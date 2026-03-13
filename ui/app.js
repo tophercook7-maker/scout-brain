@@ -1,0 +1,1417 @@
+/* eslint-disable no-console */
+console.log("app.js loaded");
+
+const STORAGE_KEY = "massive-brain-v0.4";
+
+const starterData = {
+  opportunities: [],
+  ideas: [],
+  projects: [],
+  memory: []
+};
+
+function loadState() {
+  const v4 = localStorage.getItem("massive-brain-v0.4");
+  const v3 = localStorage.getItem("massive-brain-v0.3");
+  const v2 = localStorage.getItem("massive-brain-v0.2");
+
+  if (v4) return normalizeItemFields(JSON.parse(v4));
+  if (v3) {
+    const data = normalizeItemFields(JSON.parse(v3));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+    return data;
+  }
+  if (v2) {
+    const data = normalizeItemFields(JSON.parse(v2));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+    return data;
+  }
+
+  return structuredClone(starterData);
+}
+
+function normalizeItemFields(data) {
+  for (const bucket of ["opportunities", "ideas", "projects", "memory"]) {
+    data[bucket] = (data[bucket] || []).map(item => ({
+      title: "",
+      description: "",
+      pitch: "",
+      build: "",
+      notes: "",
+      ...item,
+      pitch: item.pitch ?? item.why ?? "",
+      build: item.build ?? item.nextAction ?? ""
+    }));
+  }
+  return data;
+}
+
+let state;
+try {
+  state = loadState();
+} catch (e) {
+  console.error("loadState failed:", e);
+  state = { opportunities: [], ideas: [], projects: [], memory: [] };
+}
+
+/** Scout / Morning Runner config from scout/config.json. Loaded at runtime. */
+let scoutConfig = null;
+
+function saveState() {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+}
+
+function exportBrain() {
+  const data = JSON.stringify(state, null, 2);
+  const blob = new Blob([data], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "massive-brain-backup.json";
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function importBrain(file) {
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = function (e) {
+    try {
+      const data = JSON.parse(e.target.result);
+      if (!data.opportunities || !data.ideas || !data.projects || !data.memory) {
+        alert("Invalid backup: missing opportunities, ideas, projects, or memory.");
+        return;
+      }
+      state = normalizeItemFields(data);
+      saveState();
+      renderAll();
+    } catch (err) {
+      alert("Could not parse backup file: " + err.message);
+    }
+  };
+  reader.readAsText(file);
+}
+
+function createCard(item, bucket, index) {
+  const card = document.createElement("div");
+  card.className = "item-card";
+
+  card.innerHTML = `
+    <h3>${item.title || "Untitled"}</h3>
+    <p>${item.description || ""}</p>
+    <button class="open-btn" type="button">Open</button>
+  `;
+
+  card.querySelector(".open-btn").onclick = () => openModal(bucket, index);
+
+  return card;
+}
+
+function renderList(container, bucket) {
+  const el = document.getElementById(container);
+  el.innerHTML = "";
+
+  state[bucket].forEach((item, i) => {
+    el.appendChild(createCard(item, bucket, i));
+  });
+
+  const countId = container.replace("-list", "-count");
+  const countEl = document.getElementById(countId);
+  if (countEl) countEl.textContent = state[bucket].length;
+}
+
+function renderAll() {
+  renderList("opportunities-list", "opportunities");
+  renderList("ideas-list", "ideas");
+  renderList("projects-list", "projects");
+  renderList("memory-list", "memory");
+}
+
+function openModal(bucket, index) {
+  const item = state[bucket][index];
+
+  document.getElementById("modalTitle").value = item.title || "";
+  document.getElementById("modalDescription").value = item.description || "";
+  document.getElementById("modalPitch").value = item.pitch || item.why || "";
+  document.getElementById("modalBuild").value = item.build || item.nextAction || "";
+  document.getElementById("modalNotes").value = item.notes || "";
+
+  showTab("overview");
+
+  document.getElementById("modalSave").onclick = () => {
+    item.title = document.getElementById("modalTitle").value.trim();
+    item.description = document.getElementById("modalDescription").value.trim();
+    item.pitch = document.getElementById("modalPitch").value.trim();
+    item.build = document.getElementById("modalBuild").value.trim();
+    item.notes = document.getElementById("modalNotes").value.trim();
+
+    saveState();
+    renderAll();
+    document.getElementById("modal").classList.add("hidden");
+    document.getElementById("modal").setAttribute("aria-hidden", "true");
+  };
+
+  document.getElementById("modal").classList.remove("hidden");
+  document.getElementById("modal").setAttribute("aria-hidden", "false");
+}
+
+function closeModal() {
+  document.getElementById("modal").classList.add("hidden");
+  document.getElementById("modal").setAttribute("aria-hidden", "true");
+}
+
+function showTab(tabName) {
+  document.querySelectorAll(".tab").forEach((el) => el.classList.remove("active"));
+  document.querySelectorAll(".tabs button").forEach((el) => el.classList.remove("active"));
+  const panel = document.getElementById("tab-" + tabName);
+  const btn = document.querySelector('.tabs button[data-tab="' + tabName + '"]');
+  if (panel) panel.classList.add("active");
+  if (btn) btn.classList.add("active");
+}
+
+function showMainTab(tabName) {
+  document.querySelectorAll(".tab-panel").forEach((el) => el.classList.remove("active"));
+  document.querySelectorAll(".main-nav-btn").forEach((el) => el.classList.remove("active"));
+  const panel = document.getElementById(tabName);
+  const btn = document.querySelector('.main-nav-btn[data-main-tab="' + tabName + '"]');
+  if (panel) panel.classList.add("active");
+  if (btn) btn.classList.add("active");
+
+  if (tabName === "scout" && !scoutConfig) loadScoutConfig();
+}
+
+function loadScoutConfig() {
+  const statusEl = document.getElementById("scoutConfigStatus");
+  const cityInput = document.getElementById("scoutCity");
+  fetch(`${(window.MB_API_BASE || "").replace(/\/$/, "")}/scout/config.json`)
+    .then((r) => {
+      if (!r.ok) throw new Error(r.statusText);
+      return r.json();
+    })
+    .then((data) => {
+      scoutConfig = data;
+      if (cityInput && data.home_city) {
+        cityInput.placeholder = data.home_city;
+        if (!cityInput.value.trim()) cityInput.value = data.home_city;
+      }
+      if (statusEl) {
+        statusEl.textContent = `Config loaded: ${data.home_city}, ${data.search_radius_miles} mi, ${(data.categories || []).join(", ")} (max ${data.max_results_per_category || 5} per category${data.ignore_chains ? ", chains ignored" : ""}).`;
+        statusEl.classList.remove("scout-config-error");
+      }
+    })
+    .catch(() => {
+      scoutConfig = null;
+      if (statusEl) {
+        statusEl.textContent = "No scout/config.json found. Using form values only.";
+        statusEl.classList.add("scout-config-error");
+      }
+    });
+}
+
+function runScout() {
+  console.log("runScout (Scout tab) called");
+  const cityEl = document.getElementById("scoutCity");
+  const cityInput = cityEl ? cityEl.value.trim() : "";
+  const typeEl = document.getElementById("scoutType");
+  const typeOverride = typeEl ? typeEl.value.trim() : "";
+
+  if (scoutConfig) {
+    const city = cityInput || scoutConfig.home_city || "City";
+    const categories = typeOverride
+      ? [typeOverride]
+      : (scoutConfig.categories || ["diner", "coffee shop", "church"]);
+    const maxPer = Math.max(1, scoutConfig.max_results_per_category || 5);
+    const ignoreChains = !!scoutConfig.ignore_chains;
+
+    const allLeads = [];
+    categories.forEach((category) => {
+      const raw = generateLeads(city, category);
+      const limited = raw.slice(0, maxPer);
+      limited.forEach((lead) => {
+        if (ignoreChains && isLikelyChain(lead.name)) return;
+        allLeads.push(lead);
+      });
+    });
+    renderScout(allLeads);
+    return;
+  }
+
+  const leads = generateLeads(cityInput || "City", typeOverride || "business");
+  renderScout(leads);
+}
+
+function isLikelyChain(name) {
+  if (!name) return false;
+  const lower = name.toLowerCase();
+  const chainClues = ["chain", "franchise", "mcdonald", "starbucks", "subway", "dunkin", "walmart", "target"];
+  return chainClues.some((c) => lower.includes(c));
+}
+
+function generateLeads(city, type) {
+  const templates = [
+    {
+      name: `${type} House`,
+      city: city,
+      problem: "Outdated or basic website",
+      pitch: "Modern mobile-friendly site with menu updates and online directions",
+      next: "Show demo on iPad"
+    },
+    {
+      name: `Downtown ${type}`,
+      city: city,
+      problem: "No online menu system",
+      pitch: "Add a simple menu updater so staff can change prices easily",
+      next: "Offer $900 website rebuild"
+    },
+    {
+      name: `Family ${type}`,
+      city: city,
+      problem: "Weak mobile experience",
+      pitch: "Fast mobile design + click-to-call + Google Maps",
+      next: "Invite owner to see demo"
+    },
+    {
+      name: `Main Street ${type}`,
+      city: city,
+      problem: "Hard to find hours and location on phone",
+      pitch: "Clear hours, map, and tap-to-call on one screen",
+      next: "Send a quick mockup"
+    },
+    {
+      name: `Local ${type}`,
+      city: city,
+      problem: "Site looks dated compared to social presence",
+      pitch: "Match your website to the quality of your socials",
+      next: "Book a short call"
+    }
+  ];
+  return templates;
+}
+
+function renderScout(leads) {
+  const container = document.getElementById("scoutResults");
+  container.innerHTML = "";
+
+  leads.forEach((lead) => {
+    const card = document.createElement("div");
+    card.className = "scout-card";
+    card.innerHTML = `
+      <h3>${lead.name}</h3>
+      <p><strong>City:</strong> ${lead.city}</p>
+      <p><strong>Problem:</strong> ${lead.problem}</p>
+      <p><strong>Pitch:</strong> ${lead.pitch}</p>
+      <p><strong>Next Step:</strong> ${lead.next}</p>
+      <button type="button" class="scout-add-btn">Add to Opportunities</button>
+    `;
+    card.querySelector(".scout-add-btn").onclick = () => addOpportunity(lead);
+    container.appendChild(card);
+  });
+}
+
+function addOpportunity(lead) {
+  state.opportunities.push({
+    title: lead.name,
+    description: lead.problem,
+    pitch: lead.pitch,
+    build: lead.next,
+    notes: ""
+  });
+  saveState();
+  renderAll();
+  alert("Opportunity added to Brain");
+}
+
+function loadPitch(type) {
+  const pitches = {
+    diner: {
+      title: "Modern Diner Website",
+      problem: "Most diners have outdated websites or menus that are hard to read on phones.",
+      solution: "I build simple modern diner sites that show menus clearly, load fast, and help customers find you.",
+      price: "$900 build + $89/month support",
+      demo: "Show the Southern Diner concept page on iPad"
+    },
+    coffee: {
+      title: "Coffee Shop Website",
+      problem: "Many coffee shops rely only on Instagram or Facebook.",
+      solution: "A clean website helps people see your menu, hours, and location instantly.",
+      price: "$900 build + $89/month support",
+      demo: "Show Coffee Shop Starter Kit demo"
+    },
+    church: {
+      title: "Church Website",
+      problem: "Many churches have confusing or outdated sites.",
+      solution: "Simple site with events, sermons, contact info, and optional donations.",
+      price: "$900 build + optional support",
+      demo: "Show church template demo"
+    }
+  };
+
+  const p = pitches[type];
+  if (!p) return;
+
+  const container = document.getElementById("pitchDisplay");
+  container.innerHTML = `
+    <div class="pitch-card">
+      <h3>${p.title}</h3>
+      <p><strong>Problem:</strong> ${p.problem}</p>
+      <p><strong>Solution:</strong> ${p.solution}</p>
+      <p><strong>Price:</strong> ${p.price}</p>
+      <p><strong>Demo to Show:</strong> ${p.demo}</p>
+    </div>
+  `;
+}
+
+function renderBulletList(containerId, items) {
+  const el = document.getElementById(containerId);
+  if (!el) return;
+  el.innerHTML = "";
+  (items || []).forEach((item) => {
+    const row = document.createElement("div");
+    row.className = "tag analysis-bullet-item";
+    row.textContent = item;
+    el.appendChild(row);
+  });
+}
+
+async function runAnalyzeDraft() {
+  console.log("runAnalyzeDraft called");
+  const nameEl = document.getElementById("analyzeName");
+  const g = (id) => { const el = document.getElementById(id); return el ? el.value.trim() : ""; };
+  const name = g("analyzeName");
+  const type = g("analyzeType");
+  const website = g("analyzeWebsite");
+  const city = g("analyzeCity");
+
+  if (!name || !type || !website) {
+    alert("Add at least business name, type, and website.");
+    return;
+  }
+
+  let url = website;
+  if (!/^https?:\/\//i.test(url)) url = "https://" + url;
+
+  document.getElementById("analysisProblems").innerHTML = '<div class="tag analysis-bullet-item">Auditing site...</div>';
+  document.getElementById("analysisPitch").innerHTML = '<div class="tag analysis-bullet-item">Thinking...</div>';
+  const factsEl = document.getElementById("analysisFacts");
+  if (factsEl) factsEl.innerHTML = "";
+
+  try {
+    const audit = await auditWebsiteLive(url);
+    window.lastAuditResult = { name, type, website, city, audit };
+
+    renderBulletList("analysisProblems", audit.problems || []);
+    renderBulletList("analysisPitch", audit.pitch || []);
+
+    if (factsEl) {
+      (audit.facts || []).forEach((f) => {
+        const row = document.createElement("div");
+        row.className = "tag analysis-bullet-item";
+        row.textContent = f;
+        factsEl.appendChild(row);
+      });
+    }
+
+    const email = buildEmailFromAudit({ name, type, city, audit });
+    document.getElementById("analysisSubject").value = email.emailSubject;
+    document.getElementById("analysisEmail").value = email.emailBody;
+  } catch (err) {
+    console.error(err);
+    alert("Audit failed. Make sure audit_server.py is running.");
+  }
+}
+
+function copyEmailDraft() {
+  console.log("copyEmailDraft called");
+  const subjEl = document.getElementById("analysisSubject");
+  const bodyEl = document.getElementById("analysisEmail");
+  const subject = subjEl ? subjEl.value.trim() : "";
+  const body = bodyEl ? bodyEl.value.trim() : "";
+  const full = `Subject: ${subject}\n\n${body}`;
+  navigator.clipboard.writeText(full).then(() => {
+    alert("Email copied.");
+  });
+}
+
+function saveAnalyzeAsOpportunity() {
+  const name = document.getElementById("analyzeName").value.trim();
+  const type = document.getElementById("analyzeType").value.trim();
+  const website = document.getElementById("analyzeWebsite").value.trim();
+  const city = document.getElementById("analyzeCity").value.trim();
+  const body = document.getElementById("analysisEmail").value.trim();
+
+  if (!name) return alert("Run an analysis first.");
+
+  const audit = window.lastAuditResult?.audit || { problems: [], pitch: [], facts: [] };
+
+  state.opportunities.unshift({
+    title: name,
+    description: `${type}${city ? ` in ${city}` : ""} — ${website}`,
+    pitch: (audit.pitch || []).join("\n"),
+    build: (audit.facts || []).join("\n"),
+    notes: body
+  });
+
+  saveState();
+  renderAll();
+  alert("Saved to Opportunities.");
+}
+
+function saveAnalyzeAsIdea() {
+  const name = document.getElementById("analyzeName").value.trim();
+  const type = document.getElementById("analyzeType").value.trim();
+
+  if (!name) return alert("Run an analysis first.");
+
+  const audit = window.lastAuditResult?.audit || { problems: [], pitch: [], facts: [] };
+
+  state.ideas.unshift({
+    title: `${type} pitch for ${name}`,
+    description: "Generated from Analyze + Draft",
+    pitch: (audit.pitch || []).join("\n"),
+    build: (audit.problems || []).join("\n"),
+    notes: document.getElementById("analysisEmail").value.trim()
+  });
+
+  saveState();
+  renderAll();
+  alert("Saved to Ideas.");
+}
+
+async function fetchScoutData() {
+  if (window.MB_FETCH_SCOUT_DATA) {
+    console.log("fetchScoutData: using Supabase");
+    return window.MB_FETCH_SCOUT_DATA();
+  }
+  const apiBase = (window.MB_API_BASE || "").replace(/\/$/, "");
+  console.log("fetchScoutData: calling GET", apiBase + "/scout-data");
+  const response = await fetch(`${apiBase}/scout-data`);
+  console.log("fetchScoutData: status", response.status);
+  if (!response.ok) throw new Error("Could not load scout data");
+  return response.json();
+}
+
+async function updateCaseStatus(slug, updates) {
+  if (window.MB_UPDATE_CASE) {
+    await window.MB_UPDATE_CASE(slug, updates);
+    return {};
+  }
+  const apiBase = (window.MB_API_BASE || "").replace(/\/$/, "");
+  const res = await fetch(`${apiBase}/case/${encodeURIComponent(slug)}/update`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(updates),
+  });
+  if (!res.ok) throw new Error("Could not update case");
+  return res.json();
+}
+
+async function fetchCase(slug) {
+  if (window.MB_GET_CASE) {
+    const data = await window.MB_GET_CASE(slug);
+    if (!data) throw new Error("Case not found");
+    return data;
+  }
+  const apiBase = (window.MB_API_BASE || "").replace(/\/$/, "");
+  const res = await fetch(`${apiBase}/case/${encodeURIComponent(slug)}`);
+  if (!res.ok) throw new Error("Could not load case");
+  return res.json();
+}
+
+let _runnerPreviousCount = null;
+let _runnerStatusFilter = "all";
+let _runnerOpportunities = [];
+
+const LEAD_STATUSES = ["New", "Ready to contact", "Contacted", "Follow up", "Closed", "Skip"];
+
+function setRunnerStatus(status) {
+  const el = document.getElementById("runnerStatus");
+  if (!el) return;
+  el.textContent = status;
+  const slug = status.replace(/\.\.\./g, "").toLowerCase();
+  el.className = "runner-status status-" + (slug === "running" ? "running" : slug);
+}
+
+function setRunnerLoading(show) {
+  const el = document.getElementById("runnerLoadingIndicator");
+  if (!el) return;
+  el.classList.toggle("hidden", !show);
+  el.setAttribute("aria-hidden", show ? "false" : "true");
+}
+
+function flashRunnerPanel() {
+  const panel = document.getElementById("morningRunnerPanel");
+  if (!panel) return;
+  panel.classList.remove("runner-panel-success-flash");
+  void panel.offsetWidth;
+  panel.classList.add("runner-panel-success-flash");
+  setTimeout(() => panel.classList.remove("runner-panel-success-flash"), 800);
+}
+
+async function runScoutNow() {
+  console.log("runScoutNow called");
+  const btn = document.getElementById("runMorningScoutBtn");
+  const summary = document.getElementById("morningRunnerSummary");
+  const generated = document.getElementById("scoutGeneratedAt");
+
+  const prevCount = _runnerPreviousCount;
+
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Running Scout...";
+    console.log("Button disabled, text changed to Running Scout...");
+  }
+  setRunnerStatus("Running...");
+  setRunnerLoading(true);
+  const errorBanner = document.getElementById("scoutErrorBanner");
+  const errorBody = document.getElementById("scoutErrorBody");
+  const errorDetailsPre = document.getElementById("scoutErrorDetailsPre");
+  if (errorBanner) {
+    errorBanner.classList.add("hidden");
+    if (errorBody) errorBody.textContent = "";
+    if (errorDetailsPre) errorDetailsPre.textContent = "";
+  }
+  if (summary) summary.textContent = "Scout is running... searching and investigating businesses.";
+  if (generated) generated.textContent = "Scout is running...";
+
+  function showScoutError(userMsg, errType, errMsg, fullData) {
+    setRunnerStatus("Failed");
+    if (summary) summary.textContent = userMsg;
+    if (generated) generated.textContent = "Scout failed";
+    if (errorBanner) {
+      if (errorBody) errorBody.textContent = userMsg;
+      if (errorDetailsPre) {
+        const detailText = [errType && `error_type: ${errType}`, errMsg && `error_message: ${errMsg}`].filter(Boolean).join("\n");
+        errorDetailsPre.textContent = detailText || (fullData ? JSON.stringify(fullData, null, 2) : "");
+      }
+      errorBanner.classList.remove("hidden");
+    }
+    console.log("Scout failure reason:", userMsg);
+  }
+
+  try {
+    const apiBase = (window.MB_API_BASE || "").replace(/\/$/, "");
+    const runScoutUrl = `${apiBase}/run-scout`;
+    console.log("Calling", runScoutUrl);
+    const headers = { "Content-Type": "application/json" };
+    if (window.MB_SESSION?.access_token) {
+      headers["Authorization"] = `Bearer ${window.MB_SESSION.access_token}`;
+    }
+    const response = await fetch(runScoutUrl, { method: "POST", headers });
+    console.log("Scout response status:", response.status);
+
+    let data;
+    try {
+      const text = await response.text();
+      try {
+        data = JSON.parse(text);
+      } catch (parseErr) {
+        console.error("Scout response JSON parse failed. Response may be HTML or non-JSON:", text.slice(0, 200));
+        data = { success: false, user_friendly_message: `Server returned non-JSON (${response.status}). Is the scout server running?` };
+      }
+    } catch (readErr) {
+      console.error("Scout response read error:", readErr);
+      data = { success: false, user_friendly_message: "Could not read scout response. Network or server error." };
+    }
+
+    console.log("Scout response JSON:", data);
+
+    if (!response.ok || data.ok === false || data.success === false) {
+      const errType = data.error_type || "scout_error";
+      const errMsg = data.error_message || data.stderr || "Unknown error";
+      const userMsg = data.user_friendly_message || "Scout run failed. Check the app and try again.";
+      console.error("Scout failed:", { error_type: errType, error_message: errMsg, full: data });
+      showScoutError(userMsg, errType, errMsg, data);
+      return;
+    }
+
+    const opportunities = data.opportunities || [];
+    const newCount = opportunities.length;
+
+    renderMorningRunner(data.today, opportunities, data.stdout, data.stderr);
+
+    setRunnerStatus("Complete");
+    if (summary) {
+      if (prevCount !== null && prevCount === newCount && newCount > 0) {
+        summary.textContent = "Scout complete — no major changes found.";
+      } else {
+        summary.textContent = `Scout complete — ${newCount} opportunities refreshed.`;
+      }
+    }
+    if (generated && data.today?.generated_at) {
+      generated.textContent = "Generated: " + data.today.generated_at;
+    }
+
+    _runnerPreviousCount = newCount;
+    flashRunnerPanel();
+  } catch (err) {
+    console.error("Scout run exception:", err);
+    const deployMsg = window.MB_USE_CLOUD
+      ? "Run Scout requires the local scout server. Run the app locally for this feature."
+      : "Scout run failed. Check the app is running. Network or server error.";
+    const errMsg = err.message || String(err);
+    showScoutError(deployMsg, "network_or_exception", errMsg, null);
+  } finally {
+    setRunnerLoading(false);
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "Run Scout";
+    }
+  }
+}
+window.runScoutNow = runScoutNow;
+console.log("runScoutNow defined");
+
+function createRunnerTag(text) {
+  const el = document.createElement("span");
+  el.className = "tag";
+  el.textContent = text;
+  return el;
+}
+
+function valOrMissing(v) {
+  if (v == null || v === "") return "Missing";
+  return String(v);
+}
+
+function escapeHtml(s) {
+  if (s == null || s === "") return "";
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function buildCardDataSection(opp) {
+  const wrap = document.createElement("div");
+  wrap.className = "runner-card-data";
+  const dataTitle = document.createElement("div");
+  dataTitle.className = "runner-section-title";
+  dataTitle.textContent = "Research data";
+  wrap.appendChild(dataTitle);
+  const email = opp.contact?.email || (opp.contact?.emails?.length ? opp.contact.emails[0] : null);
+  const phone = opp.phone || opp.contact?.phone_from_site || (opp.contact?.phones?.length ? opp.contact.phones[0] : null);
+  const rows = [
+    ["Website", opp.website],
+    ["Phone", phone],
+    ["Email", email],
+    ["Contact page", opp.contact?.contact_page],
+    ["Facebook", opp.contact?.facebook],
+    ["Instagram", opp.contact?.instagram],
+    ["Recommended contact", opp.recommended_contact],
+    ["Backup contact", opp.backup_contact_method],
+    ["Rating", opp.rating != null ? String(opp.rating) : null],
+    ["Review count", opp.review_count != null ? String(opp.review_count) : null],
+    ["Hours", opp.hours],
+    ["No website", opp.no_website ? "Yes" : (opp.website ? "No" : null)],
+    ["Platform", opp.website_analysis?.platform],
+  ];
+  rows.forEach(([label, val]) => {
+    const row = document.createElement("div");
+    row.className = "runner-data-row";
+    row.innerHTML = `<span class="runner-data-label">${label}:</span> <span class="runner-data-val ${!val && val !== 0 ? "missing" : ""}">${valOrMissing(val)}</span>`;
+    if (val && (label === "Website" || label === "Contact page" || label === "Facebook" || label === "Instagram")) {
+      const link = document.createElement("a");
+      link.href = val;
+      link.target = "_blank";
+      link.rel = "noopener";
+      link.textContent = val.length > 45 ? val.slice(0, 42) + "…" : val;
+      link.className = "runner-data-link";
+      row.querySelector(".runner-data-val").innerHTML = "";
+      row.querySelector(".runner-data-val").appendChild(link);
+    }
+    wrap.appendChild(row);
+  });
+  return wrap;
+}
+
+function buildContactMatrixSection(opp) {
+  const wrap = document.createElement("div");
+  wrap.className = "runner-contact-matrix";
+  const cm = opp.contact_matrix || {};
+  const email = opp.contact?.email || (opp.contact?.emails?.length ? opp.contact.emails[0] : null);
+  const phone = opp.phone || opp.contact?.phone_from_site || (opp.contact?.phones?.length ? opp.contact.phones[0] : null);
+  const rows = [
+    ["Best contact", cm.best_contact || opp.recommended_contact],
+    ["Backup contact", cm.backup_contact || opp.backup_contact_method],
+    ["Email", email],
+    ["Phone", phone],
+    ["Contact page", opp.contact?.contact_page],
+    ["Facebook", opp.contact?.facebook],
+    ["Instagram", opp.contact?.instagram],
+  ];
+  const title = document.createElement("div");
+  title.className = "runner-section-title";
+  title.textContent = "Contact Matrix";
+  wrap.appendChild(title);
+  rows.forEach(([label, val]) => {
+    const row = document.createElement("div");
+    row.className = "runner-matrix-row";
+    const isUrl = val && ["Contact page", "Facebook", "Instagram"].includes(label);
+    row.innerHTML = `<span class="runner-matrix-label">${label}:</span> `;
+    const valSpan = document.createElement("span");
+    valSpan.className = "runner-matrix-val" + (!val ? " missing" : "");
+    if (isUrl && val) {
+      const a = document.createElement("a");
+      a.href = val;
+      a.target = "_blank";
+      a.rel = "noopener";
+      a.textContent = val.length > 50 ? val.slice(0, 47) + "…" : val;
+      valSpan.appendChild(a);
+    } else {
+      valSpan.textContent = valOrMissing(val);
+    }
+    row.appendChild(valSpan);
+    wrap.appendChild(row);
+  });
+  return wrap;
+}
+
+function buildContactLinks(opp) {
+  const wrap = document.createElement("div");
+  wrap.className = "runner-links";
+  const links = [];
+  if (opp.website) links.push(["Website", opp.website]);
+  if (opp.maps_url) links.push(["Maps", opp.maps_url]);
+  if (opp.contact?.contact_page) links.push(["Contact Page", opp.contact.contact_page]);
+  if (opp.contact?.facebook) links.push(["Facebook", opp.contact.facebook]);
+  if (opp.contact?.instagram) links.push(["Instagram", opp.contact.instagram]);
+  links.forEach(([label, href]) => {
+    const a = document.createElement("a");
+    a.href = href;
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    a.className = "tag";
+    a.textContent = label;
+    wrap.appendChild(a);
+  });
+  const email = opp.contact?.email || (opp.contact?.emails?.length ? opp.contact.emails[0] : null);
+  const phone = opp.phone || opp.contact?.phone_from_site || (opp.contact?.phones?.length ? opp.contact.phones[0] : null);
+  if (email) {
+    const el = document.createElement("span");
+    el.className = "tag";
+    el.textContent = `Email: ${email}`;
+    wrap.appendChild(el);
+  }
+  if (phone) {
+    const el = document.createElement("span");
+    el.className = "tag";
+    el.textContent = `Phone: ${phone}`;
+    wrap.appendChild(el);
+  }
+  return wrap;
+}
+
+function copyAndFeedback(btn, text, label) {
+  navigator.clipboard.writeText(text).then(() => {
+    const orig = btn.textContent;
+    btn.textContent = "Copied";
+    setTimeout(() => { btn.textContent = orig; }, 1200);
+  });
+}
+
+function openCaseDetail(opp) {
+  const modal = document.getElementById("caseDetailModal");
+  const content = document.getElementById("caseDetailContent");
+  const titleEl = document.getElementById("caseDetailTitle");
+  if (!modal || !content || !titleEl) return;
+
+  titleEl.textContent = opp.name || "Opportunity";
+  const s = (v) => (v ?? "");
+  const m = (v) => (v != null && v !== "" ? String(v) : "Missing");
+  const arr = (v) => (Array.isArray(v) ? v : v ? [v] : []);
+  const issues = arr(opp.website_analysis?.issues);
+
+  const emails = opp.contact?.emails?.length ? opp.contact.emails : (opp.contact?.email ? [opp.contact.email] : []);
+  const phones = opp.contact?.phones?.length ? opp.contact.phones : (opp.phone || opp.contact?.phone_from_site ? [opp.phone || opp.contact.phone_from_site] : []);
+
+  const email = opp.contact?.email || (opp.contact?.emails?.length ? opp.contact.emails[0] : null);
+  const phone = opp.phone || opp.contact?.phone_from_site || (opp.contact?.phones?.length ? opp.contact.phones[0] : null);
+
+  let html = `<div class="case-detail-section"><h4>Business Snapshot</h4><div class="case-field-list">`;
+  html += `<div class="case-field"><span class="case-field-label">Name:</span> ${m(opp.name)}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Category:</span> ${m(opp.category)}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Address:</span> ${m(opp.address)}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Distance:</span> ${opp.distance_miles != null ? opp.distance_miles + " mi" : "Missing"}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Maps link:</span> ${opp.maps_url ? `<a href="${opp.maps_url}" target="_blank" rel="noopener">${opp.maps_url}</a>` : "Missing"}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Website:</span> ${opp.website ? `<a href="${opp.website}" target="_blank" rel="noopener">${opp.website}</a>` : "Missing"}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Rating:</span> ${m(opp.rating)}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Review count:</span> ${m(opp.review_count)}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Hours:</span> ${m(opp.hours)}</div>`;
+  html += `</div></div>`;
+
+  html += `<div class="case-detail-section"><h4>Contact Matrix</h4><div class="case-field-list">`;
+  html += `<div class="case-field"><span class="case-field-label">Best contact:</span> ${m(opp.contact_matrix?.best_contact || opp.recommended_contact)}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Backup contact:</span> ${m(opp.contact_matrix?.backup_contact || opp.backup_contact_method)}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Email:</span> ${email || "Missing"}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Phone:</span> ${m(phone)}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Contact page:</span> ${opp.contact?.contact_page ? `<a href="${opp.contact.contact_page}" target="_blank" rel="noopener">${opp.contact.contact_page}</a>` : "Missing"}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Facebook:</span> ${opp.contact?.facebook ? `<a href="${opp.contact.facebook}" target="_blank" rel="noopener">${opp.contact.facebook}</a>` : "Missing"}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Instagram:</span> ${opp.contact?.instagram ? `<a href="${opp.contact.instagram}" target="_blank" rel="noopener">${opp.contact.instagram}</a>` : "Missing"}</div>`;
+  const soc = opp.social_links || {};
+  Object.entries(soc).filter(([k]) => !["facebook","instagram"].includes(k)).forEach(([k, v]) => {
+    if (v) html += `<div class="case-field"><span class="case-field-label">${k}:</span> <a href="${v}" target="_blank" rel="noopener">${v}</a></div>`;
+  });
+  html += `</div></div>`;
+
+  html += `<div class="case-detail-section"><h4>Website Intelligence</h4><div class="case-field-list">`;
+  html += `<div class="case-field"><span class="case-field-label">Platform:</span> ${m(opp.website_analysis?.platform)}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Homepage title:</span> ${m(opp.homepage_title)}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Meta description:</span> ${m(opp.meta_description)}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Viewport/mobile:</span> ${opp.viewport_ok === true ? "OK" : opp.viewport_ok === false ? "Issues" : "Missing"}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Tap-to-call:</span> ${opp.tap_to_call_present === true ? "Yes" : opp.tap_to_call_present === false ? "No" : "Missing"}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Contact form:</span> ${opp.contact_form_present === true ? "Yes" : opp.contact_form_present === false ? "No" : "Missing"}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Menu found:</span> ${opp.menu_visibility === true ? "Yes" : opp.menu_visibility === false ? "No" : "Missing"}</div>`;
+  const disc = opp.discovered_pages || [];
+  html += `<div class="case-field"><span class="case-field-label">Internal pages found:</span> ${disc.length ? disc.length + " pages" : "Missing"}</div>`;
+  html += `</div><p><strong>Strongest problems:</strong></p><pre class="case-pre">${escapeHtml(issues.length ? issues.join("\n") : "None identified")}</pre></div>`;
+
+  html += `<div class="case-detail-section"><h4>Pitch angle</h4><p>${s(opp.pitch_angle) || "Missing"}</p>`;
+  if (opp.demo_to_show) html += `<p><strong>Demo:</strong> ${s(opp.demo_to_show)}</p>`;
+  html += `</div>`;
+
+  html += `<div class="case-detail-section"><h4>Outreach Pack</h4>`;
+  const shortEmail = opp.email_draft?.body || opp.short_email || opp.longer_email;
+  html += `<p><strong>Short email:</strong></p><pre class="case-pre case-outreach-pre">${escapeHtml(shortEmail || "Missing")}</pre>`;
+  html += `<p><strong>Long email:</strong></p><pre class="case-pre case-outreach-pre">${escapeHtml(opp.longer_email || "Missing")}</pre>`;
+  html += `<p><strong>Contact form message:</strong></p><pre class="case-pre case-outreach-pre">${escapeHtml(opp.contact_form_version || "Missing")}</pre>`;
+  html += `<p><strong>Social DM:</strong></p><pre class="case-pre case-outreach-pre">${escapeHtml(opp.social_dm_version || "Missing")}</pre>`;
+  html += `<p><strong>Follow-up:</strong></p><pre class="case-pre case-outreach-pre">${escapeHtml(opp.follow_up_note || opp.follow_up_line || "Missing")}</pre>`;
+  html += `<div class="case-copy-buttons">`;
+  if (shortEmail) html += `<button type="button" class="ghost-btn case-copy-btn" data-copy="short">Copy short</button>`;
+  if (opp.longer_email) html += `<button type="button" class="ghost-btn case-copy-btn" data-copy="long">Copy long</button>`;
+  if (opp.follow_up_note || opp.follow_up_line) html += `<button type="button" class="ghost-btn case-copy-btn" data-copy="followup">Copy follow-up</button>`;
+  if (opp.contact_form_version) html += `<button type="button" class="ghost-btn case-copy-btn" data-copy="form">Copy form msg</button>`;
+  if (opp.social_dm_version) html += `<button type="button" class="ghost-btn case-copy-btn" data-copy="social">Copy social DM</button>`;
+  html += `</div></div>`;
+  if (opp.why_worth_pursuing || opp.next_action) {
+    html += `<div class="case-detail-section"><h4>${opp.no_website ? "Why this is a strong lead" : "Internal notes"}</h4>`;
+    if (opp.why_worth_pursuing) html += `<p>${s(opp.why_worth_pursuing)}</p>`;
+    if (opp.next_action) html += `<p><strong>Next:</strong> ${s(opp.next_action)}</p>`;
+    if (opp.follow_up_suggestion) html += `<p><strong>Follow-up:</strong> ${s(opp.follow_up_suggestion)}</p>`;
+    html += `</div>`;
+  }
+
+  html += `<div class="case-detail-section"><h4>Outreach queue</h4>`;
+  html += `<p><strong>Status:</strong> ${s(opp.status) || "New"}</p>`;
+  html += `<label class="modal-label">Outreach notes</label><textarea id="caseOutreachNotes" class="modal-textarea case-outreach-field">${s(opp.outreach_notes)}</textarea>`;
+  html += `<label class="modal-label">Follow-up due (date)</label><input type="text" id="caseFollowUpDue" class="modal-input case-outreach-field" placeholder="e.g. 2025-03-15" value="${s(opp.follow_up_due)}" />`;
+  html += `<label class="modal-label">Outcome</label><input type="text" id="caseOutcome" class="modal-input case-outreach-field" placeholder="e.g. No response, Meeting scheduled" value="${s(opp.outcome)}" />`;
+  html += `<div class="case-outreach-quick">`;
+  LEAD_STATUSES.forEach((st) => {
+    html += `<button type="button" class="ghost-btn case-status-btn" data-status="${st}">${st}</button>`;
+  });
+  html += `</div>`;
+  html += `<button type="button" id="caseOutreachSaveBtn" class="primary-btn">Save outreach</button>`;
+  html += `<button type="button" id="caseViewRawBtn" class="ghost-btn">View raw case JSON</button>`;
+  html += `</div>`;
+
+  html += `<div class="case-detail-section case-raw-section"><button type="button" id="caseRawToggle" class="ghost-btn case-raw-toggle">Raw Case File ▾</button>`;
+  html += `<pre id="caseRawPre" class="case-pre case-raw-pre hidden"></pre></div>`;
+
+  content.innerHTML = html;
+
+  document.getElementById("caseViewRawBtn").onclick = () => openRawCaseModal(opp.slug);
+  document.getElementById("caseRawToggle").onclick = async () => {
+    const pre = document.getElementById("caseRawPre");
+    const btn = document.getElementById("caseRawToggle");
+    if (pre.classList.contains("hidden")) {
+      if (!pre.textContent) {
+        try {
+          const data = await fetchCase(opp.slug);
+          pre.textContent = JSON.stringify(data, null, 2);
+        } catch (e) {
+          pre.textContent = "Error loading: " + (e.message || "Unknown");
+        }
+      }
+      pre.classList.remove("hidden");
+      btn.textContent = "Raw Case File ▴";
+    } else {
+      pre.classList.add("hidden");
+      btn.textContent = "Raw Case File ▾";
+    }
+  };
+
+  document.getElementById("caseOutreachSaveBtn").onclick = async () => {
+    const notes = document.getElementById("caseOutreachNotes")?.value ?? "";
+    const followUpDue = document.getElementById("caseFollowUpDue")?.value?.trim() || null;
+    const outcome = document.getElementById("caseOutcome")?.value?.trim() || null;
+    try {
+      await updateCaseStatus(opp.slug, { outreach_notes: notes, follow_up_due: followUpDue, outcome });
+      opp.outreach_notes = notes;
+      opp.follow_up_due = followUpDue;
+      opp.outcome = outcome;
+      document.getElementById("caseOutreachSaveBtn").textContent = "Saved";
+      setTimeout(() => { document.getElementById("caseOutreachSaveBtn").textContent = "Save outreach"; }, 1200);
+    } catch (e) {
+      console.error(e);
+    }
+  };
+  content.querySelectorAll(".case-status-btn").forEach((btn) => {
+    btn.onclick = async () => {
+      const st = btn.getAttribute("data-status");
+      try {
+        await updateCaseStatus(opp.slug, { status: st });
+        opp.status = st;
+        await refreshScoutData();
+        openCaseDetail(opp);
+      } catch (e) {
+        console.error(e);
+      }
+    };
+  });
+
+  content.querySelectorAll(".case-copy-btn").forEach((btn) => {
+    btn.onclick = () => {
+      const k = btn.getAttribute("data-copy");
+      let text = "";
+      if (k === "short") text = opp.email_draft?.body || opp.short_email || "";
+      else if (k === "long") text = opp.longer_email || "";
+      else if (k === "followup") text = opp.follow_up_note || opp.follow_up_line || "";
+      else if (k === "form") text = opp.contact_form_version || "";
+      else text = opp.social_dm_version || "";
+      copyAndFeedback(btn, text, btn.textContent);
+    };
+  });
+  modal.classList.remove("hidden");
+  modal.setAttribute("aria-hidden", "false");
+}
+
+function closeCaseDetail() {
+  const modal = document.getElementById("caseDetailModal");
+  if (modal) { modal.classList.add("hidden"); modal.setAttribute("aria-hidden", "true"); }
+}
+
+async function openRawCaseModal(slug) {
+  const modal = document.getElementById("rawCaseModal");
+  const content = document.getElementById("rawCaseContent");
+  if (!modal || !content) return;
+  content.textContent = "Loading…";
+  modal.classList.remove("hidden");
+  modal.setAttribute("aria-hidden", "false");
+  try {
+    const data = await fetchCase(slug);
+    content.textContent = JSON.stringify(data, null, 2);
+  } catch (e) {
+    content.textContent = "Error: " + (e.message || "Could not load case");
+  }
+}
+
+function closeRawCaseModal() {
+  const modal = document.getElementById("rawCaseModal");
+  if (modal) { modal.classList.add("hidden"); modal.setAttribute("aria-hidden", "true"); }
+}
+
+function renderMorningRunner(today, opportunities, stdout, stderr) {
+  const list = document.getElementById("morningRunnerList");
+  const count = document.getElementById("morningRunnerCount");
+  const summary = document.getElementById("morningRunnerSummary");
+  const generated = document.getElementById("scoutGeneratedAt");
+  const filterEl = document.getElementById("runnerStatusFilters");
+  const todaySection = document.getElementById("runnerTodaySection");
+  const todayList = document.getElementById("runnerTodayList");
+
+  if (!list || !count || !summary || !generated) return;
+
+  _runnerOpportunities = (today && today.top_opportunities) ? today.top_opportunities : (opportunities || []);
+  const top = _runnerOpportunities;
+
+  const filtered = _runnerStatusFilter === "all"
+    ? top
+    : top.filter(o => (o.status || "New") === _runnerStatusFilter);
+
+  const noWebsite = filtered.filter(o => o.no_website || o.lane === "no_website");
+  const weakWebsite = filtered.filter(o => !o.no_website && o.lane !== "no_website");
+
+  if (filterEl) {
+    filterEl.innerHTML = "";
+    ["All", ...LEAD_STATUSES].forEach((st) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "ghost-btn runner-filter-btn" + (_runnerStatusFilter === (st === "All" ? "all" : st) ? " active" : "");
+      btn.textContent = st;
+      btn.onclick = () => {
+        _runnerStatusFilter = st === "All" ? "all" : st;
+        renderMorningRunner(today, opportunities, stdout, stderr);
+      };
+      filterEl.appendChild(btn);
+    });
+  }
+
+  const todayLeads = top.filter(o => {
+    const s = o.status || "New";
+    return s === "Ready to contact" || s === "Follow up";
+  });
+  if (todaySection && todayList) {
+    todaySection.classList.toggle("hidden", todayLeads.length === 0);
+    todayList.innerHTML = "";
+    todayLeads.forEach((o) => {
+      const a = document.createElement("a");
+      a.href = "#";
+      a.className = "runner-today-item";
+      a.textContent = `${o.name || "?"} — ${o.status}`;
+      a.onclick = (e) => { e.preventDefault(); openCaseDetail(o); };
+      todayList.appendChild(a);
+    });
+  }
+
+  list.innerHTML = "";
+  count.textContent = filtered.length;
+  summary.textContent = today?.summary || "No scout summary available.";
+  generated.textContent = today?.generated_at ? `Generated: ${today.generated_at}` : "No scout run yet";
+
+  function renderOppCard(opp) {
+    const card = document.createElement("div");
+    card.className = "runner-opp";
+
+    const topRow = document.createElement("div");
+    topRow.className = "runner-opp-top";
+
+    const left = document.createElement("div");
+    const title = document.createElement("h4");
+    title.textContent = `${opp.name} • ${opp.distance_miles != null ? opp.distance_miles : "?"} miles`;
+    const desc = document.createElement("p");
+    desc.textContent = `${opp.category} — ${opp.address || "No address found"}`;
+    left.appendChild(title);
+    left.appendChild(desc);
+
+    const right = document.createElement("div");
+    const statusBadge = document.createElement("span");
+    statusBadge.className = "tag runner-status-badge status-" + (opp.status || "New").toLowerCase().replace(/\s+/g, "-");
+    statusBadge.textContent = opp.status || "New";
+    right.appendChild(statusBadge);
+    if (opp.no_website) right.appendChild(createRunnerTag("No website"));
+    right.appendChild(createRunnerTag(`Best: ${opp.recommended_contact || "unknown"}`));
+    if (opp.backup_contact_method) right.appendChild(createRunnerTag(`Backup: ${opp.backup_contact_method}`));
+    if (!opp.no_website && opp.website_analysis?.platform) right.appendChild(createRunnerTag(opp.website_analysis.platform));
+    if (opp.rating != null) right.appendChild(createRunnerTag(`⭐ ${opp.rating} (${opp.review_count ?? "?"} reviews)`));
+    if (opp.priority) right.appendChild(createRunnerTag(opp.priority));
+
+    topRow.appendChild(left);
+    topRow.appendChild(right);
+    card.appendChild(topRow);
+
+    card.appendChild(buildCardDataSection(opp));
+    card.appendChild(buildContactMatrixSection(opp));
+    card.appendChild(buildContactLinks(opp));
+
+    if (opp.best_service_to_offer || opp.demo_to_show) {
+      const recRow = document.createElement("div");
+      recRow.className = "runner-recommendations";
+      if (opp.best_service_to_offer) {
+        const s = document.createElement("span");
+        s.className = "tag";
+        s.textContent = `Offer: ${opp.best_service_to_offer}`;
+        recRow.appendChild(s);
+      }
+      if (opp.demo_to_show) {
+        const d = document.createElement("span");
+        d.className = "tag";
+        d.textContent = `Demo: ${opp.demo_to_show}`;
+        recRow.appendChild(d);
+      }
+      card.appendChild(recRow);
+    }
+
+    const issuesTitle = document.createElement("div");
+    issuesTitle.className = "runner-section-title";
+    issuesTitle.textContent = opp.no_website ? "Opportunity" : "Issues found";
+    card.appendChild(issuesTitle);
+    const issuesBox = document.createElement("div");
+    issuesBox.className = "runner-pre";
+    const issues = opp.no_website ? ["No website — strong opportunity for first-site build"] : (opp.website_analysis?.issues || []);
+    issuesBox.textContent = issues.length ? issues.join("\n") : "No strong issues detected.";
+    card.appendChild(issuesBox);
+
+    const pitchTitle = document.createElement("div");
+    pitchTitle.className = "runner-section-title";
+    pitchTitle.textContent = "Pitch angle";
+    card.appendChild(pitchTitle);
+    const pitchBox = document.createElement("div");
+    pitchBox.className = "runner-pre";
+    pitchBox.textContent = opp.pitch_angle || "No pitch angle generated.";
+    card.appendChild(pitchBox);
+
+    const emailTitle = document.createElement("div");
+    emailTitle.className = "runner-section-title";
+    emailTitle.textContent = "Ready email draft";
+    card.appendChild(emailTitle);
+    const emailBox = document.createElement("div");
+    emailBox.className = "runner-pre";
+    emailBox.textContent = `Subject: ${opp.email_draft?.subject || ""}\n\n${opp.email_draft?.body || ""}`;
+    card.appendChild(emailBox);
+
+    const statusRow = document.createElement("div");
+    statusRow.className = "runner-status-row";
+    statusRow.appendChild(document.createTextNode("Status: "));
+    const statusSelect = document.createElement("select");
+    statusSelect.className = "runner-status-select";
+    LEAD_STATUSES.forEach((st) => {
+      const opt = document.createElement("option");
+      opt.value = st;
+      opt.textContent = st;
+      if ((opp.status || "New") === st) opt.selected = true;
+      statusSelect.appendChild(opt);
+    });
+    statusSelect.onchange = async () => {
+      const newStatus = statusSelect.value;
+      try {
+        await updateCaseStatus(opp.slug, { status: newStatus });
+        await refreshScoutData();
+      } catch (e) {
+        console.error(e);
+        statusSelect.value = opp.status || "New";
+      }
+    };
+    statusRow.appendChild(statusSelect);
+    const quickActions = document.createElement("span");
+    quickActions.className = "runner-quick-actions";
+    ["Ready to contact", "Contacted", "Follow up", "Closed", "Skip"].forEach((st) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "ghost-btn runner-quick-btn";
+      btn.textContent = st === "Ready to contact" ? "Ready" : st === "Follow up" ? "Follow up" : st;
+      btn.onclick = async () => {
+        try {
+          await updateCaseStatus(opp.slug, { status: st });
+          opp.status = st;
+          statusBadge.textContent = st;
+          statusBadge.className = "tag runner-status-badge status-" + st.toLowerCase().replace(/\s+/g, "-");
+          statusSelect.value = st;
+          await refreshScoutData();
+        } catch (e) {
+          console.error(e);
+        }
+      };
+      quickActions.appendChild(btn);
+    });
+    statusRow.appendChild(quickActions);
+    card.appendChild(statusRow);
+
+    const copyRow = document.createElement("div");
+    copyRow.className = "runner-copy-row";
+    const copyBtns = [
+      ["Copy short", opp.email_draft?.body || opp.short_email || opp.longer_email, `Subject: ${opp.email_draft?.subject || ""}\n\n`],
+      ["Copy long", opp.longer_email, ""],
+      ["Copy follow-up", opp.follow_up_note || opp.follow_up_line, ""],
+      ["Copy form msg", opp.contact_form_version, ""],
+      ["Copy social DM", opp.social_dm_version, ""],
+    ];
+    copyBtns.forEach(([label, text, prefix]) => {
+      if (!text) return;
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "ghost-btn runner-copy-btn";
+      btn.textContent = label;
+      btn.onclick = () => {
+        copyAndFeedback(btn, prefix ? prefix + text : text, label);
+      };
+      copyRow.appendChild(btn);
+    });
+    const viewBtn = document.createElement("button");
+    viewBtn.type = "button";
+    viewBtn.className = "primary-btn";
+    viewBtn.textContent = "View full research";
+    viewBtn.onclick = () => openCaseDetail(opp);
+    copyRow.appendChild(viewBtn);
+    const rawBtn = document.createElement("button");
+    rawBtn.type = "button";
+    rawBtn.className = "ghost-btn";
+    rawBtn.textContent = "View raw case JSON";
+    rawBtn.onclick = () => openRawCaseModal(opp.slug);
+    copyRow.appendChild(rawBtn);
+    const saveBtn = document.createElement("button");
+    saveBtn.type = "button";
+    saveBtn.className = "ghost-btn";
+    saveBtn.textContent = "Save to Opportunities";
+    saveBtn.onclick = () => {
+      const body = opp.email_draft?.body || opp.short_email || opp.longer_email || "";
+      state.opportunities.unshift({
+        title: opp.name,
+        description: `${opp.category} — ${opp.address || ""}`,
+        pitch: opp.pitch_angle || "",
+        build: (opp.website_analysis?.facts || []).join("\n"),
+        notes: body
+      });
+      saveState();
+      renderAll();
+      saveBtn.textContent = "Saved";
+      setTimeout(() => { saveBtn.textContent = "Save to Opportunities"; }, 1200);
+    };
+    copyRow.appendChild(saveBtn);
+    card.appendChild(copyRow);
+    return card;
+  }
+
+  if (noWebsite.length > 0) {
+    const sectionTitle = document.createElement("h4");
+    sectionTitle.className = "runner-lane-title";
+    sectionTitle.textContent = `No Website Opportunities (${noWebsite.length})`;
+    list.appendChild(sectionTitle);
+    noWebsite.forEach(opp => list.appendChild(renderOppCard(opp)));
+  }
+  if (weakWebsite.length > 0) {
+    const sectionTitle2 = document.createElement("h4");
+    sectionTitle2.className = "runner-lane-title";
+    sectionTitle2.textContent = `Website Redesign Opportunities (${weakWebsite.length})`;
+    list.appendChild(sectionTitle2);
+    weakWebsite.forEach(opp => list.appendChild(renderOppCard(opp)));
+  }
+  if (noWebsite.length === 0 && weakWebsite.length === 0) {
+    const emptyMsg = document.createElement("p");
+    emptyMsg.className = "runner-empty";
+    emptyMsg.textContent = "No opportunities yet. Run Scout to find local businesses.";
+    list.appendChild(emptyMsg);
+  }
+
+  if (stdout || stderr) {
+    const log = document.createElement("div");
+    log.className = "scout-log";
+    log.textContent = [stdout, stderr].filter(Boolean).join("\n");
+    list.appendChild(log);
+  }
+}
+
+async function refreshScoutData() {
+  const summary = document.getElementById("morningRunnerSummary");
+  try {
+    const data = await fetchScoutData();
+    renderMorningRunner(data.today, data.opportunities);
+  } catch (err) {
+    console.error(err);
+    if (summary) summary.textContent = "Could not load scout data. Make sure the app is running.";
+  }
+}
+window.refreshScoutData = refreshScoutData;
+window.runScoutNow = runScoutNow;
+
+window.addEventListener("error", (e) => {
+  console.error("Global JS error:", e.error || e.message);
+});
+
+function bindButtons() {
+  console.log("frontend loaded - buttons binding started");
+
+  const exportBtn = document.getElementById("exportBrain");
+  if (exportBtn) exportBtn.addEventListener("click", exportBrain);
+
+  const importInput = document.getElementById("importBrain");
+  if (importInput) {
+    importInput.addEventListener("change", (e) => {
+      importBrain(e.target.files[0]);
+      e.target.value = "";
+    });
+  }
+
+  const modalBackdrop = document.getElementById("modalBackdrop");
+  const closeModalBtn = document.getElementById("closeModalBtn");
+  if (modalBackdrop) modalBackdrop.addEventListener("click", closeModal);
+  if (closeModalBtn) closeModalBtn.addEventListener("click", closeModal);
+
+  const caseDetailBackdrop = document.getElementById("caseDetailBackdrop");
+  const closeCaseDetailBtn = document.getElementById("closeCaseDetailBtn");
+  if (caseDetailBackdrop) caseDetailBackdrop.addEventListener("click", closeCaseDetail);
+  if (closeCaseDetailBtn) closeCaseDetailBtn.addEventListener("click", closeCaseDetail);
+
+  const rawCaseBackdrop = document.getElementById("rawCaseBackdrop");
+  const closeRawCaseBtn = document.getElementById("closeRawCaseBtn");
+  if (rawCaseBackdrop) rawCaseBackdrop.addEventListener("click", closeRawCaseModal);
+  if (closeRawCaseBtn) closeRawCaseBtn.addEventListener("click", closeRawCaseModal);
+
+  document.querySelectorAll(".tabs button").forEach((btn) => {
+    btn.addEventListener("click", () => showTab(btn.getAttribute("data-tab")));
+  });
+
+  document.querySelectorAll(".main-nav-btn").forEach((btn) => {
+    btn.addEventListener("click", () => showMainTab(btn.getAttribute("data-main-tab")));
+  });
+
+  const runScoutBtn = document.getElementById("runScoutBtn");
+  console.log("runScoutBtn element:", runScoutBtn);
+  if (runScoutBtn) {
+    runScoutBtn.addEventListener("click", () => {
+      console.log("Run Scout clicked (Scout tab)");
+      runScout();
+    });
+  }
+
+  const runMorningScoutBtn = document.getElementById("runMorningScoutBtn");
+  console.log("runMorningScoutBtn element:", runMorningScoutBtn);
+  if (runMorningScoutBtn) {
+    runMorningScoutBtn.addEventListener("click", () => {
+      console.log("Run Scout clicked");
+      runScoutNow();
+    });
+    console.log("Run Scout handler attached");
+  }
+
+  const refreshScoutBtn = document.getElementById("refreshScoutBtn");
+  console.log("refreshScoutBtn element:", refreshScoutBtn);
+  if (refreshScoutBtn) {
+    refreshScoutBtn.addEventListener("click", () => {
+      console.log("Refresh clicked");
+      refreshScoutData();
+    });
+  }
+
+  const runAnalyzeBtn = document.getElementById("runAnalyze");
+  console.log("runAnalyze element:", runAnalyzeBtn);
+  if (runAnalyzeBtn) {
+    runAnalyzeBtn.addEventListener("click", () => {
+      console.log("Analyze clicked");
+      runAnalyzeDraft();
+    });
+  }
+
+  const copyEmailBtn = document.getElementById("copyEmailBtn");
+  console.log("copyEmailBtn element:", copyEmailBtn);
+  if (copyEmailBtn) {
+    copyEmailBtn.addEventListener("click", () => {
+      console.log("Copy Email clicked");
+      copyEmailDraft();
+    });
+  }
+
+  const saveOpportunityBtn = document.getElementById("saveOpportunityBtn");
+  console.log("saveOpportunityBtn element:", saveOpportunityBtn);
+  if (saveOpportunityBtn) {
+    saveOpportunityBtn.addEventListener("click", saveAnalyzeAsOpportunity);
+  }
+
+  const saveIdeaBtn = document.getElementById("saveIdeaBtn");
+  console.log("saveIdeaBtn element:", saveIdeaBtn);
+  if (saveIdeaBtn) {
+    saveIdeaBtn.addEventListener("click", saveAnalyzeAsIdea);
+  }
+
+  document.querySelectorAll(".pitch-buttons button").forEach((btn) => {
+    btn.addEventListener("click", () => loadPitch(btn.getAttribute("data-pitch")));
+  });
+
+  document.querySelectorAll(".add-item-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const bucket = btn.getAttribute("data-bucket");
+      state[bucket].push({
+        title: "",
+        description: "",
+        pitch: "",
+        build: "",
+        notes: ""
+      });
+      saveState();
+      renderAll();
+      openModal(bucket, state[bucket].length - 1);
+    });
+  });
+
+  renderAll();
+  refreshScoutData();
+  console.log("app init complete");
+}
+
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", bindButtons);
+} else {
+  bindButtons();
+}
+console.log("app.js finished loading");

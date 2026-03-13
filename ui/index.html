@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>Topher Brain v0.8</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' x2='1' y1='0' y2='1'%3E%3Cstop stop-color='%23d97706'/%3E%3Cstop offset='1' stop-color='%233b82f6'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect rx='14' width='64' height='64' fill='%23161616'/%3E%3Ctext x='10' y='47' font-size='38'%3E🧠%3C/text%3E%3C/svg%3E">
+  <!-- CSS loaded via main.js import for Vite bundling -->
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">Topher's AI Workshop</p>
+      <h1>Topher Brain v0.8</h1>
+      <p class="subtext">Opportunity board, Scout Console, Pitch Mode, real site auditor.</p>
+    </div>
+    <div class="topbar-actions">
+      <button id="exportBrain" class="ghost-btn" type="button">Backup Brain</button>
+      <label class="ghost-btn import-label">
+        <input type="file" id="importBrain" accept=".json,application/json" style="display:none" />
+        Import
+      </label>
+    </div>
+  </header>
+
+  <nav class="main-nav">
+    <ul>
+      <li><button type="button" class="main-nav-btn active" data-main-tab="dashboard">Dashboard</button></li>
+      <li><button type="button" class="main-nav-btn" data-main-tab="scout">Scout Console</button></li>
+      <li><button type="button" class="main-nav-btn" data-main-tab="pitch">Pitch Mode</button></li>
+    </ul>
+  </nav>
+
+  <main class="dashboard">
+    <div id="auth-container"></div>
+    <section id="dashboard" class="tab-panel active">
+    <section class="grid">
+      <article class="panel">
+        <div class="panel-header">
+          <h3>Opportunities</h3>
+          <span class="count" id="opportunities-count">0</span>
+        </div>
+        <div id="opportunities-list" class="card-list"></div>
+        <button type="button" class="add-item-btn" data-bucket="opportunities">+ Add</button>
+      </article>
+
+      <article class="panel">
+        <div class="panel-header">
+          <h3>Ideas</h3>
+          <span class="count" id="ideas-count">0</span>
+        </div>
+        <div id="ideas-list" class="card-list"></div>
+        <button type="button" class="add-item-btn" data-bucket="ideas">+ Add</button>
+      </article>
+
+      <article class="panel">
+        <div class="panel-header">
+          <h3>Active Projects</h3>
+          <span class="count" id="projects-count">0</span>
+        </div>
+        <div id="projects-list" class="card-list"></div>
+        <button type="button" class="add-item-btn" data-bucket="projects">+ Add</button>
+      </article>
+
+      <article class="panel">
+        <div class="panel-header">
+          <h3>Memory</h3>
+          <span class="count" id="memory-count">0</span>
+        </div>
+        <div id="memory-list" class="card-list"></div>
+        <button type="button" class="add-item-btn" data-bucket="memory">+ Add</button>
+      </article>
+    </section>
+
+    <section class="panel analyze-panel" id="analyzeConsole">
+      <div class="panel-header">
+        <h3>Analyze + Draft</h3>
+        <span class="count">v0.8</span>
+      </div>
+      <div class="quick-form analyze-form">
+        <input id="analyzeName" placeholder="Business name" />
+        <input id="analyzeType" placeholder="Type (diner, coffee shop, church)" />
+        <input id="analyzeWebsite" placeholder="Website URL" />
+        <input id="analyzeCity" placeholder="City" />
+        <button type="button" id="runAnalyze" class="primary-btn">Analyze</button>
+      </div>
+      <div class="analyze-grid">
+        <div class="item-card">
+          <h4>Problems Found</h4>
+          <div id="analysisProblems" class="analysis-bullets"></div>
+        </div>
+        <div class="item-card">
+          <h4>Pitch Angle</h4>
+          <div id="analysisPitch" class="analysis-bullets"></div>
+        </div>
+      </div>
+      <div class="item-card" style="margin-top:14px;">
+        <h4>Audit Facts</h4>
+        <div id="analysisFacts" class="analysis-bullets"></div>
+      </div>
+      <div class="item-card analyze-email-card">
+        <h4>Email Draft</h4>
+        <label class="modal-label" for="analysisSubject">Subject</label>
+        <input id="analysisSubject" class="modal-input" />
+        <label class="modal-label" for="analysisEmail">Body</label>
+        <textarea id="analysisEmail" class="modal-textarea analyze-email-body"></textarea>
+      </div>
+      <div class="analyze-actions">
+        <button type="button" id="copyEmailBtn" class="primary-btn">Copy Email</button>
+        <button type="button" id="saveOpportunityBtn" class="ghost-btn">Save as Opportunity</button>
+        <button type="button" id="saveIdeaBtn" class="ghost-btn">Save as Idea</button>
+      </div>
+    </section>
+
+    <section class="panel" id="morningRunnerPanel">
+      <div class="panel-header runner-panel-header">
+        <div>
+          <h3>Morning Runner</h3>
+          <span class="runner-status" id="runnerStatus">Idle</span>
+        </div>
+        <span class="count" id="morningRunnerCount">0</span>
+      </div>
+      <div id="scoutErrorBanner" class="scout-error-banner hidden" role="alert">
+        <div class="scout-error-title">Scout failed</div>
+        <div class="scout-error-body" id="scoutErrorBody"></div>
+        <details class="scout-error-details">
+          <summary>Technical details</summary>
+          <pre id="scoutErrorDetailsPre" class="scout-error-pre"></pre>
+        </details>
+      </div>
+      <div class="runner-actions">
+        <button type="button" id="runMorningScoutBtn" class="primary-btn">Run Scout</button>
+        <button type="button" id="refreshScoutBtn" class="ghost-btn">Refresh Scout Data</button>
+        <span class="runner-loading-indicator hidden" id="runnerLoadingIndicator" aria-hidden="true"></span>
+        <span class="tag" id="scoutGeneratedAt">No scout run yet</span>
+      </div>
+      <div class="item-card runner-summary-card">
+        <h4>Morning Summary</h4>
+        <p id="morningRunnerSummary">No scout data loaded yet.</p>
+      </div>
+      <div id="runnerTodaySection" class="runner-today-section">
+        <h4>Today</h4>
+        <p class="runner-today-hint">Leads ready to contact + follow-ups</p>
+        <div id="runnerTodayList" class="runner-today-list"></div>
+      </div>
+      <div class="runner-filter-row">
+        <span class="runner-filter-label">Filter:</span>
+        <div id="runnerStatusFilters" class="runner-status-filters"></div>
+      </div>
+      <div id="morningRunnerList" class="card-list"></div>
+    </section>
+    </section>
+
+    <section id="scout" class="tab-panel">
+      <h2>Opportunity Scout</h2>
+      <p class="scout-intro">Scan for website clients. Uses <code>scout/config.json</code> when available.</p>
+      <div class="scout-form">
+        <input id="scoutCity" placeholder="City (from config or type here)" />
+        <input id="scoutType" placeholder="Single type override (optional)" />
+        <button type="button" id="runScoutBtn" class="primary-btn">Scan For Opportunities</button>
+      </div>
+      <p id="scoutConfigStatus" class="scout-config-status"></p>
+      <div id="scoutResults"></div>
+    </section>
+
+    <section id="pitch" class="tab-panel">
+      <h2>Pitch Mode</h2>
+      <p>Quick pitch screens you can show to business owners.</p>
+      <div class="pitch-buttons">
+        <button type="button" data-pitch="diner">Diner Pitch</button>
+        <button type="button" data-pitch="coffee">Coffee Shop Pitch</button>
+        <button type="button" data-pitch="church">Church Pitch</button>
+      </div>
+      <div id="pitchDisplay"></div>
+    </section>
+  </main>
+
+  <div id="caseDetailModal" class="modal hidden" aria-hidden="true">
+    <div class="modal-backdrop" id="caseDetailBackdrop"></div>
+    <div class="modal-panel case-detail-panel" role="dialog" aria-modal="true" aria-labelledby="caseDetailTitle">
+      <div class="modal-top">
+        <h2 id="caseDetailTitle">Opportunity Details</h2>
+        <button id="closeCaseDetailBtn" class="ghost-btn modal-close" type="button">Close</button>
+      </div>
+      <div id="caseDetailContent" class="case-detail-content"></div>
+    </div>
+  </div>
+
+  <div id="rawCaseModal" class="modal hidden" aria-hidden="true">
+    <div class="modal-backdrop" id="rawCaseBackdrop"></div>
+    <div class="modal-panel case-detail-panel" role="dialog" aria-modal="true">
+      <div class="modal-top">
+        <h2>Raw Case File</h2>
+        <button id="closeRawCaseBtn" class="ghost-btn modal-close" type="button">Close</button>
+      </div>
+      <pre id="rawCaseContent" class="raw-case-pre"></pre>
+    </div>
+  </div>
+
+  <div id="modal" class="modal hidden" aria-hidden="true">
+    <div class="modal-backdrop" id="modalBackdrop"></div>
+    <div class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="modalTitleLabel">
+      <div class="modal-top">
+        <h2 id="modalTitleLabel">Brain Item</h2>
+        <button id="closeModalBtn" class="ghost-btn modal-close" type="button">Close</button>
+      </div>
+      <div class="modal-content">
+        <label class="modal-label" for="modalTitle">Title</label>
+        <input id="modalTitle" class="modal-input" />
+
+        <div class="tabs">
+          <button type="button" data-tab="overview">Overview</button>
+          <button type="button" data-tab="pitch">Pitch</button>
+          <button type="button" data-tab="build">Build Plan</button>
+          <button type="button" data-tab="notes">Notes</button>
+        </div>
+
+        <div id="tab-overview" class="tab">
+          <label class="modal-label" for="modalDescription">Description</label>
+          <textarea id="modalDescription" class="modal-textarea"></textarea>
+        </div>
+
+        <div id="tab-pitch" class="tab">
+          <label class="modal-label" for="modalPitch">Pitch</label>
+          <textarea id="modalPitch" class="modal-textarea"></textarea>
+        </div>
+
+        <div id="tab-build" class="tab">
+          <label class="modal-label" for="modalBuild">Build Plan</label>
+          <textarea id="modalBuild" class="modal-textarea"></textarea>
+        </div>
+
+        <div id="tab-notes" class="tab">
+          <label class="modal-label" for="modalNotes">Notes</label>
+          <textarea id="modalNotes" class="modal-textarea"></textarea>
+        </div>
+
+        <button id="modalSave" class="primary-btn" type="button">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="/main.js"></script>
+</body>
+</html>

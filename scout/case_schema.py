@@ -1,0 +1,273 @@
+"""
+Case file schema for Massive Brain v2 — one detailed JSON per lead.
+
+Each opportunity is stored as a full case with identity, contact, site audit,
+and outreach fields. Used by Morning Runner and the single app.
+"""
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+from typing import Any
+
+# All fields we want per opportunity (detailed case file)
+CASE_FIELDS = [
+    # Identity & location
+    "business_name",
+    "category",
+    "distance_miles",
+    "address",
+    "phone",
+    "website",
+    "maps_link",
+    "hours",
+    "rating",
+    "review_count",
+    # Contact
+    "email",
+    "contact_page",
+    "phone_from_site",
+    "facebook",
+    "instagram",
+    "owner_manager_name",
+    "recommended_contact_method",
+    "backup_contact_method",
+    # Site / tech (from audit)
+    "platform_used",
+    "homepage_title",
+    "meta_description",
+    "viewport_ok",
+    "tap_to_call_present",
+    "menu_visibility",
+    "hours_visibility",
+    "directions_visibility",
+    "contact_form_present",
+    "text_heavy_clues",
+    "outdated_design_clues",
+    # Outreach
+    "strongest_problems",
+    "strongest_pitch_angle",
+    "best_service_to_offer",
+    "demo_to_show",
+    "short_email",
+    "longer_email",
+    "contact_form_version",
+    "follow_up_note",
+    "internal_score",
+    "priority",
+]
+
+# Legacy UI shape: some keys are nested (e.g. website_analysis, email_draft, contact).
+# We keep a flat case file on disk and convert to/from UI shape in the app.
+
+
+def empty_case(slug: str = "") -> dict[str, Any]:
+    """Return one case dict with all fields set to None or empty."""
+    return {
+        "slug": slug,
+        "business_name": None,
+        "category": None,
+        "distance_miles": None,
+        "address": None,
+        "phone": None,
+        "website": None,
+        "maps_link": None,
+        "hours": None,
+        "rating": None,
+        "review_count": None,
+        "email": None,
+        "contact_page": None,
+        "phone_from_site": None,
+        "facebook": None,
+        "instagram": None,
+        "owner_manager_name": None,
+        "lane": "weak_website",
+        "no_website": False,
+        "owner_names": [],
+        "emails": [],
+        "phones": [],
+        "reservation_link": None,
+        "order_link": None,
+        "contact_matrix": {},
+        "discovered_pages": [],
+        "recommended_contact_method": None,
+        "backup_contact_method": None,
+        "platform_used": None,
+        "homepage_title": None,
+        "meta_description": None,
+        "viewport_ok": None,
+        "tap_to_call_present": None,
+        "menu_visibility": None,
+        "hours_visibility": None,
+        "directions_visibility": None,
+        "contact_form_present": None,
+        "text_heavy_clues": None,
+        "outdated_design_clues": None,
+        "social_links": {},
+        "internal_links_found": {},
+        "page_navigation_items": [],
+        "ssl_ok": None,
+        "strongest_problems": [],
+        "strongest_pitch_angle": None,
+        "best_service_to_offer": None,
+        "demo_to_show": None,
+        "short_email": None,
+        "longer_email": None,
+        "contact_form_version": None,
+        "social_dm_version": None,
+        "follow_up_note": None,
+        "follow_up_line": None,
+        "why_problems_matter_customers": None,
+        "why_problems_matter_owner": None,
+        "why_worth_pursuing": None,
+        "what_stood_out": None,
+        "next_action": None,
+        "follow_up_suggestion": None,
+        "social_links": {},
+        "internal_links_found": {},
+        "page_navigation_items": [],
+        "ssl_ok": None,
+        "internal_score": None,
+        "priority": None,
+        # Outreach queue
+        "status": "New",
+        "first_contacted_at": None,
+        "last_contacted_at": None,
+        "follow_up_due": None,
+        "outcome": None,
+        "outreach_notes": None,
+    }
+
+
+def slug_from_name(name: str, index: int = 0) -> str:
+    """Generate a filesystem-safe slug from business name + index."""
+    base = re.sub(r"[^\w\s-]", "", (name or "lead").lower())
+    base = re.sub(r"[-\s]+", "-", base).strip("-") or "lead"
+    return f"{base}-{index}" if index else base
+
+
+def case_to_ui(c: dict[str, Any]) -> dict[str, Any]:
+    """Convert flat case file to legacy UI shape (name, website_analysis, email_draft, etc.)."""
+    problems = c.get("strongest_problems") or []
+    return {
+        "slug": c.get("slug"),
+        "name": c.get("business_name"),
+        "distance_miles": c.get("distance_miles"),
+        "category": c.get("category"),
+        "address": c.get("address"),
+        "phone": c.get("phone"),
+        "website": c.get("website"),
+        "maps_url": c.get("maps_link"),
+        "recommended_contact": c.get("recommended_contact_method"),
+        "website_analysis": {
+            "platform": c.get("platform_used"),
+            "issues": problems if isinstance(problems, list) else [problems],
+            "facts": _facts_from_case(c),
+        },
+        "score": c.get("internal_score"),
+        "pitch_angle": c.get("strongest_pitch_angle"),
+        "email_draft": {
+            "subject": _email_subject(c),
+            "body": c.get("short_email") or c.get("longer_email") or "",
+        },
+        "contact": {
+            "email": c.get("email"),
+            "emails": c.get("emails") or [],
+            "phones": c.get("phones") or [],
+            "contact_page": c.get("contact_page"),
+            "phone_from_site": c.get("phone_from_site"),
+            "facebook": c.get("facebook"),
+            "instagram": c.get("instagram"),
+        },
+        "hours": c.get("hours"),
+        "rating": c.get("rating"),
+        "review_count": c.get("review_count"),
+        "owner_manager_name": c.get("owner_manager_name"),
+        "lane": c.get("lane", "weak_website"),
+        "no_website": c.get("no_website", False),
+        "backup_contact_method": c.get("backup_contact_method"),
+        "homepage_title": c.get("homepage_title"),
+        "meta_description": c.get("meta_description"),
+        "viewport_ok": c.get("viewport_ok"),
+        "tap_to_call_present": c.get("tap_to_call_present"),
+        "menu_visibility": c.get("menu_visibility"),
+        "hours_visibility": c.get("hours_visibility"),
+        "directions_visibility": c.get("directions_visibility"),
+        "contact_form_present": c.get("contact_form_present"),
+        "best_service_to_offer": c.get("best_service_to_offer"),
+        "demo_to_show": c.get("demo_to_show"),
+        "longer_email": c.get("longer_email"),
+        "contact_form_version": c.get("contact_form_version"),
+        "social_dm_version": c.get("social_dm_version"),
+        "follow_up_note": c.get("follow_up_note"),
+        "follow_up_line": c.get("follow_up_line"),
+        "why_problems_matter_customers": c.get("why_problems_matter_customers"),
+        "why_problems_matter_owner": c.get("why_problems_matter_owner"),
+        "why_worth_pursuing": c.get("why_worth_pursuing"),
+        "what_stood_out": c.get("what_stood_out"),
+        "next_action": c.get("next_action"),
+        "follow_up_suggestion": c.get("follow_up_suggestion"),
+        "social_links": c.get("social_links") or {},
+        "internal_links_found": c.get("internal_links_found") or {},
+        "page_navigation_items": c.get("page_navigation_items") or [],
+        "owner_names": c.get("owner_names") or [],
+        "emails": c.get("emails") or [],
+        "phones": c.get("phones") or [],
+        "reservation_link": c.get("reservation_link"),
+        "order_link": c.get("order_link"),
+        "contact_matrix": c.get("contact_matrix") or {},
+        "discovered_pages": c.get("discovered_pages") or [],
+        "ssl_ok": c.get("ssl_ok"),
+        "priority": c.get("priority"),
+        "status": c.get("status") or "New",
+        "first_contacted_at": c.get("first_contacted_at"),
+        "last_contacted_at": c.get("last_contacted_at"),
+        "follow_up_due": c.get("follow_up_due"),
+        "outcome": c.get("outcome"),
+        "outreach_notes": c.get("outreach_notes"),
+    }
+
+
+def _facts_from_case(c: dict[str, Any]) -> list[str]:
+    facts = []
+    if c.get("homepage_title"):
+        facts.append(f"Title: {c['homepage_title'][:100]}")
+    if c.get("platform_used"):
+        facts.append(f"Platform: {c['platform_used']}")
+    if c.get("viewport_ok") is False:
+        facts.append("Viewport/mobile: issues")
+    if c.get("tap_to_call_present"):
+        facts.append("Tap-to-call present")
+    return facts
+
+
+def _email_subject(c: dict[str, Any]) -> str:
+    name = c.get("business_name") or "your business"
+    return f"Quick idea for {name}'s website"
+
+
+def load_cases_dir(cases_dir: Path) -> list[dict]:
+    """Load all case JSON files from scout/cases/ and return as UI-shaped list."""
+    if not cases_dir.is_dir():
+        return []
+    cases = []
+    for path in sorted(cases_dir.glob("*.json")):
+        try:
+            with open(path, encoding="utf-8") as f:
+                c = json.load(f)
+            cases.append(case_to_ui(c))
+        except Exception:
+            continue
+    return cases
+
+
+def save_case(cases_dir: Path, case: dict[str, Any]) -> Path:
+    """Write one case to scout/cases/{slug}.json. Creates dir if needed."""
+    cases_dir.mkdir(parents=True, exist_ok=True)
+    slug = case.get("slug") or slug_from_name(case.get("business_name"), 0)
+    case["slug"] = slug
+    path = cases_dir / f"{slug}.json"
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(case, f, indent=2)
+    return path

@@ -1,0 +1,20 @@
+[
+  {
+    "title": "MixedMakerShop website",
+    "description": "Refining messaging, pricing, and starter kit visibility.",
+    "priority": "high",
+    "status": "Active"
+  },
+  {
+    "title": "Southern diner concept page",
+    "description": "Make it more alive, colorful, and persuasive for local pitching.",
+    "priority": "high",
+    "status": "Active"
+  },
+  {
+    "title": "Letters to daughters book",
+    "description": "Build a printable collection for a future book.",
+    "priority": "medium",
+    "status": "Ongoing"
+  }
+]

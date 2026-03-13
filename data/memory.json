@@ -1,0 +1,20 @@
+[
+  {
+    "title": "Primary income focus",
+    "description": "Web design is the main engine. 3D printing is secondary.",
+    "priority": "high",
+    "type": "Rule"
+  },
+  {
+    "title": "Best work time",
+    "description": "Mornings are strongest for focused building.",
+    "priority": "medium",
+    "type": "Personal"
+  },
+  {
+    "title": "Avoid overload",
+    "description": "Pick one clear task, not ten. Simplicity keeps momentum.",
+    "priority": "high",
+    "type": "Guidance"
+  }
+]

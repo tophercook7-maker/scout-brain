@@ -1,0 +1,11 @@
+{
+  "home_city": "Hot Springs, Arkansas",
+  "search_radius_miles": 25,
+  "categories": [
+    "coffee shop",
+    "diner",
+    "church"
+  ],
+  "max_results_per_category": 5,
+  "ignore_chains": true
+}

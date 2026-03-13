@@ -1,0 +1,33 @@
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Node / frontend
+node_modules
+dist
+build
+coverage
+
+# Python
+.venv
+__pycache__
+*.pyc
+
+# OS / editor
+.DS_Store
+.cursor
+
+# Supabase local state
+.supabase
+
+# Logs and temp
+*.log
+tmp
+temp
+
+# Scout local generated output
+scout/cases/*.json
+scout/opportunities.json
+scout/today.json
+scout/history.json

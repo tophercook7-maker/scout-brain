@@ -1,0 +1,20 @@
+[
+  {
+    "title": "Menu Updater",
+    "description": "A simple tool or service for updating specials and prices fast.",
+    "priority": "high",
+    "type": "Product"
+  },
+  {
+    "title": "Southern Diner Concept",
+    "description": "A warm, mobile-friendly diner sample to pitch to local family restaurants.",
+    "priority": "high",
+    "type": "Portfolio Demo"
+  },
+  {
+    "title": "Coffee Shop Starter Kit",
+    "description": "DIY website kit with warm, modern, and dark style options.",
+    "priority": "medium",
+    "type": "Digital Product"
+  }
+]

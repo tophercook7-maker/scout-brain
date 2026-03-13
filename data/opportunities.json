@@ -1,0 +1,20 @@
+[
+  {
+    "title": "Family diner with weak mobile menu",
+    "description": "Site is functional but basic. Good chance for a cleaner mobile-first redesign pitch.",
+    "priority": "high",
+    "type": "Local Lead"
+  },
+  {
+    "title": "Coffee shop with broken website link",
+    "description": "Facebook looks active but website link is dead. Strong opening for outreach.",
+    "priority": "high",
+    "type": "Local Lead"
+  },
+  {
+    "title": "Church website template opportunity",
+    "description": "Local churches often need simple, trustworthy sites with events and contact info.",
+    "priority": "medium",
+    "type": "Template Opportunity"
+  }
+]
