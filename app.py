@@ -17,6 +17,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 from urllib import request as urllib_request
+from urllib.parse import urlparse
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
@@ -204,16 +205,96 @@ def _job_update(job_id: str, **updates) -> dict | None:
 def _get_user_id_from_request(request: Request) -> str | None:
     """Verify Bearer JWT and return user_id (uuid). Returns None if no/invalid auth."""
     auth = request.headers.get("Authorization")
+    print(f"  [Auth] Authorization header present: {bool(auth)}")
     if not auth or not auth.startswith("Bearer "):
+        print("  [Auth] missing/invalid bearer header")
         return None
     token = auth[7:].strip()
-    if not token or not _supabase_jwt_secret:
+    if not token:
+        print("  [Auth] empty bearer token")
         return None
+
+    print("  [Auth] token decode starting")
+    token_issuer_host = None
     try:
         import jwt
-        payload = jwt.decode(token, _supabase_jwt_secret, algorithms=["HS256"])
-        return payload.get("sub")
+        unverified = jwt.decode(
+            token,
+            options={"verify_signature": False, "verify_aud": False},
+        )
+        token_issuer = str(unverified.get("iss") or "").strip()
+        token_issuer_host = urlparse(token_issuer).netloc or None
     except Exception:
+        token_issuer_host = None
+
+    configured_supabase_host = urlparse(_supabase_url or "").netloc or None
+    if token_issuer_host:
+        print(f"  [Auth] token issuer host: {token_issuer_host}")
+    if configured_supabase_host:
+        print(f"  [Auth] backend SUPABASE_URL host: {configured_supabase_host}")
+
+    # Preferred verification path: ask Supabase Auth to validate the access token.
+    # This supports both HS256 and RS256 projects.
+    if _supabase_url and _supabase_service_key:
+        try:
+            req = urllib_request.Request(
+                f"{_supabase_url.rstrip('/')}/auth/v1/user",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "apikey": _supabase_service_key,
+                },
+                method="GET",
+            )
+            with urllib_request.urlopen(req, timeout=10) as resp:
+                code = getattr(resp, "status", 200)
+                raw = resp.read().decode("utf-8", errors="ignore")
+                payload = json.loads(raw) if raw else {}
+                if 200 <= int(code) < 300:
+                    user_id = str(payload.get("id") or payload.get("sub") or "").strip()
+                    if user_id:
+                        print("  [Auth] token verification succeeded")
+                        print("  [Auth] user id resolved")
+                        return user_id
+                    print("  [Auth] token verification failed: user id not resolved", file=sys.stderr)
+                else:
+                    print(f"  [Auth] token verification failed: upstream {code}", file=sys.stderr)
+        except Exception as e:
+            print(
+                f"  [Auth] token verification via Supabase failed: {type(e).__name__}",
+                file=sys.stderr,
+            )
+
+    if not _supabase_jwt_secret:
+        print("  [Auth] SUPABASE_JWT_SECRET is missing")
+        print("  [Auth] user id not resolved")
+        return None
+
+    # Fallback for legacy HS256 setups.
+    try:
+        import jwt
+        payload = jwt.decode(
+            token,
+            _supabase_jwt_secret,
+            algorithms=["HS256"],
+            options={"verify_aud": False},
+        )
+        user_id = str(payload.get("sub") or "").strip()
+        if user_id:
+            print("  [Auth] token verification succeeded")
+            print("  [Auth] user id resolved")
+            return user_id
+        print("  [Auth] token verification failed: user id not resolved", file=sys.stderr)
+        return None
+    except Exception as e:
+        reason = type(e).__name__
+        if reason == "InvalidSignatureError":
+            print(
+                "  [Auth] token verification failed: InvalidSignatureError (likely Supabase project mismatch or wrong JWT secret)",
+                file=sys.stderr,
+            )
+        else:
+            print(f"  [Auth] token verification failed: {reason}", file=sys.stderr)
+        print("  [Auth] user id not resolved")
         return None
 
 

@@ -44,10 +44,12 @@ Use this checklist to deploy Massive Brain so it runs from any device without yo
 
 Set in the Railway dashboard:
 
+For MixedMakerShop admin proxy auth to work, these three backend values must come from the exact same Supabase project as MixedMakerShop (`https://zwdsnwvuhaesbllzbfmt.supabase.co`): `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, and `SUPABASE_JWT_SECRET`.
+
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `GOOGLE_MAPS_API_KEY` | Yes (for Run Scout) | Google Cloud API key with Places API (New) + Geocoding enabled |
-| `SUPABASE_URL` | Yes (for sync) | `https://YOUR_PROJECT_REF.supabase.co` |
+| `SUPABASE_URL` | Yes (for sync/auth verification context) | `https://zwdsnwvuhaesbllzbfmt.supabase.co` |
 | `SUPABASE_SERVICE_ROLE_KEY` | Yes (for sync) | From Supabase → Settings → API → service_role (secret) |
 | `SUPABASE_JWT_SECRET` | Yes (for sync) | From Supabase → Settings → API → JWT Secret |
 | `PORT` | No | Railway sets this automatically |
@@ -87,7 +89,7 @@ Set in the Railway dashboard:
 
 | Variable | Value |
 |----------|--------|
-| `VITE_SUPABASE_URL` | `https://YOUR_PROJECT_REF.supabase.co` |
+| `VITE_SUPABASE_URL` | `https://zwdsnwvuhaesbllzbfmt.supabase.co` |
 | `VITE_SUPABASE_ANON_KEY` | Your Supabase anon (public) key |
 | `VITE_API_BASE_URL` | Your **backend** URL, e.g. `https://brain-api.mixedmakershop.com` or Railway URL (no trailing slash) |
 

@@ -1,6 +1,6 @@
 -- Massive Brain — Supabase schema
 -- Apply in: Supabase Dashboard → SQL Editor
--- Project: jtqbcryjzjtlhsllhpvp
+-- Project: use your active deployment project (for MixedMakerShop integration, use zwdsnwvuhaesbllzbfmt)
 
 -- Profiles (extends auth.users)
 create table if not exists public.profiles (

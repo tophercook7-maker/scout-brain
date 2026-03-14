@@ -1,10 +1,14 @@
 # Massive Brain — Connect to Supabase
 
-Use your existing project: [jtqbcryjzjtlhsllhpvp](https://supabase.com/dashboard/project/jtqbcryjzjtlhsllhpvp)
+For MixedMakerShop integration, Scout-Brain must use the same Supabase project as MixedMakerShop admin:
+
+- `https://zwdsnwvuhaesbllzbfmt.supabase.co`
+
+Do not mix projects for auth-enabled API calls.
 
 ## 1. Run the schema
 
-1. Open [Supabase SQL Editor](https://supabase.com/dashboard/project/jtqbcryjzjtlhsllhpvp/sql/new)
+1. Open the SQL Editor for your selected shared project
 2. Paste the contents of `supabase/migrations/001_initial.sql`
 3. Run
 
@@ -27,8 +31,11 @@ cp .env.example .env
 Edit `.env`:
 
 ```
-VITE_SUPABASE_URL=https://jtqbcryjzjtlhsllhpvp.supabase.co
+VITE_SUPABASE_URL=https://zwdsnwvuhaesbllzbfmt.supabase.co
 VITE_SUPABASE_ANON_KEY=your-anon-key-here
+SUPABASE_URL=https://zwdsnwvuhaesbllzbfmt.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=your-service-role-key-here
+SUPABASE_JWT_SECRET=your-jwt-secret-here
 ```
 
 ## 5. Run the app
@@ -44,5 +51,5 @@ Open http://localhost:5173. Sign up with email/password. Data syncs to Supabase.
 
 Set env vars in Vercel project settings:
 
-- `VITE_SUPABASE_URL` = your Supabase URL
+- `VITE_SUPABASE_URL` = `https://zwdsnwvuhaesbllzbfmt.supabase.co`
 - `VITE_SUPABASE_ANON_KEY` = your anon key

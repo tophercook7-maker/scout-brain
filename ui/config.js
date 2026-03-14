@@ -2,7 +2,7 @@
  * Massive Brain — Supabase config
  * Set in .env or Vercel/hosting env:
  *
- *   VITE_SUPABASE_URL=https://jtqbcryjzjtlhsllhpvp.supabase.co
+ *   VITE_SUPABASE_URL=https://zwdsnwvuhaesbllzbfmt.supabase.co
  *   VITE_SUPABASE_ANON_KEY=your-anon-key
  *
  * Or: SUPABASE_URL, SUPABASE_ANON_KEY (if build injects them)

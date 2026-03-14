@@ -120,6 +120,8 @@ python3 app.py
 - `ALLOWED_ORIGINS` (comma-separated explicit frontend origins)
 - `PORT` (set automatically by Railway)
 
+When Scout-Brain is called from MixedMakerShop admin, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, and `SUPABASE_JWT_SECRET` must all come from the same Supabase project used by MixedMakerShop auth (`https://zwdsnwvuhaesbllzbfmt.supabase.co`).
+
 `SUPABASE_ANON_KEY` is not required by the backend for current server flows.
 
 ## Backend API routes used by frontend
