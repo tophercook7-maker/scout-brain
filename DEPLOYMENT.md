@@ -41,9 +41,14 @@ Set in the Railway dashboard:
 ### 2.3 Deploy
 
 - [ ] Railway Docker deploy uses root `Dockerfile` (Python-only runtime).
+- [ ] Service uses Dockerfile deploy mode (not Nixpacks) for backend-only runtime.
+- [ ] Repo Railway config (`railway.json`) uses:
+  - Build: `pip install -r requirements.txt`
+  - Start: `python3 app.py`
 - [ ] Dockerfile does not run frontend build commands (`npm install`, `npm ci`, `npm run build`).
 - [ ] Build command: `pip install -r requirements.txt`
-- [ ] Start command: `uvicorn app:app --host 0.0.0.0 --port $PORT`
+- [ ] Start command: `python3 app.py`
+- [ ] `app.py` reads `PORT` from env and binds host `0.0.0.0`
 - [ ] Railway uses backend-only mode (`SERVE_FRONTEND=0` by default)
 - [ ] Deploy; note the generated URL (e.g. `https://your-app.up.railway.app`)
 

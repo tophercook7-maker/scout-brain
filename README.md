@@ -98,10 +98,14 @@ Railway is backend-only for this project (frontend runs on Vercel).
 Docker deploy mode (recommended for Railway):
 
 - Root `Dockerfile` uses `python:3.11-slim` and installs from `requirements.txt`.
-- Container start command runs FastAPI via:
-  - `uvicorn app:app --host 0.0.0.0 --port ${PORT:-8080}`
+- Preferred production entrypoint is `python3 app.py`.
+- `app.py` binds to `0.0.0.0` and reads port from `os.environ.get("PORT", 8760)`.
 - `SERVE_FRONTEND=0` is set in the container (API-only mode).
 - Do not run frontend build commands in Railway Docker builds (`npm install`, `npm ci`, `npm run build`).
+- Use Dockerfile deploy in Railway (do not use Nixpacks for this backend service).
+- Repo Railway config (`railway.json`) is set to:
+  - Build: `pip install -r requirements.txt`
+  - Start: `python3 app.py`
 
 Build command:
 
@@ -112,10 +116,10 @@ pip install -r requirements.txt
 Start command:
 
 ```bash
-uvicorn app:app --host 0.0.0.0 --port $PORT
+python3 app.py
 ```
 
-`Procfile` already includes the same start command.
+`Procfile` uses the same entrypoint.
 
 Do **not** set Railway build steps to `npm install` or `npm run build`.
 
