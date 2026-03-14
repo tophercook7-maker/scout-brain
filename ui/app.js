@@ -197,17 +197,27 @@ function setActiveAdminModuleNav(module) {
   });
 }
 
+function setVisible(el, show) {
+  if (!el) return;
+  el.classList.toggle("hidden", !show);
+}
+
 function applyAdminRouteView() {
   const path = (window.location.pathname || "").replace(/\/$/, "");
   if (!(path === "/admin" || path.startsWith("/admin/"))) return;
   const module = currentAdminModule();
-
-  // Keep one code path and reuse existing panels while focusing module context.
-  showMainTab("dashboard");
   setActiveAdminModuleNav(module);
   const routeLabel = document.getElementById("adminRouteLabel");
   if (routeLabel) routeLabel.textContent = path;
   const moduleDescription = document.getElementById("adminModuleDescription");
+  const moduleIntro = document.getElementById("adminModuleIntro");
+  const moduleTitle = document.getElementById("adminModuleTitle");
+  const moduleHelp = document.getElementById("adminModuleHelp");
+  const dashboardSummary = document.getElementById("adminDashboardSummary");
+  const dashboardGrid = document.getElementById("dashboardGrid");
+  const analyzeConsole = document.getElementById("analyzeConsole");
+  const morningRunnerPanel = document.getElementById("morningRunnerPanel");
+  const moduleCards = document.querySelectorAll("[data-module-card]");
   if (moduleDescription) {
     const labels = {
       dashboard: "Dashboard",
@@ -220,28 +230,53 @@ function applyAdminRouteView() {
     moduleDescription.textContent = labels[module] || "Dashboard";
   }
 
+  const moduleGuidance = {
+    dashboard: "Overview of pipeline counts, discovered leads, follow-ups, and top opportunities.",
+    scout: "Run Scout and review latest scans with the location used for distance calculations.",
+    leads: "Sortable lead list with status tags and one-click access to full case dossiers.",
+    cases: "Full business dossier review with deep research, contact matrix, and outreach pack.",
+    outreach: "Contact queue focused on follow-ups and rapid status changes.",
+    notes: "Central notes workspace for CRM context and follow-up memory.",
+  };
+  if (moduleTitle) moduleTitle.textContent = moduleDescription?.textContent || "Dashboard";
+  if (moduleHelp) moduleHelp.textContent = moduleGuidance[module] || moduleGuidance.dashboard;
+
+  moduleCards.forEach((card) => card.classList.remove("hidden"));
+  setVisible(moduleIntro, module !== "dashboard");
+  setVisible(dashboardSummary, module === "dashboard");
+  setVisible(analyzeConsole, module === "scout");
+
   if (module === "dashboard") {
     _runnerStatusFilter = "all";
     _runnerSort = "priority";
-    document.getElementById("adminDashboardSummary")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    setVisible(dashboardGrid, true);
+    setVisible(morningRunnerPanel, false);
   } else if (module === "scout") {
     _runnerStatusFilter = "all";
     _runnerSort = "priority";
-    document.getElementById("morningRunnerPanel")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    setVisible(dashboardGrid, false);
+    setVisible(morningRunnerPanel, true);
   } else if (module === "leads") {
     _runnerStatusFilter = "all";
     _runnerSort = "name";
-    document.getElementById("morningRunnerPanel")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    setVisible(dashboardGrid, false);
+    setVisible(morningRunnerPanel, true);
   } else if (module === "cases") {
     _runnerStatusFilter = "all";
     _runnerSort = "priority";
-    document.getElementById("morningRunnerPanel")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    setVisible(dashboardGrid, false);
+    setVisible(morningRunnerPanel, true);
   } else if (module === "outreach") {
     _runnerStatusFilter = "Follow up";
     _runnerSort = "priority";
-    document.getElementById("morningRunnerPanel")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    setVisible(dashboardGrid, false);
+    setVisible(morningRunnerPanel, true);
   } else if (module === "notes") {
-    document.getElementById("memory-list")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    setVisible(dashboardGrid, true);
+    setVisible(morningRunnerPanel, false);
+    moduleCards.forEach((card) => {
+      card.classList.toggle("hidden", card.getAttribute("data-module-card") !== "memory");
+    });
   }
 
   if (_runnerLastPayload) {
@@ -842,8 +877,6 @@ function buildCardDataSection(opp) {
     if (val && (label === "Website" || label === "Contact page" || label === "Facebook" || label === "Instagram")) {
       const link = document.createElement("a");
       link.href = val;
-      link.target = "_blank";
-      link.rel = "noopener";
       link.textContent = val.length > 45 ? val.slice(0, 42) + "…" : val;
       link.className = "runner-data-link";
       row.querySelector(".runner-data-val").innerHTML = "";
@@ -883,8 +916,6 @@ function buildContactMatrixSection(opp) {
     if (isUrl && val) {
       const a = document.createElement("a");
       a.href = val;
-      a.target = "_blank";
-      a.rel = "noopener";
       a.textContent = val.length > 50 ? val.slice(0, 47) + "…" : val;
       valSpan.appendChild(a);
     } else {
@@ -908,8 +939,6 @@ function buildContactLinks(opp) {
   links.forEach(([label, href]) => {
     const a = document.createElement("a");
     a.href = href;
-    a.target = "_blank";
-    a.rel = "noopener noreferrer";
     a.className = "tag";
     a.textContent = label;
     wrap.appendChild(a);
@@ -962,8 +991,8 @@ function openCaseDetail(opp) {
   html += `<div class="case-field"><span class="case-field-label">Category:</span> ${m(opp.category)}</div>`;
   html += `<div class="case-field"><span class="case-field-label">Address:</span> ${m(opp.address)}</div>`;
   html += `<div class="case-field"><span class="case-field-label">Distance:</span> ${opp.distance_miles != null ? opp.distance_miles + " mi" : "Missing"}</div>`;
-  html += `<div class="case-field"><span class="case-field-label">Maps link:</span> ${opp.maps_url ? `<a href="${opp.maps_url}" target="_blank" rel="noopener">${opp.maps_url}</a>` : "Missing"}</div>`;
-  html += `<div class="case-field"><span class="case-field-label">Website:</span> ${opp.website ? `<a href="${opp.website}" target="_blank" rel="noopener">${opp.website}</a>` : "Missing"}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Maps link:</span> ${opp.maps_url ? `<a href="${opp.maps_url}">${opp.maps_url}</a>` : "Missing"}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Website:</span> ${opp.website ? `<a href="${opp.website}">${opp.website}</a>` : "Missing"}</div>`;
   html += `<div class="case-field"><span class="case-field-label">Rating:</span> ${m(opp.rating)}</div>`;
   html += `<div class="case-field"><span class="case-field-label">Review count:</span> ${m(opp.review_count)}</div>`;
   html += `<div class="case-field"><span class="case-field-label">Hours:</span> ${m(opp.hours)}</div>`;
@@ -974,14 +1003,14 @@ function openCaseDetail(opp) {
   html += `<div class="case-field"><span class="case-field-label">Backup contact:</span> ${m(opp.contact_matrix?.backup_contact_method || opp.contact_matrix?.backup_contact || opp.backup_contact_method)}</div>`;
   html += `<div class="case-field"><span class="case-field-label">Email:</span> ${email || "Missing"}</div>`;
   html += `<div class="case-field"><span class="case-field-label">Phone:</span> ${m(phone)}</div>`;
-  html += `<div class="case-field"><span class="case-field-label">Contact page:</span> ${opp.contact?.contact_page ? `<a href="${opp.contact.contact_page}" target="_blank" rel="noopener">${opp.contact.contact_page}</a>` : "Missing"}</div>`;
-  html += `<div class="case-field"><span class="case-field-label">Facebook:</span> ${opp.contact?.facebook ? `<a href="${opp.contact.facebook}" target="_blank" rel="noopener">${opp.contact.facebook}</a>` : "Missing"}</div>`;
-  html += `<div class="case-field"><span class="case-field-label">Instagram:</span> ${opp.contact?.instagram ? `<a href="${opp.contact.instagram}" target="_blank" rel="noopener">${opp.contact.instagram}</a>` : "Missing"}</div>`;
-  html += `<div class="case-field"><span class="case-field-label">LinkedIn:</span> ${opp.contact?.linkedin ? `<a href="${opp.contact.linkedin}" target="_blank" rel="noopener">${opp.contact.linkedin}</a>` : "Missing"}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Contact page:</span> ${opp.contact?.contact_page ? `<a href="${opp.contact.contact_page}">${opp.contact.contact_page}</a>` : "Missing"}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Facebook:</span> ${opp.contact?.facebook ? `<a href="${opp.contact.facebook}">${opp.contact.facebook}</a>` : "Missing"}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Instagram:</span> ${opp.contact?.instagram ? `<a href="${opp.contact.instagram}">${opp.contact.instagram}</a>` : "Missing"}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">LinkedIn:</span> ${opp.contact?.linkedin ? `<a href="${opp.contact.linkedin}">${opp.contact.linkedin}</a>` : "Missing"}</div>`;
   html += `<div class="case-field"><span class="case-field-label">Owner/founder/manager:</span> ${m(opp.owner_manager_name || opp.contact_matrix?.owner_name || (opp.owner_names && opp.owner_names[0]))}</div>`;
   const soc = opp.social_links || {};
   Object.entries(soc).filter(([k]) => !["facebook","instagram"].includes(k)).forEach(([k, v]) => {
-    if (v) html += `<div class="case-field"><span class="case-field-label">${k}:</span> <a href="${v}" target="_blank" rel="noopener">${v}</a></div>`;
+    if (v) html += `<div class="case-field"><span class="case-field-label">${k}:</span> <a href="${v}">${v}</a></div>`;
   });
   html += `</div></div>`;
 

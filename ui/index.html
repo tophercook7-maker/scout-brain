@@ -82,31 +82,27 @@
     <div id="auth-container"></div>
 
     <div id="admin-protected" hidden>
-      <section class="hero-card" id="adminDashboardSummary">
-        <div>
-          <h2>Dashboard</h2>
-          <p>Private CRM snapshot across scout, leads, cases, outreach, and notes.</p>
-        </div>
-        <div class="hero-actions">
-          <div class="mini-stat"><span class="mini-label">Total Leads</span><strong id="adm-total-leads">0</strong></div>
-          <div class="mini-stat"><span class="mini-label">Leads Discovered Today</span><strong id="adm-today-leads">0</strong></div>
-          <div class="mini-stat"><span class="mini-label">Follow Ups Due</span><strong id="adm-followups-due">0</strong></div>
-          <div class="mini-stat"><span class="mini-label">Top Opportunities</span><strong id="adm-top-opps">None</strong></div>
-        </div>
-      </section>
+      <main class="dashboard" id="adminMainContent">
+        <section class="hero-card" id="adminDashboardSummary">
+          <div>
+            <h2>Dashboard</h2>
+            <p>Private CRM snapshot across scout, leads, cases, outreach, and notes.</p>
+          </div>
+          <div class="hero-actions">
+            <div class="mini-stat"><span class="mini-label">Total Leads</span><strong id="adm-total-leads">0</strong></div>
+            <div class="mini-stat"><span class="mini-label">Leads Discovered Today</span><strong id="adm-today-leads">0</strong></div>
+            <div class="mini-stat"><span class="mini-label">Follow Ups Due</span><strong id="adm-followups-due">0</strong></div>
+            <div class="mini-stat"><span class="mini-label">Top Opportunities</span><strong id="adm-top-opps">None</strong></div>
+          </div>
+        </section>
 
-      <nav class="main-nav">
-        <ul>
-          <li><button type="button" class="main-nav-btn active" data-main-tab="dashboard">Dashboard</button></li>
-          <li><button type="button" class="main-nav-btn" data-main-tab="scout">Scout Console</button></li>
-          <li><button type="button" class="main-nav-btn" data-main-tab="pitch">Pitch Mode</button></li>
-        </ul>
-      </nav>
+        <section class="panel hidden" id="adminModuleIntro">
+          <h3 id="adminModuleTitle">Dashboard</h3>
+          <p id="adminModuleHelp">Use the admin menu to switch modules without leaving this workspace.</p>
+        </section>
 
-      <main class="dashboard">
-        <section id="dashboard" class="tab-panel active">
-    <section class="grid">
-      <article class="panel">
+        <section class="grid" id="dashboardGrid">
+      <article class="panel" data-module-card="opportunities">
         <div class="panel-header">
           <h3>Opportunities</h3>
           <span class="count" id="opportunities-count">0</span>
@@ -115,7 +111,7 @@
         <button type="button" class="add-item-btn" data-bucket="opportunities">+ Add</button>
       </article>
 
-      <article class="panel">
+      <article class="panel" data-module-card="ideas">
         <div class="panel-header">
           <h3>Ideas</h3>
           <span class="count" id="ideas-count">0</span>
@@ -124,7 +120,7 @@
         <button type="button" class="add-item-btn" data-bucket="ideas">+ Add</button>
       </article>
 
-      <article class="panel">
+      <article class="panel" data-module-card="projects">
         <div class="panel-header">
           <h3>Active Projects</h3>
           <span class="count" id="projects-count">0</span>
@@ -133,7 +129,7 @@
         <button type="button" class="add-item-btn" data-bucket="projects">+ Add</button>
       </article>
 
-      <article class="panel">
+      <article class="panel" data-module-card="memory">
         <div class="panel-header">
           <h3>Memory</h3>
           <span class="count" id="memory-count">0</span>
@@ -227,31 +223,6 @@
         </select>
       </div>
       <div id="morningRunnerList" class="card-list"></div>
-    </section>
-    </section>
-
-    <section id="scout" class="tab-panel">
-      <h2>Opportunity Scout</h2>
-      <p class="scout-intro">Scan for website clients. Uses <code>scout/config.json</code> when available.</p>
-      <div class="scout-form">
-        <input id="scoutCity" placeholder="City (from config or type here)" />
-        <input id="scoutType" placeholder="Single type override (optional)" />
-        <button type="button" id="runScoutBtn" class="primary-btn">Scan For Opportunities</button>
-      </div>
-      <p id="scoutConfigStatus" class="scout-config-status"></p>
-      <div id="scoutResults"></div>
-    </section>
-
-    <section id="pitch" class="tab-panel">
-      <h2>Pitch Mode</h2>
-      <p>Quick pitch screens you can show to business owners.</p>
-      <div class="pitch-buttons">
-        <button type="button" data-pitch="diner">Diner Pitch</button>
-        <button type="button" data-pitch="coffee">Coffee Shop Pitch</button>
-        <button type="button" data-pitch="church">Church Pitch</button>
-      </div>
-      <div id="pitchDisplay"></div>
-    </section>
       </main>
     </div>
   </section>

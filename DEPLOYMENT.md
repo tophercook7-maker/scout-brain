@@ -40,8 +40,9 @@ Set in the Railway dashboard:
 
 ### 2.3 Deploy
 
-- [ ] Railway uses `Procfile`: `web: python app.py`
-- [ ] Or set start command: `python app.py`
+- [ ] Build command: `pip install -r requirements.txt`
+- [ ] Start command: `uvicorn app:app --host 0.0.0.0 --port $PORT`
+- [ ] Railway uses backend-only mode (`SERVE_FRONTEND=0` by default)
 - [ ] Deploy; note the generated URL (e.g. `https://your-app.up.railway.app`)
 
 ### 2.4 Custom domain (later)
@@ -103,6 +104,7 @@ The backend runs the scout using config from the **repo** (e.g. `scout/config.js
 
 - **Frontend**: `npm run dev` (Vite). Use Vite proxy: leave `VITE_API_BASE_URL` unset so `/run-scout` etc. proxy to `localhost:8760`.
 - **Backend**: `python app.py` (runs on port 8760; set `PORT=8760` if needed).
+- **Optional monolith local mode**: `SERVE_FRONTEND=1 python app.py` to serve frontend from FastAPI.
 - **.env**: Copy `.env.example` and `backend.env.example`, fill in keys for local runs.
 
 ---

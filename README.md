@@ -75,7 +75,9 @@ npm install
 npm run build
 ```
 
-`vercel.json` is already configured for Vite output (`dist`).
+`vercel.json` includes SPA rewrite support so client routes like `/admin/scout` resolve to `index.html` instead of returning 404.
+
+Important: frontend API calls must continue to use `VITE_API_BASE_URL` (do not point frontend routes to Railway directly).
 
 ### Immediate Vercel setup (live Railway backend)
 
@@ -91,6 +93,14 @@ npm run build
 
 Use repo root as service root.
 
+Railway is backend-only for this project (frontend runs on Vercel).
+
+Build command:
+
+```bash
+pip install -r requirements.txt
+```
+
 Start command:
 
 ```bash
@@ -99,26 +109,45 @@ uvicorn app:app --host 0.0.0.0 --port $PORT
 
 `Procfile` already includes the same start command.
 
-Railway production should serve the built Vite frontend from `dist` through FastAPI:
+Do **not** set Railway build steps to `npm install` or `npm run build`.
 
-- `GET /` serves `dist/index.html`
-- `GET /assets/*` serves `dist/assets/*`
-- Non-API frontend routes use SPA fallback to `dist/index.html`
-- API routes (`/run-scout`, `/scout-data`, `/audit`, `/case/*`, `/scout/*`) remain backend endpoints
+Backend API-only behavior in production:
 
-Because `dist` is ignored in git, ensure Railway builds frontend before start:
+- `SERVE_FRONTEND` defaults to `false`, so Railway serves API only.
+- `GET /` returns backend status JSON in API-only mode.
+- API routes stay active:
+  - `POST /run-scout`
+  - `GET /scout-data`
+  - `POST /audit`
+  - `GET /case/{slug}`
+  - `POST /case/{slug}/update`
+  - `GET /scout/config.json`
 
-```bash
-npm install
-npm run build
-pip install -r requirements.txt
-```
+If you ever want monolith mode (FastAPI also serves frontend), set `SERVE_FRONTEND=1`.
 
-Then start FastAPI with:
+## Deployment and domains
 
-```bash
-uvicorn app:app --host 0.0.0.0 --port $PORT
-```
+Frontend:
+
+- Use the Vercel project URL first.
+- Add custom domain later: `brain.mixedmakershop.com`.
+
+Backend:
+
+- Use the Railway public URL first.
+- Add custom domain later: `brain-api.mixedmakershop.com`.
+
+## Custom domain setup
+
+Vercel frontend custom domain:
+
+- Add `brain.mixedmakershop.com` in Vercel Domains.
+- Configure DNS at your domain provider exactly as instructed by Vercel.
+
+Railway backend custom domain:
+
+- Add `brain-api.mixedmakershop.com` in Railway Public Networking / Custom Domain.
+- Configure DNS at your domain provider exactly as instructed by Railway.
 
 ## CORS configuration
 

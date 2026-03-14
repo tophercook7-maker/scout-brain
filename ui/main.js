@@ -347,7 +347,12 @@ initAuth?.((session) => {
 window.addEventListener("error", (e) => {
   console.error("Global JS error:", e.error || e.message);
 });
-window.addEventListener("popstate", applyRouteShell);
+window.addEventListener("popstate", () => {
+  applyRouteShell();
+  if (isAdminRoute()) {
+    window.MB_APPLY_ADMIN_ROUTE_VIEW?.();
+  }
+});
 
 initDebugOverlay();
 setDebugValue("dbg-api", import.meta.env.VITE_API_BASE_URL || "missing");

@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 """
-Massive Brain - single local app (FastAPI).
+Massive Brain backend (FastAPI).
 
-One command: python3 app.py
-Opens http://localhost:8760 in the browser.
-
-- Serves UI at / from ui/
-- GET /scout-data, POST /run-scout, POST /audit
+- API routes: /scout-data, /run-scout, /audit, /case/*
 - Reads/writes scout/config.json, scout/history.json, scout/opportunities.json, scout/today.json
-- Loads GOOGLE_MAPS_API_KEY from .env (backend only)
+- Loads GOOGLE_MAPS_API_KEY and Supabase secrets from env
+- Optional frontend serving can be enabled with SERVE_FRONTEND=1
 """
 from pathlib import Path
 import json
@@ -61,6 +58,18 @@ try:
     _env_loaded = True
 except ImportError:
     pass
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# Railway backend-only mode should not require npm or frontend assets.
+# Enable only when intentionally serving frontend from this process.
+SERVE_FRONTEND = _env_flag("SERVE_FRONTEND", default=False)
 
 app = FastAPI(title="Massive Brain", version="2.0")
 
@@ -277,14 +286,17 @@ def _serve_frontend_index():
 
 # --- Routes -----------------------------------------------------------------
 
-@app.get("/", response_class=HTMLResponse)
-def serve_app():
-    return _serve_frontend_index()
+@app.get("/")
+def serve_root():
+    if SERVE_FRONTEND:
+        return _serve_frontend_index()
+    return {"ok": True, "service": "scout-brain-backend", "mode": "api-only"}
 
 
-# Serve compiled Vite assets in production.
-app.mount("/assets", StaticFiles(directory=str(DIST_ASSETS_DIR), check_dir=False), name="assets")
-app.mount("/ui", StaticFiles(directory=str(UI_DIR), html=True), name="ui")
+if SERVE_FRONTEND:
+    # Serve compiled Vite assets only when frontend serving is explicitly enabled.
+    app.mount("/assets", StaticFiles(directory=str(DIST_ASSETS_DIR), check_dir=False), name="assets")
+    app.mount("/ui", StaticFiles(directory=str(UI_DIR), html=True), name="ui")
 
 
 @app.get("/scout-data")
@@ -478,17 +490,18 @@ def get_scout_config():
         return json.load(f)
 
 
-@app.get("/{full_path:path}", response_class=HTMLResponse)
-def spa_fallback(full_path: str):
-    """
-    SPA fallback for frontend routes.
-    Keep API/static prefixes protected so backend routes are not shadowed.
-    """
-    protected_prefixes = ("run-scout", "scout-data", "audit", "case", "scout", "assets", "ui")
-    for prefix in protected_prefixes:
-        if full_path == prefix or full_path.startswith(f"{prefix}/"):
-            raise HTTPException(status_code=404, detail="Not found")
-    return _serve_frontend_index()
+if SERVE_FRONTEND:
+    @app.get("/{full_path:path}", response_class=HTMLResponse)
+    def spa_fallback(full_path: str):
+        """
+        SPA fallback for frontend routes.
+        Keep API/static prefixes protected so backend routes are not shadowed.
+        """
+        protected_prefixes = ("run-scout", "scout-data", "audit", "case", "scout", "assets", "ui")
+        for prefix in protected_prefixes:
+            if full_path == prefix or full_path.startswith(f"{prefix}/"):
+                raise HTTPException(status_code=404, detail="Not found")
+        return _serve_frontend_index()
 
 
 def _open_browser():
@@ -503,6 +516,7 @@ def main():
     print("  Massive Brain - backend")
     print("  -------------------------")
     print(f"  App running at:  http://0.0.0.0:{port}")
+    print(f"  FRONTEND_SERVING: {'enabled' if SERVE_FRONTEND else 'disabled (api-only)'}")
     print()
     if _env_loaded:
         if _maps_key:

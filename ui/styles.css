@@ -169,6 +169,8 @@ h1 {
 main.showing-auth .grid,
 main.showing-auth .analyze-panel,
 main.showing-auth #morningRunnerPanel,
+main.showing-auth #adminDashboardSummary,
+main.showing-auth #adminModuleIntro,
 main.showing-auth .main-nav,
 main.showing-auth .tab-panel#scout,
 main.showing-auth .tab-panel#pitch,
