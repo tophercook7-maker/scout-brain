@@ -101,6 +101,73 @@
           <p id="adminModuleHelp">Use the admin menu to switch modules without leaving this workspace.</p>
         </section>
 
+        <section class="panel" id="adminCommandCenter">
+          <div class="panel-header">
+            <h3>CRM Command Center</h3>
+            <span class="count" id="adminCommandCenterCount">0</span>
+          </div>
+
+          <div class="dashboard-kpi-grid">
+            <article class="dashboard-kpi-card">
+              <p class="dashboard-kpi-label">Leads discovered today</p>
+              <h4 id="kpiLeadsToday">0</h4>
+            </article>
+            <article class="dashboard-kpi-card">
+              <p class="dashboard-kpi-label">Ready to contact</p>
+              <h4 id="kpiReadyToContact">0</h4>
+            </article>
+            <article class="dashboard-kpi-card">
+              <p class="dashboard-kpi-label">Follow-ups due</p>
+              <h4 id="kpiFollowUpsDue">0</h4>
+            </article>
+            <article class="dashboard-kpi-card">
+              <p class="dashboard-kpi-label">Total active cases</p>
+              <h4 id="kpiActiveCases">0</h4>
+            </article>
+          </div>
+
+          <div class="dashboard-command-grid">
+            <article class="item-card">
+              <h4>Top Opportunities</h4>
+              <p class="runner-today-hint">Top 5 by website gap, score, reachability, and status.</p>
+              <div id="dashboardTopOpps" class="runner-today-list"></div>
+            </article>
+
+            <article class="item-card">
+              <h4>Today's Actions</h4>
+              <div class="dashboard-action-block">
+                <p><strong>Ready to contact</strong></p>
+                <div id="dashboardReadyList" class="runner-today-list"></div>
+              </div>
+              <div class="dashboard-action-block">
+                <p><strong>Follow up</strong></p>
+                <div id="dashboardFollowUpList" class="runner-today-list"></div>
+              </div>
+              <div class="dashboard-action-block">
+                <p><strong>Overdue follow-ups</strong></p>
+                <div id="dashboardOverdueList" class="runner-today-list"></div>
+              </div>
+            </article>
+
+            <article class="item-card">
+              <h4>Recent Scout Run</h4>
+              <div class="case-field-list">
+                <div class="case-field"><span class="case-field-label">Summary:</span> <span id="dashboardRunSummary">No scout run yet.</span></div>
+                <div class="case-field"><span class="case-field-label">Location used:</span> <span id="dashboardRunLocation">Missing</span></div>
+                <div class="case-field"><span class="case-field-label">Processed count:</span> <span id="dashboardRunProcessed">0</span></div>
+                <div class="case-field"><span class="case-field-label">Saved count:</span> <span id="dashboardRunSaved">0</span></div>
+                <div class="case-field"><span class="case-field-label">Skipped count:</span> <span id="dashboardRunSkipped">0</span></div>
+              </div>
+            </article>
+          </div>
+
+          <div class="runner-copy-row">
+            <button type="button" class="primary-btn" id="dashboardQuickRunScout">Run Scout</button>
+            <button type="button" class="ghost-btn" id="dashboardQuickLeads">View Leads</button>
+            <button type="button" class="ghost-btn" id="dashboardQuickOutreach">View Outreach</button>
+          </div>
+        </section>
+
         <section class="grid" id="dashboardGrid">
       <article class="panel" data-module-card="opportunities">
         <div class="panel-header">

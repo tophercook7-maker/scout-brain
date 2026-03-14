@@ -159,6 +159,42 @@ h1 {
   padding: 18px 20px 40px;
 }
 
+.dashboard-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.dashboard-kpi-card {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 10px 12px;
+  background: color-mix(in oklab, var(--panel) 92%, #0f172a 8%);
+}
+
+.dashboard-kpi-label {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.dashboard-kpi-card h4 {
+  margin: 4px 0 0;
+  font-size: 24px;
+}
+
+.dashboard-command-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.dashboard-action-block {
+  margin-bottom: 10px;
+}
+
 .main-nav {
   max-width: 1200px;
   margin: 0 auto;

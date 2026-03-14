@@ -95,6 +95,14 @@ Use repo root as service root.
 
 Railway is backend-only for this project (frontend runs on Vercel).
 
+Docker deploy mode (recommended for Railway):
+
+- Root `Dockerfile` uses `python:3.11-slim` and installs from `requirements.txt`.
+- Container start command runs FastAPI via:
+  - `uvicorn app:app --host 0.0.0.0 --port ${PORT:-8080}`
+- `SERVE_FRONTEND=0` is set in the container (API-only mode).
+- Do not run frontend build commands in Railway Docker builds (`npm install`, `npm ci`, `npm run build`).
+
 Build command:
 
 ```bash

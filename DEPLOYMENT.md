@@ -40,6 +40,8 @@ Set in the Railway dashboard:
 
 ### 2.3 Deploy
 
+- [ ] Railway Docker deploy uses root `Dockerfile` (Python-only runtime).
+- [ ] Dockerfile does not run frontend build commands (`npm install`, `npm ci`, `npm run build`).
 - [ ] Build command: `pip install -r requirements.txt`
 - [ ] Start command: `uvicorn app:app --host 0.0.0.0 --port $PORT`
 - [ ] Railway uses backend-only mode (`SERVE_FRONTEND=0` by default)

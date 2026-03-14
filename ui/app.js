@@ -214,6 +214,7 @@ function applyAdminRouteView() {
   const moduleTitle = document.getElementById("adminModuleTitle");
   const moduleHelp = document.getElementById("adminModuleHelp");
   const dashboardSummary = document.getElementById("adminDashboardSummary");
+  const commandCenter = document.getElementById("adminCommandCenter");
   const dashboardGrid = document.getElementById("dashboardGrid");
   const analyzeConsole = document.getElementById("analyzeConsole");
   const morningRunnerPanel = document.getElementById("morningRunnerPanel");
@@ -244,6 +245,7 @@ function applyAdminRouteView() {
   moduleCards.forEach((card) => card.classList.remove("hidden"));
   setVisible(moduleIntro, module !== "dashboard");
   setVisible(dashboardSummary, module === "dashboard");
+  setVisible(commandCenter, module === "dashboard");
   setVisible(analyzeConsole, module === "scout");
 
   if (module === "dashboard") {
@@ -1488,6 +1490,149 @@ function updateAdminSummary(today, opportunities) {
   setText("adm-today-leads", String(todayLeads));
   setText("adm-followups-due", String(followUps));
   setText("adm-top-opps", topNames.length ? topNames.join(", ") : "None");
+
+  renderDashboardCommandCenter(today, opportunities || []);
+}
+
+function parseDateAsLocal(value) {
+  if (!value) return null;
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return null;
+  return d;
+}
+
+function isOverdueFollowUp(opp) {
+  const due = parseDateAsLocal(opp.follow_up_due);
+  if (!due) return false;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  return due < today;
+}
+
+function getLeadScore(opp) {
+  const raw = opp.internal_score ?? opp.score ?? 0;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function hasReachableContact(opp) {
+  const email = opp.contact?.email || (opp.contact?.emails && opp.contact.emails[0]);
+  const phone = opp.phone || opp.contact?.phone_from_site || (opp.contact?.phones && opp.contact.phones[0]);
+  const reachableMethod = opp.recommended_contact || opp.backup_contact_method || email || phone || opp.contact?.contact_page;
+  return !!reachableMethod;
+}
+
+function statusPriority(status) {
+  if (status === "Ready to contact") return 4;
+  if (status === "Follow up") return 3;
+  if (status === "New") return 2;
+  if (status === "Contacted") return 1;
+  return 0;
+}
+
+function rankTopOpportunity(opp) {
+  let rank = 0;
+  if (opp.no_website || opp.lane === "no_website") rank += 500;
+  rank += Math.max(0, getLeadScore(opp)) * 10;
+  if (hasReachableContact(opp)) rank += 200;
+  rank += statusPriority(opp.status || "New") * 25;
+  return rank;
+}
+
+function inferRunLocation(today) {
+  const explicit = today?.location_used || today?.search_location || today?.location || today?.city;
+  if (explicit) return String(explicit);
+  const summary = String(today?.summary || "");
+  const m = summary.match(/using\s+([^.,;]+)/i);
+  if (m && m[1]) return m[1].trim();
+  if (summary.toLowerCase().includes("current location")) return "Current location";
+  return "Saved home location";
+}
+
+function renderDashboardSimpleList(containerId, items, emptyLabel) {
+  const el = document.getElementById(containerId);
+  if (!el) return;
+  el.innerHTML = "";
+  if (!items.length) {
+    const row = document.createElement("div");
+    row.className = "runner-today-item";
+    row.textContent = emptyLabel;
+    el.appendChild(row);
+    return;
+  }
+  items.slice(0, 5).forEach((opp) => {
+    const row = document.createElement("a");
+    row.href = "#";
+    row.className = "runner-today-item";
+    row.textContent = `${opp.name || "Unknown"} — ${opp.status || "New"}`;
+    row.onclick = (e) => {
+      e.preventDefault();
+      openCaseDetail(opp);
+    };
+    el.appendChild(row);
+  });
+}
+
+function renderDashboardCommandCenter(today, opportunities) {
+  const active = opportunities.filter((o) => !["Closed", "Skip"].includes(o.status || ""));
+  const ready = opportunities.filter((o) => (o.status || "New") === "Ready to contact");
+  const followUp = opportunities.filter((o) => (o.status || "New") === "Follow up");
+  const overdue = opportunities.filter((o) => isOverdueFollowUp(o));
+  const dueCount = opportunities.filter((o) => (o.status || "New") === "Follow up" || isOverdueFollowUp(o)).length;
+  const leadsToday = today?.top_opportunities?.length || opportunities.length;
+  const topRanked = [...opportunities]
+    .sort((a, b) => rankTopOpportunity(b) - rankTopOpportunity(a))
+    .slice(0, 5);
+
+  const setText = (id, val) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = val;
+  };
+
+  setText("kpiLeadsToday", String(leadsToday));
+  setText("kpiReadyToContact", String(ready.length));
+  setText("kpiFollowUpsDue", String(dueCount));
+  setText("kpiActiveCases", String(active.length));
+  setText("adminCommandCenterCount", String(opportunities.length));
+
+  renderDashboardSimpleList("dashboardReadyList", ready, "No leads ready to contact.");
+  renderDashboardSimpleList("dashboardFollowUpList", followUp, "No follow-ups queued.");
+  renderDashboardSimpleList("dashboardOverdueList", overdue, "No overdue follow-ups.");
+
+  const topEl = document.getElementById("dashboardTopOpps");
+  if (topEl) {
+    topEl.innerHTML = "";
+    if (!topRanked.length) {
+      const empty = document.createElement("div");
+      empty.className = "runner-today-item";
+      empty.textContent = "No opportunities yet.";
+      topEl.appendChild(empty);
+    } else {
+      topRanked.forEach((opp) => {
+        const row = document.createElement("a");
+        row.href = "#";
+        row.className = "runner-today-item";
+        const noWebsite = opp.no_website || opp.lane === "no_website" ? "No website" : "Has website";
+        const score = getLeadScore(opp);
+        const contact = hasReachableContact(opp) ? "Reachable" : "Contact unclear";
+        row.textContent = `${opp.name || "Unknown"} — ${noWebsite} • Score ${score} • ${contact} • ${opp.status || "New"}`;
+        row.onclick = (e) => {
+          e.preventDefault();
+          openCaseDetail(opp);
+        };
+        topEl.appendChild(row);
+      });
+    }
+  }
+
+  const processed = Number(today?.processed_count ?? today?.processed ?? opportunities.length);
+  const saved = Number(today?.saved_count ?? today?.saved ?? opportunities.length);
+  const skipped = Number(today?.skipped_count ?? today?.skipped ?? Math.max(0, processed - saved));
+  setText("dashboardRunSummary", today?.summary || "No scout run yet.");
+  setText("dashboardRunLocation", inferRunLocation(today));
+  setText("dashboardRunProcessed", String(Number.isFinite(processed) ? processed : opportunities.length));
+  setText("dashboardRunSaved", String(Number.isFinite(saved) ? saved : opportunities.length));
+  setText("dashboardRunSkipped", String(Number.isFinite(skipped) ? skipped : 0));
 }
 
 async function refreshScoutData() {
@@ -1508,6 +1653,13 @@ window.runScoutNow = runScoutNow;
 window.addEventListener("error", (e) => {
   console.error("Global JS error:", e.error || e.message);
 });
+
+function navigateAdminRoute(href) {
+  if (!href) return;
+  history.pushState({}, "", href);
+  window.dispatchEvent(new PopStateEvent("popstate"));
+  applyAdminRouteView();
+}
 
 function bindButtons() {
   console.log("frontend loaded - buttons binding started");
@@ -1550,12 +1702,21 @@ function bindButtons() {
     link.addEventListener("click", (e) => {
       e.preventDefault();
       const href = link.getAttribute("href");
-      if (!href) return;
-      history.pushState({}, "", href);
-      window.dispatchEvent(new PopStateEvent("popstate"));
-      applyAdminRouteView();
+      navigateAdminRoute(href);
     });
   });
+
+  const quickRun = document.getElementById("dashboardQuickRunScout");
+  if (quickRun) {
+    quickRun.addEventListener("click", () => {
+      navigateAdminRoute("/admin/scout");
+      runScoutNow();
+    });
+  }
+  const quickLeads = document.getElementById("dashboardQuickLeads");
+  if (quickLeads) quickLeads.addEventListener("click", () => navigateAdminRoute("/admin/leads"));
+  const quickOutreach = document.getElementById("dashboardQuickOutreach");
+  if (quickOutreach) quickOutreach.addEventListener("click", () => navigateAdminRoute("/admin/outreach"));
 
   const runScoutBtn = document.getElementById("runScoutBtn");
   console.log("runScoutBtn element:", runScoutBtn);
