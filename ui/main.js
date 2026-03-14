@@ -4,9 +4,13 @@
 import "./styles.css";
 console.log("frontend loaded");
 
-// API base URL for backend (Vercel frontend -> Railway backend). Empty = same origin.
+// API base URL for backend (Vercel frontend -> Railway/backend host). Empty = same-origin calls.
 const apiBase = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
 window.MB_API_BASE = apiBase;
+
+if (!apiBase && window.location.hostname.includes("vercel.app")) {
+  console.warn("VITE_API_BASE_URL is not set. Configure it in Vercel to point at your hosted backend.");
+}
 
 import { supabase, isCloudMode } from "../src/lib/supabaseClient.js";
 import { initAuth, signIn, signUp, signOut } from "../src/lib/auth.js";

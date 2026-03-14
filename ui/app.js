@@ -416,7 +416,7 @@ async function runAnalyzeDraft() {
     document.getElementById("analysisEmail").value = email.emailBody;
   } catch (err) {
     console.error(err);
-    alert("Audit failed. Make sure audit_server.py is running.");
+    alert("Audit failed. Make sure your backend API is reachable and VITE_API_BASE_URL is set correctly.");
   }
 }
 
@@ -646,8 +646,8 @@ async function runScoutNow() {
   } catch (err) {
     console.error("Scout run exception:", err);
     const deployMsg = window.MB_USE_CLOUD
-      ? "Run Scout requires the local scout server. Run the app locally for this feature."
-      : "Scout run failed. Check the app is running. Network or server error.";
+      ? "Run Scout failed. Check that VITE_API_BASE_URL points to a hosted backend with /run-scout enabled."
+      : "Scout run failed. Check that the backend is running and reachable.";
     const errMsg = err.message || String(err);
     showScoutError(deployMsg, "network_or_exception", errMsg, null);
   } finally {
@@ -1279,7 +1279,7 @@ async function refreshScoutData() {
     renderMorningRunner(data.today, data.opportunities);
   } catch (err) {
     console.error(err);
-    if (summary) summary.textContent = "Could not load scout data. Make sure the app is running.";
+    if (summary) summary.textContent = "Could not load scout data. Check that the backend API is reachable.";
   }
 }
 window.refreshScoutData = refreshScoutData;

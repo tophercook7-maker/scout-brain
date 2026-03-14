@@ -12,6 +12,7 @@ Opens http://localhost:8760 in the browser.
 """
 from pathlib import Path
 import json
+import os
 import sys
 import webbrowser
 import threading
@@ -24,6 +25,9 @@ from pydantic import BaseModel
 
 APP_DIR = Path(__file__).resolve().parent
 UI_DIR = APP_DIR / "ui"
+DIST_DIR = APP_DIR / "dist"
+DIST_ASSETS_DIR = DIST_DIR / "assets"
+DIST_INDEX_PATH = DIST_DIR / "index.html"
 SCOUT_DIR = APP_DIR / "scout"
 CASES_DIR = SCOUT_DIR / "cases"
 CONFIG_PATH = SCOUT_DIR / "config.json"
@@ -48,7 +52,6 @@ _supabase_service_key = None
 _supabase_jwt_secret = None
 try:
     from dotenv import load_dotenv
-    import os
     load_dotenv(SCOUT_DIR / ".env")
     load_dotenv(ENV_PATH)
     _maps_key = os.environ.get("GOOGLE_MAPS_API_KEY", "").strip()
@@ -61,10 +64,34 @@ except ImportError:
 
 app = FastAPI(title="Massive Brain", version="2.0")
 
-# CORS for Vercel frontend calling Railway backend
+# CORS for Vercel frontend calling Railway backend.
+# Configure explicit origins with ALLOWED_ORIGINS="https://your-app.vercel.app,https://other-domain.com"
+# and optionally customize ALLOWED_ORIGIN_REGEX.
+def _parse_allowed_origins() -> list[str]:
+    raw = os.environ.get("ALLOWED_ORIGINS", "").strip()
+    if raw:
+        origins = [o.strip().rstrip("/") for o in raw.split(",") if o.strip()]
+        # Keep ordering stable while removing duplicates.
+        return list(dict.fromkeys(origins))
+    return [
+        "http://localhost:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:5174",
+    ]
+
+
+_allowed_origins = _parse_allowed_origins()
+_allowed_origin_regex_raw = os.environ.get("ALLOWED_ORIGIN_REGEX")
+if _allowed_origin_regex_raw is None:
+    _allowed_origin_regex = r"^https://.*\.vercel\.app$"
+else:
+    _allowed_origin_regex = _allowed_origin_regex_raw.strip() or None
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_allowed_origins,
+    allow_origin_regex=_allowed_origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -236,16 +263,27 @@ def _audit_url(url: str):
     return fetch_and_audit(url)
 
 
+def _serve_frontend_index():
+    """Serve built Vite frontend; fall back to ui/ for local pre-build runs."""
+    if DIST_INDEX_PATH.is_file():
+        return FileResponse(DIST_INDEX_PATH, media_type="text/html")
+
+    index_file = UI_DIR / "index.html"
+    if index_file.is_file():
+        return FileResponse(index_file, media_type="text/html")
+
+    raise HTTPException(status_code=404, detail="Frontend not found")
+
+
 # --- Routes -----------------------------------------------------------------
 
 @app.get("/", response_class=HTMLResponse)
-def index():
-    index_file = UI_DIR / "index.html"
-    if not index_file.is_file():
-        raise HTTPException(status_code=404, detail="UI not found")
-    return FileResponse(index_file, media_type="text/html")
+def serve_app():
+    return _serve_frontend_index()
 
 
+# Serve compiled Vite assets in production.
+app.mount("/assets", StaticFiles(directory=str(DIST_ASSETS_DIR), check_dir=False), name="assets")
 app.mount("/ui", StaticFiles(directory=str(UI_DIR), html=True), name="ui")
 
 
@@ -307,7 +345,7 @@ def post_run_scout(request: Request):
             return _scout_error_response(
                 "api_key_missing",
                 str(e),
-                "Scout failed: Google Maps API key not configured. Add GOOGLE_MAPS_API_KEY to scout/.env",
+                "Scout failed: Google Maps API key not configured. Set GOOGLE_MAPS_API_KEY in backend environment variables.",
             )
         if "certificate" in err_lower or "ssl" in err_lower:
             return _scout_error_response(
@@ -429,13 +467,25 @@ def get_scout_config():
         return json.load(f)
 
 
+@app.get("/{full_path:path}", response_class=HTMLResponse)
+def spa_fallback(full_path: str):
+    """
+    SPA fallback for frontend routes.
+    Keep API/static prefixes protected so backend routes are not shadowed.
+    """
+    protected_prefixes = ("run-scout", "scout-data", "audit", "case", "scout", "assets", "ui")
+    for prefix in protected_prefixes:
+        if full_path == prefix or full_path.startswith(f"{prefix}/"):
+            raise HTTPException(status_code=404, detail="Not found")
+    return _serve_frontend_index()
+
+
 def _open_browser():
     time.sleep(1.2)
     webbrowser.open("http://localhost:8760")
 
 
 def main():
-    import os
     import uvicorn
     port = int(os.environ.get("PORT", 8760))
     print()
@@ -454,6 +504,11 @@ def main():
             print("  SUPABASE: not set (scout results local only)")
     else:
         print("  .env: python-dotenv not installed or .env missing")
+    print(f"  ALLOWED_ORIGINS: {', '.join(_allowed_origins)}")
+    if _allowed_origin_regex:
+        print(f"  ALLOWED_ORIGIN_REGEX: {_allowed_origin_regex}")
+    else:
+        print("  ALLOWED_ORIGIN_REGEX: disabled")
     print()
     if port == 8760:
         threading.Thread(target=_open_browser, daemon=True).start()

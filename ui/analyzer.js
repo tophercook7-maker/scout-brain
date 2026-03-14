@@ -10,8 +10,8 @@ async function auditWebsiteLive(url) {
 
   if (!response.ok) {
     const msg = response.status === 404 && window.MB_USE_CLOUD
-      ? "Analyze requires the local audit server. Run the app locally for this feature."
-      : "Audit server did not respond correctly";
+      ? "Analyze endpoint not found. Set VITE_API_BASE_URL to your hosted backend URL."
+      : "Audit endpoint did not respond correctly";
     throw new Error(msg);
   }
 
