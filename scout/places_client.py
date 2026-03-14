@@ -27,6 +27,11 @@ TEXT_SEARCH_FIELDS = (
     "places.googleMapsUri,places.location"
 )
 
+DETAILS_FIELDS = (
+    "id,displayName,formattedAddress,nationalPhoneNumber,internationalPhoneNumber,websiteUri,"
+    "rating,userRatingCount,regularOpeningHours,googleMapsUri,location,reviews"
+)
+
 
 def _haversine_miles(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     """Approximate distance in miles between two points."""
@@ -155,6 +160,67 @@ def _place_from_new_api(p: dict, center_lat: float, center_lng: float) -> dict:
     }
 
 
+def _extract_review_intelligence(reviews: list[dict] | None) -> tuple[list[str], list[str]]:
+    snippets: list[str] = []
+    themes: dict[str, int] = {}
+    if not reviews:
+        return snippets, []
+
+    keyword_map = {
+        "service": ["service", "staff", "friendly", "rude", "slow"],
+        "speed": ["slow", "wait", "line", "quick", "fast"],
+        "quality": ["quality", "fresh", "taste", "delicious", "bland"],
+        "pricing": ["price", "expensive", "cheap", "value", "overpriced"],
+        "cleanliness": ["clean", "dirty", "hygiene", "bathroom"],
+        "website_or_ordering": ["website", "online", "order", "booking", "reservation"],
+    }
+
+    for r in reviews[:5]:
+        text = (r.get("text") or {}).get("text") if isinstance(r.get("text"), dict) else r.get("text")
+        if not text:
+            continue
+        text = str(text).strip()
+        if not text:
+            continue
+        snippets.append(text[:220])
+        lower = text.lower()
+        for theme, keywords in keyword_map.items():
+            if any(k in lower for k in keywords):
+                themes[theme] = themes.get(theme, 0) + 1
+
+    top_themes = sorted(themes.items(), key=lambda x: x[1], reverse=True)
+    themed = [f"{name} ({count})" for name, count in top_themes[:4]]
+    return snippets[:3], themed
+
+
+def place_details_new(place_id: str, center_lat: float, center_lng: float, log: Callable[[str], None] | None = None) -> dict | None:
+    """Fetch Place Details (New) for richer dossier fields, including reviews."""
+    if not place_id:
+        return None
+    url = f"{PLACE_DETAILS_URL}/{urllib.parse.quote(place_id)}"
+    req = urllib.request.Request(
+        url,
+        method="GET",
+        headers={
+            "X-Goog-Api-Key": os.environ.get("GOOGLE_MAPS_API_KEY", "").strip(),
+            "X-Goog-FieldMask": DETAILS_FIELDS,
+            "User-Agent": "MassiveBrainPlaces/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = json.loads(resp.read().decode("utf-8"))
+        mapped = _place_from_new_api(raw, center_lat, center_lng)
+        snippets, themes = _extract_review_intelligence(raw.get("reviews"))
+        mapped["review_snippets"] = snippets
+        mapped["review_themes"] = themes
+        return mapped
+    except Exception as e:
+        if log:
+            log(f"Place Details fetch failed for {place_id}: {e}")
+        return None
+
+
 def geocode(address: str, log: Callable[[str], None] | None = None) -> tuple[float, float] | None:
     """Geocode address to (lat, lng). Uses Geocoding API."""
     data = _geocode_get(GEOCODE_URL, {"address": address}, log=log)
@@ -211,6 +277,8 @@ def search_places(
     categories: list[str],
     max_per_category: int = 5,
     radius_miles: float = 25,
+    current_lat: float | None = None,
+    current_lng: float | None = None,
     log: Callable[[str], None] | None = None,
 ) -> list[dict]:
     """
@@ -219,12 +287,19 @@ def search_places(
     Returns place dicts: name, address, phone, website, rating, review_count,
     hours, maps_url, distance_miles, category.
     """
-    coords = geocode(city, log=log)
-    if not coords:
+    if current_lat is not None and current_lng is not None:
+        lat, lng = float(current_lat), float(current_lng)
         if log:
-            log("Geocode failed for city")
-        raise RuntimeError("Geocode failed for city")
-    lat, lng = coords
+            log(f"run scout using current location ({lat}, {lng})")
+    else:
+        coords = geocode(city, log=log)
+        if not coords:
+            if log:
+                log("Geocode failed for city")
+            raise RuntimeError("Geocode failed for city")
+        lat, lng = coords
+        if log:
+            log("run scout using saved config location")
 
     def _log(msg: str) -> None:
         if log:
@@ -262,6 +337,10 @@ def search_places(
             _log(f"Website found: {'yes' if r.get('website') else 'no'}")
             _log(f"Phone found: {'yes' if r.get('phone') else 'no'}")
             r["category"] = cat
+            details = place_details_new(pid, lat, lng, log=log)
+            if details:
+                # Prefer richer details payload when available.
+                r.update({k: v for k, v in details.items() if v is not None})
             all_places.append(r)
 
     return all_places

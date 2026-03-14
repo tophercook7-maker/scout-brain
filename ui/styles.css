@@ -28,6 +28,35 @@ body {
   color: var(--text);
 }
 
+.public-site,
+.admin-app {
+  min-height: 100vh;
+}
+
+.public-topbar {
+  align-items: center;
+}
+
+.public-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.public-main {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 20px;
+}
+
+.admin-module-nav {
+  margin-bottom: 8px;
+}
+
+#admin-protected[hidden] {
+  display: none !important;
+}
+
 .topbar {
   max-width: 1200px;
   margin: 0 auto;
@@ -166,6 +195,9 @@ main.showing-auth #auth-container {
 }
 
 .main-nav-btn {
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
   padding: 10px 16px;
   border-radius: 999px;
   border: 1px solid var(--line);

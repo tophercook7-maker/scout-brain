@@ -393,11 +393,20 @@ def investigate(url: str, crawl_internal: bool = True, timeout: int = 12) -> dic
         pitch = ["create a cleaner mobile-friendly layout"]
 
     best_contact = "email" if all_emails else "phone" if all_phones else "contact_form" if contact_form else "social" if all_social else "unknown"
-    backup_contact = "phone" if all_emails and all_phones else "email" if all_phones and not all_emails else None
+    backup_contact = "phone" if all_emails and all_phones else "email" if all_phones and not all_emails else "contact_form" if all_social else None
 
     contact_matrix = {
         "best_contact": best_contact,
+        "best_contact_method": best_contact,
         "backup_contact": backup_contact,
+        "backup_contact_method": backup_contact,
+        "email": (list(all_emails)[:1] or [None])[0],
+        "phone": (list(all_phones)[:1] or [None])[0],
+        "contact_page": contact_page_url,
+        "facebook": all_social.get("facebook"),
+        "instagram": all_social.get("instagram"),
+        "linkedin": all_social.get("linkedin"),
+        "owner_name": (list(all_owner_names)[:1] or [None])[0],
         "phone_available": bool(all_phones),
         "contact_form_available": contact_form,
         "social_available": bool(all_social),
@@ -423,14 +432,17 @@ def investigate(url: str, crawl_internal: bool = True, timeout: int = 12) -> dic
         "social": all_social,
         "contact_page": contact_page_url,
         "internal_links_found": all_internal,
+        "important_internal_links": all_internal,
         "discovered_pages": discovered_pages[:15],
         "owner_names": list(all_owner_names)[:5],
         "reservation_link": reservation_link,
         "order_link": order_link,
         "contact_matrix": contact_matrix,
         "page_navigation_items": page_nav_items,
+        "navigation_items": page_nav_items,
         "text_heavy_clues": text_heavy,
         "outdated_design_clues": bool(platform and "weebly" in (platform or "").lower()),
         "problems": problems[:6],
+        "strongest_problems": problems[:6],
         "pitch": pitch[:6],
     }

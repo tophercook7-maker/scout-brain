@@ -14,7 +14,7 @@ if (!apiBase && window.location.hostname.includes("vercel.app")) {
 }
 
 import { supabase, isCloudMode } from "../src/lib/supabaseClient.js";
-import { initAuth, signIn, signUp, signOut } from "../src/lib/auth.js";
+import { initAuth, signIn, signUp, signOut, requestPasswordReset } from "../src/lib/auth.js";
 import {
   fetchScoutDataFromSupabase,
   getCaseFromSupabase,
@@ -23,12 +23,54 @@ import {
 
 let modulesLoaded = false;
 
+function normalizedPath() {
+  const p = window.location.pathname || "/";
+  if (p.length > 1 && p.endsWith("/")) return p.slice(0, -1);
+  return p;
+}
+
+function isAdminRoute(path = normalizedPath()) {
+  return path === "/admin" || path.startsWith("/admin/");
+}
+
+function currentPublicRoute(path = normalizedPath()) {
+  if (path === "/" || path === "/services" || path === "/portfolio" || path === "/contact") return path;
+  return "/";
+}
+
+function applyRouteShell() {
+  const path = normalizedPath();
+  const admin = isAdminRoute(path);
+  const publicSite = document.getElementById("public-site");
+  const adminApp = document.getElementById("admin-app");
+  if (publicSite) publicSite.classList.toggle("hidden", admin);
+  if (adminApp) adminApp.classList.toggle("hidden", !admin);
+
+  const publicRoute = currentPublicRoute(path);
+  document.querySelectorAll("[data-public-page]").forEach((el) => {
+    el.classList.toggle("hidden", el.getAttribute("data-public-page") !== publicRoute);
+  });
+  document.querySelectorAll(".public-nav-link").forEach((el) => {
+    const href = el.getAttribute("data-public-route") || "";
+    el.classList.toggle("active", href === (admin ? "/admin" : publicRoute));
+  });
+
+  const routeLabel = document.getElementById("adminRouteLabel");
+  if (routeLabel && admin) routeLabel.textContent = path;
+}
+
+function setAdminAccess(authed) {
+  const protectedEl = document.getElementById("admin-protected");
+  if (protectedEl) protectedEl.hidden = !authed;
+}
+
 async function loadAppModules() {
   if (modulesLoaded) return;
   await import("./analyzer.js");
   await import("./app.js");
   modulesLoaded = true;
   setDebugValue("dbg-init", "complete");
+  window.MB_APPLY_ADMIN_ROUTE_VIEW?.();
 }
 
 function setAuthEmailDisplay(session) {
@@ -67,6 +109,9 @@ function renderAuthUI(container, onLoggedIn) {
       <p style="margin-top:16px;font-size:13px;color:var(--muted);">
         New? <a href="#" id="auth-toggle-signup" style="color:var(--accent);">Sign up</a>
       </p>
+      <p style="margin-top:8px;font-size:13px;color:var(--muted);">
+        <a href="#" id="auth-forgot-password" style="color:var(--accent);">Forgot Password?</a>
+      </p>
     </div>
   `;
   container.appendChild(root);
@@ -77,9 +122,11 @@ function renderAuthUI(container, onLoggedIn) {
   const passwordEl = root.querySelector("#auth-password");
   const errorEl = root.querySelector("#auth-error");
   const toggleEl = root.querySelector("#auth-toggle-signup");
+  const forgotEl = root.querySelector("#auth-forgot-password");
 
   form.onsubmit = async (e) => {
     e.preventDefault();
+    errorEl.style.color = "#e08080";
     errorEl.textContent = "";
     console.log("sign in clicked");
     try {
@@ -120,6 +167,47 @@ function renderAuthUI(container, onLoggedIn) {
     form.querySelector('button[type="submit"]').textContent = isSignUp ? "Sign Up" : "Sign In";
     toggleEl.textContent = isSignUp ? "Sign in instead" : "Sign up";
   };
+
+  forgotEl.onclick = async (e) => {
+    e.preventDefault();
+    console.log("forgot password clicked");
+
+    const defaultEmail = emailEl.value?.trim() || "";
+    const requestedEmail = window.prompt("Enter your email address to reset your password:", defaultEmail);
+    const email = (requestedEmail || "").trim();
+    if (!email) {
+      errorEl.style.color = "#e08080";
+      errorEl.textContent = "Unable to send reset email.";
+      return;
+    }
+
+    console.log("password reset requested");
+    try {
+      const { error } = await requestPasswordReset(email);
+      if (error) {
+        const msg = String(error.message || "").toLowerCase();
+        if (msg.includes("not found") || msg.includes("no user")) {
+          errorEl.style.color = "#e08080";
+          errorEl.textContent = "No account found for that email.";
+        } else {
+          errorEl.style.color = "#e08080";
+          errorEl.textContent = "Unable to send reset email.";
+        }
+        console.error("password reset failed", error);
+        return;
+      }
+      errorEl.style.color = "#7ef5b7";
+      errorEl.textContent = "Reset email sent. Check your inbox.";
+      console.log("password reset success");
+      setTimeout(() => {
+        errorEl.style.color = "#e08080";
+      }, 3000);
+    } catch (err) {
+      errorEl.style.color = "#e08080";
+      errorEl.textContent = "Unable to send reset email.";
+      console.error("password reset failed", err);
+    }
+  };
 }
 
 function renderLoggedInBar(onLogout) {
@@ -138,16 +226,28 @@ function renderLoggedInBar(onLogout) {
 }
 
 async function boot() {
+  applyRouteShell();
   console.log("auth bootstrap start");
   setDebugValue("dbg-init", "booting");
   const cssOk = document.styleSheets.length > 0 && getComputedStyle(document.documentElement).getPropertyValue("--bg").trim();
   console.log("[Massive Brain] Boot | stylesheets:", document.styleSheets.length, "| --bg set:", !!cssOk);
+  if (!isAdminRoute()) {
+    setDebugValue("dbg-init", "public");
+    return;
+  }
   void checkBackend();
   try {
     if (!isCloudMode() || !supabase) {
       window.MB_USE_CLOUD = false;
       setDebugValue("dbg-auth", "no user");
-      await loadAppModules();
+      setAdminAccess(false);
+      const container = document.getElementById("auth-container");
+      if (container) {
+        container.innerHTML = `<div class="panel" style="max-width:520px;margin:24px auto;">
+          <h3>Admin login unavailable</h3>
+          <p>Supabase auth is not configured. Set Vercel env vars and reload.</p>
+        </div>`;
+      }
       return;
     }
 
@@ -167,6 +267,7 @@ async function boot() {
 
     if (!session?.user) {
       window.MB_USE_CLOUD = false;
+      setAdminAccess(false);
       const container = document.getElementById("auth-container");
       if (container) {
         document.querySelector("main.dashboard")?.classList.add("showing-auth");
@@ -184,22 +285,25 @@ async function boot() {
           if (freshSession?.user) {
             window.MB_SESSION = freshSession;
             setCloudBridge();
+            setAdminAccess(true);
             renderLoggedInBar(handleLogout);
             setAuthEmailDisplay(freshSession);
             setDebugValue("dbg-auth", "signed-in");
+            await loadAppModules();
             await window.refreshScoutData?.();
           } else {
             window.MB_USE_CLOUD = false;
+            setAdminAccess(false);
             setDebugValue("dbg-auth", "no user");
           }
         });
       }
-      await loadAppModules();
       return;
     }
 
     window.MB_SESSION = session;
     setCloudBridge();
+    setAdminAccess(true);
     renderLoggedInBar(handleLogout);
     setAuthEmailDisplay(session);
     setDebugValue("dbg-auth", "signed-in");
@@ -207,9 +311,9 @@ async function boot() {
   } catch (err) {
     console.error("auth bootstrap failed:", err);
     window.MB_USE_CLOUD = false;
+    setAdminAccess(false);
     setDebugValue("dbg-auth", "no user");
     setDebugValue("dbg-init", "error");
-    await loadAppModules();
   }
 }
 
@@ -226,6 +330,7 @@ function handleLogout() {
   window.MB_FETCH_SCOUT_DATA = null;
   window.MB_GET_CASE = null;
   window.MB_UPDATE_CASE = null;
+  setAdminAccess(false);
   document.getElementById("auth-bar")?.remove();
   location.reload();
 }
@@ -242,6 +347,7 @@ initAuth?.((session) => {
 window.addEventListener("error", (e) => {
   console.error("Global JS error:", e.error || e.message);
 });
+window.addEventListener("popstate", applyRouteShell);
 
 initDebugOverlay();
 setDebugValue("dbg-api", import.meta.env.VITE_API_BASE_URL || "missing");
@@ -251,7 +357,11 @@ setDebugValue("dbg-init", "starting");
 setDebugValue("dbg-backend", "checking");
 
 if (document.readyState === "loading") {
-  document.addEventListener("DOMContentLoaded", boot);
+  document.addEventListener("DOMContentLoaded", () => {
+    applyRouteShell();
+    boot();
+  });
 } else {
+  applyRouteShell();
   boot();
 }

@@ -171,13 +171,87 @@ function showTab(tabName) {
 
 function showMainTab(tabName) {
   document.querySelectorAll(".tab-panel").forEach((el) => el.classList.remove("active"));
-  document.querySelectorAll(".main-nav-btn").forEach((el) => el.classList.remove("active"));
+  document.querySelectorAll('.main-nav-btn[data-main-tab]').forEach((el) => el.classList.remove("active"));
   const panel = document.getElementById(tabName);
   const btn = document.querySelector('.main-nav-btn[data-main-tab="' + tabName + '"]');
   if (panel) panel.classList.add("active");
   if (btn) btn.classList.add("active");
 
   if (tabName === "scout" && !scoutConfig) loadScoutConfig();
+}
+
+function currentAdminModule() {
+  const path = (window.location.pathname || "").replace(/\/$/, "");
+  if (path === "/admin" || path === "/admin/dashboard") return "dashboard";
+  if (path === "/admin/scout") return "scout";
+  if (path === "/admin/leads") return "leads";
+  if (path === "/admin/cases") return "cases";
+  if (path === "/admin/outreach") return "outreach";
+  if (path === "/admin/notes") return "notes";
+  return "dashboard";
+}
+
+function setActiveAdminModuleNav(module) {
+  document.querySelectorAll(".admin-module-link").forEach((el) => {
+    el.classList.toggle("active", el.getAttribute("data-admin-module") === module);
+  });
+}
+
+function applyAdminRouteView() {
+  const path = (window.location.pathname || "").replace(/\/$/, "");
+  if (!(path === "/admin" || path.startsWith("/admin/"))) return;
+  const module = currentAdminModule();
+
+  // Keep one code path and reuse existing panels while focusing module context.
+  showMainTab("dashboard");
+  setActiveAdminModuleNav(module);
+  const routeLabel = document.getElementById("adminRouteLabel");
+  if (routeLabel) routeLabel.textContent = path;
+  const moduleDescription = document.getElementById("adminModuleDescription");
+  if (moduleDescription) {
+    const labels = {
+      dashboard: "Dashboard",
+      scout: "Scout engine",
+      leads: "Leads list",
+      cases: "Business dossiers",
+      outreach: "Outreach queue",
+      notes: "Notes",
+    };
+    moduleDescription.textContent = labels[module] || "Dashboard";
+  }
+
+  if (module === "dashboard") {
+    _runnerStatusFilter = "all";
+    _runnerSort = "priority";
+    document.getElementById("adminDashboardSummary")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  } else if (module === "scout") {
+    _runnerStatusFilter = "all";
+    _runnerSort = "priority";
+    document.getElementById("morningRunnerPanel")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  } else if (module === "leads") {
+    _runnerStatusFilter = "all";
+    _runnerSort = "name";
+    document.getElementById("morningRunnerPanel")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  } else if (module === "cases") {
+    _runnerStatusFilter = "all";
+    _runnerSort = "priority";
+    document.getElementById("morningRunnerPanel")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  } else if (module === "outreach") {
+    _runnerStatusFilter = "Follow up";
+    _runnerSort = "priority";
+    document.getElementById("morningRunnerPanel")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  } else if (module === "notes") {
+    document.getElementById("memory-list")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  if (_runnerLastPayload) {
+    renderMorningRunner(
+      _runnerLastPayload.today,
+      _runnerLastPayload.opportunities,
+      _runnerLastPayload.stdout,
+      _runnerLastPayload.stderr
+    );
+  }
 }
 
 function loadScoutConfig() {
@@ -519,7 +593,9 @@ async function fetchCase(slug) {
 
 let _runnerPreviousCount = null;
 let _runnerStatusFilter = "all";
+let _runnerSort = "priority";
 let _runnerOpportunities = [];
+let _runnerLastPayload = null;
 
 const LEAD_STATUSES = ["New", "Ready to contact", "Contacted", "Follow up", "Closed", "Skip"];
 
@@ -552,6 +628,7 @@ async function runScoutNow() {
   const btn = document.getElementById("runMorningScoutBtn");
   const summary = document.getElementById("morningRunnerSummary");
   const generated = document.getElementById("scoutGeneratedAt");
+  const locationStatus = document.getElementById("scoutLocationStatus");
 
   const prevCount = _runnerPreviousCount;
 
@@ -573,6 +650,43 @@ async function runScoutNow() {
   if (summary) summary.textContent = "Scout is running... searching and investigating businesses.";
   if (generated) generated.textContent = "Scout is running...";
 
+  async function resolveDeviceLocation() {
+    const savedHome = scoutConfig?.home_city ? `Saved location: ${scoutConfig.home_city}` : "Using saved home location";
+    console.log("requesting device location");
+    if (!("geolocation" in navigator)) {
+      console.log("device location denied");
+      if (locationStatus) locationStatus.textContent = "Location unavailable, using saved home location";
+      if (summary) summary.textContent = savedHome;
+      return null;
+    }
+    return new Promise((resolve) => {
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          const coords = {
+            current_lat: pos.coords.latitude,
+            current_lng: pos.coords.longitude,
+          };
+          console.log("device location received", coords);
+          if (locationStatus) {
+            locationStatus.textContent = `Current location: ${coords.current_lat.toFixed(4)}, ${coords.current_lng.toFixed(4)}`;
+          }
+          resolve(coords);
+        },
+        () => {
+          console.log("device location denied");
+          if (locationStatus) locationStatus.textContent = "Location unavailable, using saved home location";
+          if (summary) summary.textContent = savedHome;
+          resolve(null);
+        },
+        {
+          enableHighAccuracy: true,
+          timeout: 8000,
+          maximumAge: 300000,
+        }
+      );
+    });
+  }
+
   function showScoutError(userMsg, errType, errMsg, fullData) {
     setRunnerStatus("Failed");
     if (summary) summary.textContent = userMsg;
@@ -589,6 +703,7 @@ async function runScoutNow() {
   }
 
   try {
+    const deviceLocation = await resolveDeviceLocation();
     const apiBase = (window.MB_API_BASE || "").replace(/\/$/, "");
     const runScoutUrl = `${apiBase}/run-scout`;
     console.log("Calling", runScoutUrl);
@@ -596,7 +711,21 @@ async function runScoutNow() {
     if (window.MB_SESSION?.access_token) {
       headers["Authorization"] = `Bearer ${window.MB_SESSION.access_token}`;
     }
-    const response = await fetch(runScoutUrl, { method: "POST", headers });
+    const payload = deviceLocation || {};
+    if (deviceLocation) {
+      console.log("run scout using current location");
+      if (summary) summary.textContent = "Using current location";
+    } else {
+      console.log("run scout using saved config location");
+      const savedHome = scoutConfig?.home_city ? `Saved location: ${scoutConfig.home_city}` : "Using saved home location";
+      if (locationStatus) locationStatus.textContent = savedHome;
+      if (summary) summary.textContent = savedHome;
+    }
+    const response = await fetch(runScoutUrl, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+    });
     console.log("Scout response status:", response.status);
 
     let data;
@@ -841,13 +970,15 @@ function openCaseDetail(opp) {
   html += `</div></div>`;
 
   html += `<div class="case-detail-section"><h4>Contact Matrix</h4><div class="case-field-list">`;
-  html += `<div class="case-field"><span class="case-field-label">Best contact:</span> ${m(opp.contact_matrix?.best_contact || opp.recommended_contact)}</div>`;
-  html += `<div class="case-field"><span class="case-field-label">Backup contact:</span> ${m(opp.contact_matrix?.backup_contact || opp.backup_contact_method)}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Best contact:</span> ${m(opp.contact_matrix?.best_contact_method || opp.contact_matrix?.best_contact || opp.recommended_contact)}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Backup contact:</span> ${m(opp.contact_matrix?.backup_contact_method || opp.contact_matrix?.backup_contact || opp.backup_contact_method)}</div>`;
   html += `<div class="case-field"><span class="case-field-label">Email:</span> ${email || "Missing"}</div>`;
   html += `<div class="case-field"><span class="case-field-label">Phone:</span> ${m(phone)}</div>`;
   html += `<div class="case-field"><span class="case-field-label">Contact page:</span> ${opp.contact?.contact_page ? `<a href="${opp.contact.contact_page}" target="_blank" rel="noopener">${opp.contact.contact_page}</a>` : "Missing"}</div>`;
   html += `<div class="case-field"><span class="case-field-label">Facebook:</span> ${opp.contact?.facebook ? `<a href="${opp.contact.facebook}" target="_blank" rel="noopener">${opp.contact.facebook}</a>` : "Missing"}</div>`;
   html += `<div class="case-field"><span class="case-field-label">Instagram:</span> ${opp.contact?.instagram ? `<a href="${opp.contact.instagram}" target="_blank" rel="noopener">${opp.contact.instagram}</a>` : "Missing"}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">LinkedIn:</span> ${opp.contact?.linkedin ? `<a href="${opp.contact.linkedin}" target="_blank" rel="noopener">${opp.contact.linkedin}</a>` : "Missing"}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Owner/founder/manager:</span> ${m(opp.owner_manager_name || opp.contact_matrix?.owner_name || (opp.owner_names && opp.owner_names[0]))}</div>`;
   const soc = opp.social_links || {};
   Object.entries(soc).filter(([k]) => !["facebook","instagram"].includes(k)).forEach(([k, v]) => {
     if (v) html += `<div class="case-field"><span class="case-field-label">${k}:</span> <a href="${v}" target="_blank" rel="noopener">${v}</a></div>`;
@@ -861,10 +992,25 @@ function openCaseDetail(opp) {
   html += `<div class="case-field"><span class="case-field-label">Viewport/mobile:</span> ${opp.viewport_ok === true ? "OK" : opp.viewport_ok === false ? "Issues" : "Missing"}</div>`;
   html += `<div class="case-field"><span class="case-field-label">Tap-to-call:</span> ${opp.tap_to_call_present === true ? "Yes" : opp.tap_to_call_present === false ? "No" : "Missing"}</div>`;
   html += `<div class="case-field"><span class="case-field-label">Contact form:</span> ${opp.contact_form_present === true ? "Yes" : opp.contact_form_present === false ? "No" : "Missing"}</div>`;
-  html += `<div class="case-field"><span class="case-field-label">Menu found:</span> ${opp.menu_visibility === true ? "Yes" : opp.menu_visibility === false ? "No" : "Missing"}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Menu found:</span> ${opp.menu_found === true || opp.menu_visibility === true ? "Yes" : (opp.menu_found === false || opp.menu_visibility === false) ? "No" : "Missing"}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Hours found:</span> ${opp.hours_found === true || opp.hours_visibility === true ? "Yes" : (opp.hours_found === false || opp.hours_visibility === false) ? "No" : "Missing"}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Directions found:</span> ${opp.directions_found === true || opp.directions_visibility === true ? "Yes" : (opp.directions_found === false || opp.directions_visibility === false) ? "No" : "Missing"}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Outdated design clues:</span> ${opp.outdated_design_clues === true ? "Yes" : opp.outdated_design_clues === false ? "No" : "Missing"}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Text-heavy clues:</span> ${opp.text_heavy_clues === true ? "Yes" : opp.text_heavy_clues === false ? "No" : "Missing"}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Navigation items:</span> ${((opp.navigation_items || opp.page_navigation_items || []).length ? (opp.navigation_items || opp.page_navigation_items).join(", ") : "Missing")}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Important internal links:</span> ${(Object.keys(opp.important_internal_links || opp.internal_links_found || {}).length ? Object.entries(opp.important_internal_links || opp.internal_links_found).map(([k, v]) => `${k}: ${v}`).join(" | ") : "Missing")}</div>`;
   const disc = opp.discovered_pages || [];
   html += `<div class="case-field"><span class="case-field-label">Internal pages found:</span> ${disc.length ? disc.length + " pages" : "Missing"}</div>`;
   html += `</div><p><strong>Strongest problems:</strong></p><pre class="case-pre">${escapeHtml(issues.length ? issues.join("\n") : "None identified")}</pre></div>`;
+
+  const reviewSnippets = Array.isArray(opp.review_snippets) ? opp.review_snippets : [];
+  const reviewThemes = Array.isArray(opp.review_themes) ? opp.review_themes : [];
+  html += `<div class="case-detail-section"><h4>Review Intelligence</h4><div class="case-field-list">`;
+  html += `<div class="case-field"><span class="case-field-label">Rating:</span> ${m(opp.rating)}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Review count:</span> ${m(opp.review_count)}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Review themes:</span> ${reviewThemes.length ? reviewThemes.join(", ") : "Missing"}</div>`;
+  html += `</div>`;
+  html += `<p><strong>Review snippets:</strong></p><pre class="case-pre">${escapeHtml(reviewSnippets.length ? reviewSnippets.join("\n\n") : "Missing")}</pre></div>`;
 
   html += `<div class="case-detail-section"><h4>Pitch angle</h4><p>${s(opp.pitch_angle) || "Missing"}</p>`;
   if (opp.demo_to_show) html += `<p><strong>Demo:</strong> ${s(opp.demo_to_show)}</p>`;
@@ -1003,11 +1149,13 @@ function closeRawCaseModal() {
 }
 
 function renderMorningRunner(today, opportunities, stdout, stderr) {
+  _runnerLastPayload = { today, opportunities, stdout, stderr };
   const list = document.getElementById("morningRunnerList");
   const count = document.getElementById("morningRunnerCount");
   const summary = document.getElementById("morningRunnerSummary");
   const generated = document.getElementById("scoutGeneratedAt");
   const filterEl = document.getElementById("runnerStatusFilters");
+  const sortEl = document.getElementById("runnerSortSelect");
   const todaySection = document.getElementById("runnerTodaySection");
   const todayList = document.getElementById("runnerTodayList");
 
@@ -1020,8 +1168,22 @@ function renderMorningRunner(today, opportunities, stdout, stderr) {
     ? top
     : top.filter(o => (o.status || "New") === _runnerStatusFilter);
 
-  const noWebsite = filtered.filter(o => o.no_website || o.lane === "no_website");
-  const weakWebsite = filtered.filter(o => !o.no_website && o.lane !== "no_website");
+  const sorted = [...filtered].sort((a, b) => {
+    if (_runnerSort === "distance") {
+      return (a.distance_miles ?? 9999) - (b.distance_miles ?? 9999);
+    }
+    if (_runnerSort === "name") {
+      return String(a.name || "").localeCompare(String(b.name || ""));
+    }
+    if (_runnerSort === "status") {
+      return String(a.status || "New").localeCompare(String(b.status || "New"));
+    }
+    const pScore = { high: 3, medium: 2, low: 1 };
+    return (pScore[b.priority] || 0) - (pScore[a.priority] || 0);
+  });
+
+  const noWebsite = sorted.filter(o => o.no_website || o.lane === "no_website");
+  const weakWebsite = sorted.filter(o => !o.no_website && o.lane !== "no_website");
 
   if (filterEl) {
     filterEl.innerHTML = "";
@@ -1036,6 +1198,14 @@ function renderMorningRunner(today, opportunities, stdout, stderr) {
       };
       filterEl.appendChild(btn);
     });
+  }
+
+  if (sortEl) {
+    sortEl.value = _runnerSort;
+    sortEl.onchange = () => {
+      _runnerSort = sortEl.value || "priority";
+      renderMorningRunner(today, opportunities, stdout, stderr);
+    };
   }
 
   const todayLeads = top.filter(o => {
@@ -1056,7 +1226,7 @@ function renderMorningRunner(today, opportunities, stdout, stderr) {
   }
 
   list.innerHTML = "";
-  count.textContent = filtered.length;
+  count.textContent = sorted.length;
   summary.textContent = today?.summary || "No scout summary available.";
   generated.textContent = today?.generated_at ? `Generated: ${today.generated_at}` : "No scout run yet";
 
@@ -1272,14 +1442,35 @@ function renderMorningRunner(today, opportunities, stdout, stderr) {
   }
 }
 
+function updateAdminSummary(today, opportunities) {
+  const total = opportunities?.length || 0;
+  const todayLeads = today?.top_opportunities?.length || total;
+  const followUps = (opportunities || []).filter((o) => {
+    const status = o.status || "New";
+    return status === "Follow up" || !!o.follow_up_due;
+  }).length;
+  const topNames = (opportunities || []).slice(0, 3).map((o) => o.name).filter(Boolean);
+
+  const setText = (id, val) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = val;
+  };
+  setText("adm-total-leads", String(total));
+  setText("adm-today-leads", String(todayLeads));
+  setText("adm-followups-due", String(followUps));
+  setText("adm-top-opps", topNames.length ? topNames.join(", ") : "None");
+}
+
 async function refreshScoutData() {
   const summary = document.getElementById("morningRunnerSummary");
   try {
     const data = await fetchScoutData();
     renderMorningRunner(data.today, data.opportunities);
+    updateAdminSummary(data.today, data.opportunities);
   } catch (err) {
     console.error(err);
     if (summary) summary.textContent = "Could not load scout data. Check that the backend API is reachable.";
+    updateAdminSummary(null, []);
   }
 }
 window.refreshScoutData = refreshScoutData;
@@ -1322,8 +1513,19 @@ function bindButtons() {
     btn.addEventListener("click", () => showTab(btn.getAttribute("data-tab")));
   });
 
-  document.querySelectorAll(".main-nav-btn").forEach((btn) => {
+  document.querySelectorAll(".main-nav-btn[data-main-tab]").forEach((btn) => {
     btn.addEventListener("click", () => showMainTab(btn.getAttribute("data-main-tab")));
+  });
+
+  document.querySelectorAll(".admin-module-link").forEach((link) => {
+    link.addEventListener("click", (e) => {
+      e.preventDefault();
+      const href = link.getAttribute("href");
+      if (!href) return;
+      history.pushState({}, "", href);
+      window.dispatchEvent(new PopStateEvent("popstate"));
+      applyAdminRouteView();
+    });
   });
 
   const runScoutBtn = document.getElementById("runScoutBtn");
@@ -1405,9 +1607,12 @@ function bindButtons() {
   });
 
   renderAll();
+  applyAdminRouteView();
   refreshScoutData();
   console.log("app init complete");
 }
+
+window.MB_APPLY_ADMIN_ROUTE_VIEW = applyAdminRouteView;
 
 if (document.readyState === "loading") {
   document.addEventListener("DOMContentLoaded", bindButtons);

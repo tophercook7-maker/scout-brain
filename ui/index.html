@@ -8,32 +8,103 @@
   <!-- CSS loaded via main.js import for Vite bundling -->
 </head>
 <body>
-  <header class="topbar">
-    <div>
-      <p class="eyebrow">Topher's AI Workshop</p>
-      <h1>Topher Brain v0.8</h1>
-      <p class="subtext">Opportunity board, Scout Console, Pitch Mode, real site auditor.</p>
-    </div>
-    <div class="topbar-actions">
-      <button id="exportBrain" class="ghost-btn" type="button">Backup Brain</button>
-      <label class="ghost-btn import-label">
-        <input type="file" id="importBrain" accept=".json,application/json" style="display:none" />
-        Import
-      </label>
-    </div>
-  </header>
+  <section id="public-site" class="public-site">
+    <header class="topbar public-topbar">
+      <div>
+        <p class="eyebrow">MixedMakerShop</p>
+        <h1>Scout-Brain</h1>
+        <p class="subtext">Web design and growth systems for local businesses.</p>
+      </div>
+      <nav class="public-nav">
+        <a href="/" class="ghost-btn public-nav-link" data-public-route="/">Home</a>
+        <a href="/services" class="ghost-btn public-nav-link" data-public-route="/services">Services</a>
+        <a href="/portfolio" class="ghost-btn public-nav-link" data-public-route="/portfolio">Portfolio</a>
+        <a href="/contact" class="ghost-btn public-nav-link" data-public-route="/contact">Contact</a>
+        <a href="/admin" class="primary-btn public-nav-link" data-public-route="/admin">Admin Login</a>
+      </nav>
+    </header>
+    <main class="public-main">
+      <section class="public-page" data-public-page="/">
+        <article class="panel">
+          <h2>Homepage</h2>
+          <p>Welcome to the public website. Private CRM tools are available in the admin area.</p>
+        </article>
+      </section>
+      <section class="public-page hidden" data-public-page="/services">
+        <article class="panel">
+          <h2>Services</h2>
+          <p>Website builds, redesigns, and local-business conversion optimization.</p>
+        </article>
+      </section>
+      <section class="public-page hidden" data-public-page="/portfolio">
+        <article class="panel">
+          <h2>Portfolio</h2>
+          <p>Selected examples and case outcomes for local business growth projects.</p>
+        </article>
+      </section>
+      <section class="public-page hidden" data-public-page="/contact">
+        <article class="panel">
+          <h2>Contact</h2>
+          <p>Reach out for project inquiries and partnership opportunities.</p>
+        </article>
+      </section>
+    </main>
+  </section>
 
-  <nav class="main-nav">
-    <ul>
-      <li><button type="button" class="main-nav-btn active" data-main-tab="dashboard">Dashboard</button></li>
-      <li><button type="button" class="main-nav-btn" data-main-tab="scout">Scout Console</button></li>
-      <li><button type="button" class="main-nav-btn" data-main-tab="pitch">Pitch Mode</button></li>
-    </ul>
-  </nav>
+  <section id="admin-app" class="admin-app hidden">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">Private Admin / CRM</p>
+        <h1>Scout-Brain Admin</h1>
+        <p class="subtext" id="adminRouteLabel">/admin</p>
+        <p class="subtext" id="adminModuleDescription">Dashboard</p>
+      </div>
+      <div class="topbar-actions">
+        <button id="exportBrain" class="ghost-btn" type="button">Backup Brain</button>
+        <label class="ghost-btn import-label">
+          <input type="file" id="importBrain" accept=".json,application/json" style="display:none" />
+          Import
+        </label>
+      </div>
+    </header>
 
-  <main class="dashboard">
+    <nav class="main-nav admin-module-nav">
+      <ul>
+        <li><a href="/admin" class="main-nav-btn admin-module-link" data-admin-module="dashboard">Dashboard</a></li>
+        <li><a href="/admin/scout" class="main-nav-btn admin-module-link" data-admin-module="scout">Scout</a></li>
+        <li><a href="/admin/leads" class="main-nav-btn admin-module-link" data-admin-module="leads">Leads</a></li>
+        <li><a href="/admin/cases" class="main-nav-btn admin-module-link" data-admin-module="cases">Cases</a></li>
+        <li><a href="/admin/outreach" class="main-nav-btn admin-module-link" data-admin-module="outreach">Outreach</a></li>
+        <li><a href="/admin/notes" class="main-nav-btn admin-module-link" data-admin-module="notes">Notes</a></li>
+      </ul>
+    </nav>
+
     <div id="auth-container"></div>
-    <section id="dashboard" class="tab-panel active">
+
+    <div id="admin-protected" hidden>
+      <section class="hero-card" id="adminDashboardSummary">
+        <div>
+          <h2>Dashboard</h2>
+          <p>Private CRM snapshot across scout, leads, cases, outreach, and notes.</p>
+        </div>
+        <div class="hero-actions">
+          <div class="mini-stat"><span class="mini-label">Total Leads</span><strong id="adm-total-leads">0</strong></div>
+          <div class="mini-stat"><span class="mini-label">Leads Discovered Today</span><strong id="adm-today-leads">0</strong></div>
+          <div class="mini-stat"><span class="mini-label">Follow Ups Due</span><strong id="adm-followups-due">0</strong></div>
+          <div class="mini-stat"><span class="mini-label">Top Opportunities</span><strong id="adm-top-opps">None</strong></div>
+        </div>
+      </section>
+
+      <nav class="main-nav">
+        <ul>
+          <li><button type="button" class="main-nav-btn active" data-main-tab="dashboard">Dashboard</button></li>
+          <li><button type="button" class="main-nav-btn" data-main-tab="scout">Scout Console</button></li>
+          <li><button type="button" class="main-nav-btn" data-main-tab="pitch">Pitch Mode</button></li>
+        </ul>
+      </nav>
+
+      <main class="dashboard">
+        <section id="dashboard" class="tab-panel active">
     <section class="grid">
       <article class="panel">
         <div class="panel-header">
@@ -132,6 +203,7 @@
         <button type="button" id="runMorningScoutBtn" class="primary-btn">Run Scout</button>
         <button type="button" id="refreshScoutBtn" class="ghost-btn">Refresh Scout Data</button>
         <span class="runner-loading-indicator hidden" id="runnerLoadingIndicator" aria-hidden="true"></span>
+        <span class="tag" id="scoutLocationStatus">Saved location mode</span>
         <span class="tag" id="scoutGeneratedAt">No scout run yet</span>
       </div>
       <div class="item-card runner-summary-card">
@@ -146,6 +218,13 @@
       <div class="runner-filter-row">
         <span class="runner-filter-label">Filter:</span>
         <div id="runnerStatusFilters" class="runner-status-filters"></div>
+        <label for="runnerSortSelect" class="runner-filter-label">Sort:</label>
+        <select id="runnerSortSelect" class="runner-sort-select">
+          <option value="priority">Priority</option>
+          <option value="name">Name</option>
+          <option value="distance">Distance</option>
+          <option value="status">Status</option>
+        </select>
       </div>
       <div id="morningRunnerList" class="card-list"></div>
     </section>
@@ -173,7 +252,9 @@
       </div>
       <div id="pitchDisplay"></div>
     </section>
-  </main>
+      </main>
+    </div>
+  </section>
 
   <div id="caseDetailModal" class="modal hidden" aria-hidden="true">
     <div class="modal-backdrop" id="caseDetailBackdrop"></div>

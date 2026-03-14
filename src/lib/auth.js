@@ -49,6 +49,17 @@ export async function signOut() {
   return supabase.auth.signOut();
 }
 
+export async function requestPasswordReset(email) {
+  if (!supabase) return { data: null, error: new Error("Supabase not configured") };
+  try {
+    return await supabase.auth.resetPasswordForEmail(email, {
+      redirectTo: window.location.origin,
+    });
+  } catch (err) {
+    return { data: null, error: err };
+  }
+}
+
 export async function getUser() {
   if (!supabase) return null;
   try {

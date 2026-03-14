@@ -92,16 +92,16 @@ def load_config():
         return json.load(f)
 
 
-def _fetch_places(city: str, categories: list, max_per: int, radius: float):
+def _fetch_places(city: str, categories: list, max_per: int, radius: float, current_lat: float | None = None, current_lng: float | None = None):
     def log(msg: str) -> None:
         print(f"  {msg}")
 
     try:
         from .places_client import search_places
-        return search_places(city, categories, max_per, radius, log=log)
+        return search_places(city, categories, max_per, radius, log=log, current_lat=current_lat, current_lng=current_lng)
     except ImportError:
         from places_client import search_places
-        return search_places(city, categories, max_per, radius, log=log)
+        return search_places(city, categories, max_per, radius, log=log, current_lat=current_lat, current_lng=current_lng)
 
 
 def _score_no_website(case: dict) -> float:
@@ -267,12 +267,15 @@ def _build_no_website_case(place: dict, home_city: str, categories: list, index:
     case["hours"] = place.get("hours")
     case["rating"] = place.get("rating")
     case["review_count"] = place.get("review_count")
+    case["review_snippets"] = place.get("review_snippets") or []
+    case["review_themes"] = place.get("review_themes") or []
 
     case["email"] = None
     case["contact_page"] = None
     case["phone_from_site"] = None
     case["facebook"] = None
     case["instagram"] = None
+    case["linkedin"] = None
     case["social_links"] = {}
     case["emails"] = []
     case["phones"] = [place["phone"]] if place.get("phone") else []
@@ -295,8 +298,10 @@ def _build_no_website_case(place: dict, home_city: str, categories: list, index:
     case["strongest_problems"] = ["No website — missing online presence"]
     case["strongest_pitch_angle"] = "Get your first simple website so customers can find you online"
     case["best_service_to_offer"] = "First website — simple, mobile-friendly, with hours and contact"
+    case["best_demo_to_show"] = "Show example of similar local business site"
     case["demo_to_show"] = "Show example of similar local business site"
     case["why_worth_pursuing"] = f"{name} — independent business with no website. High intent for first-site build."
+    case["why_this_lead_is_worth_pursuing"] = case["why_worth_pursuing"]
     case["what_stood_out"] = "No website"
     case["next_action"] = "Call or visit with short pitch"
     case["follow_up_suggestion"] = "Follow up in 3–5 days"
@@ -304,7 +309,16 @@ def _build_no_website_case(place: dict, home_city: str, categories: list, index:
     case["priority"] = "high" if case["phone"] else "medium"
     case["contact_matrix"] = {
         "best_contact": "phone" if case["phone"] else "visit",
+        "best_contact_method": "phone" if case["phone"] else "visit",
         "backup_contact": "maps",
+        "backup_contact_method": "maps",
+        "email": None,
+        "phone": case["phone"],
+        "contact_page": None,
+        "facebook": None,
+        "instagram": None,
+        "linkedin": None,
+        "owner_name": None,
         "phone_available": bool(case["phone"]),
         "contact_form_available": False,
         "social_available": False,
@@ -354,6 +368,8 @@ def _build_weak_website_case(place: dict, home_city: str, categories: list, inde
     case["hours"] = place.get("hours")
     case["rating"] = place.get("rating")
     case["review_count"] = place.get("review_count")
+    case["review_snippets"] = place.get("review_snippets") or []
+    case["review_themes"] = place.get("review_themes") or []
 
     log.append(f"  Investigating: {website}")
     inv = None
@@ -368,6 +384,9 @@ def _build_weak_website_case(place: dict, home_city: str, categories: list, inde
         case["meta_description"] = inv.get("meta_description")
         case["viewport_ok"] = inv.get("viewport_ok")
         case["tap_to_call_present"] = inv.get("tap_to_call_present")
+        case["menu_found"] = inv.get("menu_visibility")
+        case["hours_found"] = inv.get("hours_visibility")
+        case["directions_found"] = inv.get("directions_visibility")
         case["menu_visibility"] = inv.get("menu_visibility")
         case["hours_visibility"] = inv.get("hours_visibility")
         case["directions_visibility"] = inv.get("directions_visibility")
@@ -376,7 +395,9 @@ def _build_weak_website_case(place: dict, home_city: str, categories: list, inde
         case["outdated_design_clues"] = inv.get("outdated_design_clues")
         case["ssl_ok"] = inv.get("ssl_ok")
         case["internal_links_found"] = inv.get("internal_links_found") or {}
+        case["important_internal_links"] = inv.get("important_internal_links") or inv.get("internal_links_found") or {}
         case["page_navigation_items"] = inv.get("page_navigation_items") or []
+        case["navigation_items"] = inv.get("navigation_items") or inv.get("page_navigation_items") or []
         case["emails"] = inv.get("emails") or []
         case["phones"] = inv.get("phones") or []
         case["owner_names"] = inv.get("owner_names") or []
@@ -392,7 +413,9 @@ def _build_weak_website_case(place: dict, home_city: str, categories: list, inde
         case["phone_from_site"] = (inv.get("phones") or [None])[0]
         case["facebook"] = social.get("facebook")
         case["instagram"] = social.get("instagram")
+        case["linkedin"] = social.get("linkedin")
         case["social_links"] = social
+        case["owner_manager_name"] = (case.get("owner_names") or [None])[0]
 
         problems = inv.get("problems") or []
         pitch_lines = inv.get("pitch") or []
@@ -406,6 +429,7 @@ def _build_weak_website_case(place: dict, home_city: str, categories: list, inde
     case["strongest_problems"] = problems
     case["strongest_pitch_angle"] = pitch_lines[0] if pitch_lines else None
     case["best_service_to_offer"] = "Modern mobile-friendly website with clear menu, hours, and contact"
+    case["best_demo_to_show"] = "Show demo on iPad"
     case["demo_to_show"] = "Show demo on iPad"
 
     if case["email"]:
@@ -429,6 +453,7 @@ def _build_weak_website_case(place: dict, home_city: str, categories: list, inde
     case["follow_up_line"] = pack["follow_up_line"]
 
     case["why_worth_pursuing"] = f"{name} — real business with website, worth outreach."
+    case["why_this_lead_is_worth_pursuing"] = case["why_worth_pursuing"]
     case["what_stood_out"] = problems[0] if problems else None
     case["next_action"] = "Send short email or try contact form"
     case["follow_up_suggestion"] = "Follow up in 5–7 days"
@@ -444,7 +469,7 @@ def _build_weak_website_case(place: dict, home_city: str, categories: list, inde
     return case
 
 
-def run():
+def run(current_lat: float | None = None, current_lng: float | None = None):
     try:
         from dotenv import load_dotenv
         load_dotenv(SCRIPT_DIR / ".env")
@@ -463,6 +488,10 @@ def run():
     print("Morning Runner — automated local client finder")
     print(f"  home_city: {home_city}, radius: {radius} mi")
     print(f"  categories: {categories}, max_per: {max_per}, ignore_chains: {ignore_chains}")
+    if current_lat is not None and current_lng is not None:
+        print(f"  location mode: current ({current_lat}, {current_lng})")
+    else:
+        print(f"  location mode: saved config ({home_city})")
     if not api_key:
         print()
         print("  ERROR: GOOGLE_MAPS_API_KEY not set. Add to scout/.env")
@@ -475,7 +504,7 @@ def run():
 
     places = []
     try:
-        places = _fetch_places(home_city, categories, max_per, radius)
+        places = _fetch_places(home_city, categories, max_per, radius, current_lat=current_lat, current_lng=current_lng)
     except ScoutRunError:
         raise
     except Exception as e:
@@ -570,7 +599,8 @@ def run():
         return
 
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    summary = f"Found {len(no_website_slugs)} no-website + {len(weak_website_slugs)} weak-website opportunities near {home_city}."
+    location_summary = f"{current_lat:.4f},{current_lng:.4f}" if (current_lat is not None and current_lng is not None) else home_city
+    summary = f"Found {len(no_website_slugs)} no-website + {len(weak_website_slugs)} weak-website opportunities near {location_summary}."
     today = {
         "generated_at": generated_at,
         "summary": summary,

@@ -98,9 +98,9 @@ app.add_middleware(
 )
 
 
-def _run_morning_runner():
+def _run_morning_runner(current_lat: float | None = None, current_lng: float | None = None):
     from scout.morning_runner import run
-    run()
+    run(current_lat=current_lat, current_lng=current_lng)
 
 
 def _load_scout_data():
@@ -312,10 +312,21 @@ def _scout_error_response(error_type: str, error_message: str, user_friendly_mes
     return JSONResponse(status_code=200, content=payload)
 
 
+class RunScoutBody(BaseModel):
+    current_lat: float | None = None
+    current_lng: float | None = None
+
+
 @app.post("/run-scout")
-def post_run_scout(request: Request):
+def post_run_scout(request: Request, body: RunScoutBody | None = None):
     try:
-        _run_morning_runner()
+        current_lat = body.current_lat if body else None
+        current_lng = body.current_lng if body else None
+        if current_lat is not None and current_lng is not None:
+            print(f"  [Scout] run scout using current location: {current_lat}, {current_lng}")
+        else:
+            print("  [Scout] run scout using saved config location")
+        _run_morning_runner(current_lat=current_lat, current_lng=current_lng)
         data = _load_scout_data()
         today = data["today"]
         opportunities = data["opportunities"]
