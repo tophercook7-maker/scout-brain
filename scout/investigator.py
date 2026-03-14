@@ -5,6 +5,7 @@ data, platform clues, owner names, and builds a contact matrix.
 Used by Morning Runner to build detailed research per opportunity.
 """
 import re
+import time
 from pathlib import Path
 import urllib.request
 import urllib.error
@@ -29,19 +30,23 @@ CRAWL_PATHS = [
 INTERNAL_SCREENSHOT_PRIORITY = ["menu", "services", "about", "contact"]
 
 
-def _fetch(url: str, timeout: int = 10) -> tuple[str, int]:
-    """Fetch URL, return (html, status)."""
+def _fetch(url: str, timeout: int = 10) -> tuple[str, int, float | None]:
+    """Fetch URL, return (html, status, elapsed_seconds)."""
     if not url.startswith("http"):
         url = "https://" + url
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    started = time.perf_counter()
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = resp.read(400000)
-            return body.decode("utf-8", errors="ignore"), resp.status
+            elapsed = time.perf_counter() - started
+            return body.decode("utf-8", errors="ignore"), resp.status, elapsed
     except urllib.error.HTTPError as e:
-        return "", e.code
+        elapsed = time.perf_counter() - started
+        return "", e.code, elapsed
     except Exception:
-        return "", 0
+        elapsed = time.perf_counter() - started
+        return "", 0, elapsed
 
 
 def _extract_emails(html: str) -> list[str]:
@@ -278,6 +283,37 @@ def _get_title_meta(html: str) -> tuple[str | None, str | None]:
     return title, meta
 
 
+def _estimate_text_content_length(html: str) -> int:
+    cleaned = re.sub(r"<script[^>]*>.*?</script>", " ", html or "", flags=re.I | re.S)
+    cleaned = re.sub(r"<style[^>]*>.*?</style>", " ", cleaned, flags=re.I | re.S)
+    cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return len(cleaned)
+
+
+def _count_images(html: str) -> int:
+    return len(re.findall(r"<img\b", html or "", flags=re.I))
+
+
+def _count_broken_links_from_html(html: str, base_url: str, timeout: int = 6, max_checks: int = 6) -> int:
+    candidates: list[str] = []
+    for m in re.finditer(r'href=["\']([^"\']+)["\']', html or "", re.I):
+        href = (m.group(1) or "").strip()
+        if not href or href.startswith("#") or href.startswith("javascript:") or href.startswith("mailto:") or href.startswith("tel:"):
+            continue
+        full = urljoin(base_url, href)
+        if full not in candidates:
+            candidates.append(full)
+        if len(candidates) >= max_checks:
+            break
+    broken = 0
+    for link in candidates:
+        _, status, _ = _fetch(link, timeout=timeout)
+        if status == 0 or status >= 400:
+            broken += 1
+    return broken
+
+
 def _clamp_score(v: float) -> int:
     return int(max(0, min(100, round(v))))
 
@@ -449,7 +485,7 @@ def investigate(
     ssl_ok = parsed.scheme == "https"
     debug_log: list[str] = []
 
-    home_html, status = _fetch(url, timeout)
+    home_html, status, homepage_load_seconds = _fetch(url, timeout)
     if not home_html:
         debug_log.append("website: fetch failed")
         return {
@@ -483,6 +519,13 @@ def investigate(
             "navigation_score": None,
             "conversion_score": None,
             "audit_issues": [],
+            "homepage_http_status": status,
+            "homepage_load_seconds": homepage_load_seconds,
+            "missing_meta_title": None,
+            "missing_meta_description": None,
+            "text_content_length": None,
+            "image_count": None,
+            "broken_links_count": None,
             "problems": ["Website could not be fetched"],
             "pitch": ["review manually"],
             "desktop_homepage_path": None,
@@ -514,6 +557,11 @@ def investigate(
 
     home_result = _analyze_page(home_html, url)
     title, meta = _get_title_meta(home_html)
+    missing_meta_title = not bool((title or "").strip())
+    missing_meta_description = not bool((meta or "").strip())
+    text_content_length = _estimate_text_content_length(home_html)
+    image_count = _count_images(home_html)
+    broken_links_count = _count_broken_links_from_html(home_html, url, timeout=min(timeout, 8))
     platform = home_result["platform"]
     viewport_ok = home_result["viewport_ok"]
     tap_to_call = home_result["tap_to_call_present"]
@@ -552,7 +600,7 @@ def investigate(
             candidate = urljoin(base, path)
             if candidate.rstrip("/") == url.rstrip("/"):
                 continue
-            html, _ = _fetch(candidate, timeout=8)
+            html, _, _ = _fetch(candidate, timeout=8)
             if html:
                 discovered_pages.append(candidate)
                 combined += "\n" + html
@@ -748,6 +796,13 @@ def investigate(
         "conversion_score": audit.get("conversion_score"),
         "audit_issues": audit.get("audit_issues") or [],
         "detected_issues": audit.get("detected_issues") or [],
+        "homepage_http_status": status,
+        "homepage_load_seconds": homepage_load_seconds,
+        "missing_meta_title": missing_meta_title,
+        "missing_meta_description": missing_meta_description,
+        "text_content_length": text_content_length,
+        "image_count": image_count,
+        "broken_links_count": broken_links_count,
         "desktop_homepage_path": shot_paths.get("desktop_homepage_path"),
         "mobile_homepage_path": shot_paths.get("mobile_homepage_path"),
         "internal_page_path": shot_paths.get("internal_page_path"),

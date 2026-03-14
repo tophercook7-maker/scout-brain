@@ -222,80 +222,166 @@ def _as_int(value, default: int = 0) -> int:
         return default
 
 
-def calculateOpportunityScore(lead: dict) -> tuple[int, list[str], str]:
-    """
-    Opportunity score engine (0-100).
-    Returns: (score, scoring_signals, lead_tier).
-    """
+def _calculate_base_business_score(lead: dict) -> tuple[int, list[str]]:
     score = 35.0
-    score_signals: list[str] = []
-
+    signals: list[str] = []
     rating = _as_float(lead.get("rating"), 0.0)
     review_count = _as_int(lead.get("review_count"), 0)
-    lane = str(lead.get("lane") or "").strip().lower()
-
-    outdated_design = lead.get("outdated_design_clues") is True
-    mobile_layout_problem = lead.get("viewport_ok") is False
-    text_heavy = lead.get("text_heavy_clues") is True
-    missing_cta = lead.get("tap_to_call_present") is False and lead.get("contact_form_present") is False
     business_closed = str(lead.get("business_status") or "").strip().lower() in {"closed", "permanently_closed"}
 
-    modern_website_detected = (
-        lane == "weak_website"
-        and lead.get("viewport_ok") is True
-        and lead.get("tap_to_call_present") is True
-        and lead.get("contact_form_present") is True
-        and not outdated_design
-        and not text_heavy
-    )
-
-    if lane == "no_website" or lead.get("no_website"):
-        score += 20
-        score_signals.append("+20 no website present")
-
     if rating >= 4.2:
-        score += 15
-        score_signals.append("+15 review rating >= 4.2")
+        score += 12
+        signals.append("+12 strong review rating")
     if review_count >= 50:
-        score += 15
-        score_signals.append("+15 review count >= 50")
-    if outdated_design:
-        score += 15
-        score_signals.append("+15 outdated design clues")
-    if mobile_layout_problem:
-        score += 15
-        score_signals.append("+15 mobile layout problem")
-    if text_heavy:
-        score += 10
-        score_signals.append("+10 text-heavy homepage")
-    if missing_cta:
-        score += 10
-        score_signals.append("+10 missing CTA")
-
-    if modern_website_detected:
-        score -= 30
-        score_signals.append("-30 modern website detected")
-    if rating > 0 and rating < 3.5:
-        score -= 20
-        score_signals.append("-20 review rating < 3.5")
-    if business_closed:
-        score -= 50
-        score_signals.append("-50 business closed")
-
+        score += 12
+        signals.append("+12 high review volume")
+    elif review_count >= 20:
+        score += 6
+        signals.append("+6 moderate review volume")
     if lead.get("phone") or lead.get("email") or lead.get("contact_page"):
-        score += 5
-        score_signals.append("+5 reachable contact available")
+        score += 6
+        signals.append("+6 reachable contact available")
 
-    clamped = max(0, min(100, int(round(score))))
-    if clamped >= 85:
+    distance = _as_float(lead.get("distance_miles"), 9999.0)
+    if distance <= 8:
+        score += 5
+        signals.append("+5 close local proximity")
+
+    if rating > 0 and rating < 3.5:
+        score -= 15
+        signals.append("-15 low review rating")
+    if business_closed:
+        score -= 60
+        signals.append("-60 business closed")
+
+    return max(0, min(100, int(round(score)))), signals
+
+
+def calculateWebsiteQualityScore(lead: dict) -> dict:
+    print("website quality check started")
+    issues: list[str] = []
+    boosts: list[str] = []
+    website_quality_score = 0
+
+    website = str(lead.get("website") or "").strip()
+    has_website = bool(website) and not bool(lead.get("no_website"))
+    fetch_ok = lead.get("fetch_ok")
+    ssl_ok = lead.get("ssl_ok")
+    viewport_ok = lead.get("viewport_ok")
+    homepage_title = str(lead.get("homepage_title") or "").strip()
+    meta_description = str(lead.get("meta_description") or "").strip()
+    missing_meta_title = bool(lead.get("missing_meta_title")) or not bool(homepage_title)
+    missing_meta_description = bool(lead.get("missing_meta_description")) or not bool(meta_description)
+    homepage_load_seconds = lead.get("homepage_load_seconds")
+    load_seconds = _as_float(homepage_load_seconds, 0.0) if homepage_load_seconds is not None else None
+    text_content_length = _as_int(lead.get("text_content_length"), 0) if lead.get("text_content_length") is not None else None
+    image_count = _as_int(lead.get("image_count"), 0) if lead.get("image_count") is not None else None
+    broken_links_count = _as_int(lead.get("broken_links_count"), 0) if lead.get("broken_links_count") is not None else 0
+
+    no_website = not has_website
+    unreachable = has_website and (fetch_ok is False)
+    very_slow = bool(load_seconds is not None and load_seconds > 3.0)
+    no_mobile = viewport_ok is False
+    no_ssl = bool(has_website and ((ssl_ok is False) or website.lower().startswith("http://")))
+    missing_seo_basics = missing_meta_title or missing_meta_description
+    very_low_text = bool(text_content_length is not None and text_content_length < 300)
+    missing_images = bool(image_count is not None and image_count == 0)
+    broken_links = broken_links_count > 0
+
+    if no_website:
+        website_quality_score += 40
+        issues.append("no website")
+        boosts.append("+40 no website")
+    if unreachable:
+        website_quality_score += 35
+        issues.append("website unreachable")
+        boosts.append("+35 website unreachable")
+    if very_slow:
+        website_quality_score += 20
+        issues.append("website very slow")
+        boosts.append("+20 very slow website")
+    if no_mobile:
+        website_quality_score += 20
+        issues.append("no mobile optimization")
+        boosts.append("+20 no mobile optimization")
+    if no_ssl:
+        website_quality_score += 15
+        issues.append("no SSL")
+        boosts.append("+15 no SSL")
+    if missing_seo_basics:
+        website_quality_score += 10
+        issues.append("missing SEO basics")
+        boosts.append("+10 missing meta title/description")
+    if very_low_text:
+        issues.append("very low text content")
+    if missing_images:
+        issues.append("missing images")
+    if broken_links:
+        issues.append("broken links detected")
+
+    for issue in issues:
+        print(f"website issue detected: {issue}")
+
+    seo_score = 100
+    if missing_meta_title:
+        seo_score -= 25
+    if missing_meta_description:
+        seo_score -= 25
+    if very_low_text:
+        seo_score -= 20
+    if missing_images:
+        seo_score -= 15
+    if broken_links:
+        seo_score -= 15
+    seo_score = max(0, min(100, seo_score))
+
+    website_quality_score = max(0, min(100, int(round(website_quality_score))))
+    if no_website:
+        website_status = "none"
+    elif unreachable:
+        website_status = "unreachable"
+    elif website_quality_score >= 20:
+        website_status = "weak"
+    else:
+        website_status = "healthy"
+
+    result = {
+        "website_status": website_status,
+        "website_speed": round(load_seconds, 2) if load_seconds is not None else None,
+        "mobile_ready": not no_mobile,
+        "seo_score": seo_score,
+        "website_quality_score": website_quality_score,
+        "website_issues": issues,
+        "website_boost_signals": boosts,
+    }
+    print(
+        "website scoring applied: "
+        f"status={website_status}, quality={website_quality_score}, seo={seo_score}"
+    )
+    return result
+
+
+def calculateOpportunityScore(lead: dict) -> tuple[int, list[str], str, dict]:
+    """
+    Opportunity score engine (0-100).
+    Returns: (score, scoring_signals, lead_tier, website_quality_payload).
+    """
+    base_score, base_signals = _calculate_base_business_score(lead)
+    website_quality = calculateWebsiteQualityScore(lead)
+    website_score = int(website_quality.get("website_quality_score") or 0)
+
+    total = max(0, min(100, int(round(base_score + website_score))))
+    score_signals = list(base_signals) + list(website_quality.get("website_boost_signals") or [])
+    if total >= 85:
         tier = "Hot Lead"
-    elif clamped >= 70:
+    elif total >= 70:
         tier = "Strong Lead"
-    elif clamped >= 50:
+    elif total >= 50:
         tier = "Possible Lead"
     else:
         tier = "Low Priority"
-    return clamped, score_signals, tier
+    print(f"opportunity score updated: base={base_score}, website={website_score}, total={total}")
+    return total, score_signals, tier, website_quality
 
 
 def generateOpportunitySignals(caseData: dict) -> list[str]:
@@ -445,6 +531,12 @@ def _build_no_website_case(place: dict, home_city: str, categories: list, index:
 
     case["strongest_problems"] = ["No website — missing online presence"]
     case["website_score"] = 0
+    case["fetch_ok"] = False
+    case["website_status"] = "none"
+    case["website_speed"] = None
+    case["mobile_ready"] = False
+    case["seo_score"] = 0
+    case["website_quality_score"] = 40
     case["mobile_score"] = 0
     case["design_score"] = 0
     case["navigation_score"] = 0
@@ -460,10 +552,15 @@ def _build_no_website_case(place: dict, home_city: str, categories: list, index:
     case["what_stood_out"] = "No website"
     case["next_action"] = "Call or visit with short pitch"
     case["follow_up_suggestion"] = "Follow up in 3–5 days"
-    score, score_signals, lead_tier = calculateOpportunityScore(case)
+    score, score_signals, lead_tier, website_quality = calculateOpportunityScore(case)
     case["opportunity_score"] = score
     case["internal_score"] = score
     case["lead_tier"] = lead_tier
+    case["website_status"] = website_quality.get("website_status")
+    case["website_speed"] = website_quality.get("website_speed")
+    case["mobile_ready"] = website_quality.get("mobile_ready")
+    case["seo_score"] = website_quality.get("seo_score")
+    case["website_quality_score"] = website_quality.get("website_quality_score")
     case["priority"] = "high" if score >= 70 else "medium" if score >= 50 else "low"
     case["contact_matrix"] = {
         "best_contact": "phone" if case["phone"] else "visit",
@@ -569,6 +666,14 @@ def _build_weak_website_case(place: dict, home_city: str, categories: list, inde
         case["text_heavy_clues"] = inv.get("text_heavy_clues")
         case["outdated_design_clues"] = inv.get("outdated_design_clues")
         case["website_score"] = inv.get("website_score")
+        case["fetch_ok"] = inv.get("fetch_ok")
+        case["homepage_http_status"] = inv.get("homepage_http_status")
+        case["homepage_load_seconds"] = inv.get("homepage_load_seconds")
+        case["missing_meta_title"] = inv.get("missing_meta_title")
+        case["missing_meta_description"] = inv.get("missing_meta_description")
+        case["text_content_length"] = inv.get("text_content_length")
+        case["image_count"] = inv.get("image_count")
+        case["broken_links_count"] = inv.get("broken_links_count")
         case["mobile_score"] = inv.get("mobile_score")
         case["design_score"] = inv.get("design_score")
         case["navigation_score"] = inv.get("navigation_score")
@@ -612,6 +717,7 @@ def _build_weak_website_case(place: dict, home_city: str, categories: list, inde
         for line in inv.get("debug_log") or []:
             log.append(f"    {line}")
     else:
+        case["fetch_ok"] = False
         problems = ["Website could not be fully investigated."]
         pitch_lines = ["Manual review recommended."]
         log.append("    website investigation: failed")
@@ -651,10 +757,15 @@ def _build_weak_website_case(place: dict, home_city: str, categories: list, inde
     case["what_stood_out"] = problems[0] if problems else None
     case["next_action"] = "Send short email or try contact form"
     case["follow_up_suggestion"] = "Follow up in 5–7 days"
-    score, score_signals, lead_tier = calculateOpportunityScore(case)
+    score, score_signals, lead_tier, website_quality = calculateOpportunityScore(case)
     case["opportunity_score"] = score
     case["internal_score"] = score
     case["lead_tier"] = lead_tier
+    case["website_status"] = website_quality.get("website_status")
+    case["website_speed"] = website_quality.get("website_speed")
+    case["mobile_ready"] = website_quality.get("mobile_ready")
+    case["seo_score"] = website_quality.get("seo_score")
+    case["website_quality_score"] = website_quality.get("website_quality_score")
     case["priority"] = "high" if score >= 70 else "medium" if score >= 50 else "low"
     base_signals = generateOpportunitySignals(case)
     merged_signals = list(dict.fromkeys(base_signals + score_signals))
@@ -669,7 +780,27 @@ def _build_weak_website_case(place: dict, home_city: str, categories: list, inde
     return case
 
 
-def run(current_lat: float | None = None, current_lng: float | None = None):
+def run(
+    current_lat: float | None = None,
+    current_lng: float | None = None,
+    progress_callback=None,
+):
+    def report_progress(stage: str, progress: int, message: str, **extra):
+        if not progress_callback:
+            return
+        payload = {
+            "stage": stage,
+            "progress": max(0, min(100, int(progress))),
+            "message": message,
+        }
+        if extra:
+            payload.update(extra)
+        try:
+            progress_callback(payload)
+        except Exception:
+            # Progress telemetry should never break the scout run.
+            pass
+
     try:
         from dotenv import load_dotenv
         load_dotenv(SCRIPT_DIR / ".env")
@@ -721,12 +852,14 @@ def run(current_lat: float | None = None, current_lng: float | None = None):
             "Scout failed: Google Maps API key not configured. Add GOOGLE_MAPS_API_KEY to scout/.env",
         )
     print()
+    report_progress("discovering_businesses", 20, "Discovery started")
 
     places = []
     seen_place_ids: set[str] = set()
     total_duplicates_skipped = 0
     try:
-        for target in target_cities:
+        total_cities = max(1, len(target_cities))
+        for city_idx, target in enumerate(target_cities, start=1):
             city_name = target.get("city_name") or home_city
             state = target.get("state") or ""
             city_label = f"{city_name}, {state}" if state else city_name
@@ -763,6 +896,15 @@ def run(current_lat: float | None = None, current_lng: float | None = None):
                     break
             print(f"  businesses discovered: {city_added}")
             print(f"  duplicates skipped: {city_dupes}")
+            discovery_progress = 20 + int((city_idx / total_cities) * 15)
+            report_progress(
+                "discovering_businesses",
+                discovery_progress,
+                f"Discovered {len(places)} businesses ({city_idx}/{total_cities} cities scanned)",
+                discovered_count=len(places),
+                cities_scanned=city_idx,
+                total_cities=total_cities,
+            )
             if len(places) >= max_total_results:
                 break
     except ScoutRunError:
@@ -811,6 +953,19 @@ def run(current_lat: float | None = None, current_lng: float | None = None):
 
     print(f"  No website: {len(no_website)} | Weak website: {len(weak_website)}")
     print()
+    total_businesses = len(no_website) + len(weak_website)
+    report_progress(
+        "businesses_discovered",
+        35,
+        f"Businesses discovered: {total_businesses}",
+        total_businesses=total_businesses,
+    )
+    report_progress(
+        "fetching_websites",
+        50,
+        f"Fetching websites for {total_businesses} businesses",
+        total_businesses=total_businesses,
+    )
 
     case_slugs = []
     no_website_slugs = []
@@ -820,6 +975,7 @@ def run(current_lat: float | None = None, current_lng: float | None = None):
     saved = 0
     skipped = 0
 
+    total_to_analyze = max(1, total_businesses)
     for i, place in enumerate(no_website):
         cat = place.get("category") or (categories[0] if categories else "")
         print(f"  [{cat}] ", end="")
@@ -834,11 +990,43 @@ def run(current_lat: float | None = None, current_lng: float | None = None):
             case_slugs.append(case["slug"])
         else:
             skipped += 1
+        fetch_progress = 50 + int((processed / total_to_analyze) * 8)
+        report_progress(
+            "fetching_websites",
+            fetch_progress,
+            f"Fetching websites for {processed} of {total_to_analyze} businesses",
+            analyzed_count=processed,
+            total_businesses=total_to_analyze,
+        )
+        analysis_progress = 70 + int((processed / total_to_analyze) * 10)
+        print(f"  analyzing business {processed}/{total_to_analyze}")
+        report_progress(
+            "analyzing_websites",
+            analysis_progress,
+            f"Analyzing website {processed} of {total_to_analyze}",
+            analyzed_count=processed,
+            total_businesses=total_to_analyze,
+        )
 
     for i, place in enumerate(weak_website):
         cat = place.get("category") or (categories[0] if categories else "")
         print(f"  [{cat}] ", end="")
         processed += 1
+        weak_idx = i + 1
+        report_progress(
+            "fetching_websites",
+            50 + int((weak_idx / max(1, len(weak_website))) * 8),
+            f"Fetching websites for {processed + 1} of {total_to_analyze} businesses",
+            fetched_count=processed + 1,
+            total_businesses=total_to_analyze,
+        )
+        report_progress(
+            "capturing_screenshots",
+            58 + int((weak_idx / max(1, len(weak_website))) * 10),
+            f"Capturing screenshots for {weak_idx} of {len(weak_website)} businesses",
+            screenshots_count=weak_idx,
+            screenshot_targets=len(weak_website),
+        )
         case = _build_weak_website_case(place, home_city, categories, len(no_website) + i, debug_log, category=cat)
         for line in debug_log:
             print(line)
@@ -849,6 +1037,15 @@ def run(current_lat: float | None = None, current_lng: float | None = None):
             case_slugs.append(case["slug"])
         else:
             skipped += 1
+        analysis_progress = 70 + int((processed / total_to_analyze) * 10)
+        print(f"  analyzing business {processed}/{total_to_analyze}")
+        report_progress(
+            "analyzing_websites",
+            analysis_progress,
+            f"Analyzing website {processed} of {total_to_analyze}",
+            analyzed_count=processed,
+            total_businesses=total_to_analyze,
+        )
 
     print()
     print(f"  Processed: {processed}")
@@ -858,6 +1055,7 @@ def run(current_lat: float | None = None, current_lng: float | None = None):
 
     if not case_slugs:
         _write_empty("No case files written. Check Places API and config.")
+        report_progress("generating_dossiers", 82, "No valid leads to generate dossiers")
         return
 
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -869,7 +1067,10 @@ def run(current_lat: float | None = None, current_lng: float | None = None):
         "case_slugs": case_slugs,
         "no_website_slugs": no_website_slugs,
         "weak_website_slugs": weak_website_slugs,
-        "top_opportunities": case_slugs,
+        "top_opportunities": case_slugs[:10],
+        "total_businesses_scanned": len(places),
+        "businesses_without_websites": len(no_website),
+        "weak_websites_detected": len(weak_website),
         "businesses_discovered": len(places),
         "duplicates_skipped": total_duplicates_skipped,
         "unique_leads_created": len(case_slugs),
@@ -896,10 +1097,17 @@ def run(current_lat: float | None = None, current_lng: float | None = None):
             ui_list.append(ui_obj)
     with open(OPPORTUNITIES_PATH, "w", encoding="utf-8") as f:
         json.dump(ui_list, f, indent=2)
+    report_progress(
+        "generating_dossiers",
+        85,
+        "Generating dossiers",
+        generated_count=len(case_slugs),
+    )
 
     print()
     print(f"  Wrote {len(case_slugs)} cases. {len(no_website_slugs)} no-website (priority), {len(weak_website_slugs)} weak-website.")
     print(f"  unique leads created: {len(case_slugs)}")
+    report_progress("saving_results", 95, "Saving results")
 
 
 def _write_empty(summary: str | None = None):

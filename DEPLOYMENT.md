@@ -73,6 +73,27 @@ For MixedMakerShop admin proxy auth to work, these three backend values must com
 - [ ] Railway → Settings → Domains → Add custom domain: `brain-api.mixedmakershop.com`
 - [ ] Add the CNAME record at your DNS provider
 
+### 2.5 Railway scheduled job (daily at 7 AM)
+
+- [ ] In Railway, add a Scheduled Job (Cron)
+- [ ] Cron expression: `0 7 * * *`
+- [ ] Method: `POST`
+- [ ] URL: `https://<your-scout-backend>/scheduled/scout`
+- [ ] Keep `ENABLE_SCHEDULED_SCOUT=false` if you want Railway Cron to be the only scheduler trigger
+
+This route runs the full pipeline:
+
+- scout discovery
+- opportunity scoring
+- CRM intake
+- follow-up refresh
+
+Expected logs include:
+
+- `daily scout started`
+- `scheduled scout finished`
+- `morning intake complete`
+
 ---
 
 ## 3. Frontend (Vercel)
