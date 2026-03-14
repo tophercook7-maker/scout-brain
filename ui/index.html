@@ -170,6 +170,29 @@
             <button type="button" class="ghost-btn" id="dashboardQuickLeads">View Leads</button>
             <button type="button" class="ghost-btn" id="dashboardQuickOutreach">View Outreach</button>
           </div>
+
+          <article class="item-card" id="emailAlertsPanel">
+            <h4>Email Alerts</h4>
+            <p class="runner-today-hint">Customize your daily lead briefing email.</p>
+            <div class="case-field-list">
+              <label class="case-field"><input type="checkbox" id="emailAlertsEnabled" checked /> Enable email alerts</label>
+              <label class="case-field">
+                <span class="case-field-label">Frequency:</span>
+                <select id="emailAlertsFrequency" class="runner-sort-select">
+                  <option value="daily">Daily</option>
+                  <option value="weekly">Weekly</option>
+                  <option value="off">Off</option>
+                </select>
+              </label>
+              <label class="case-field"><input type="checkbox" id="emailAlertsIncludeNewLeads" checked /> Include new leads</label>
+              <label class="case-field"><input type="checkbox" id="emailAlertsIncludeFollowups" checked /> Include follow-ups</label>
+              <label class="case-field"><input type="checkbox" id="emailAlertsIncludeTopOpportunities" checked /> Include top opportunities</label>
+            </div>
+            <div class="runner-copy-row">
+              <button type="button" class="primary-btn" id="saveEmailAlertsBtn">Save Email Alerts</button>
+              <span class="tag" id="emailAlertsStatus">Loading…</span>
+            </div>
+          </article>
         </section>
 
         <section class="grid" id="dashboardGrid">

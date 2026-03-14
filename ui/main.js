@@ -25,8 +25,10 @@ import { supabase, isCloudMode } from "../src/lib/supabaseClient.js";
 import { initAuth, signIn, signUp, signOut, requestPasswordReset } from "../src/lib/auth.js";
 import {
   fetchScoutDataFromSupabase,
+  getUserEmailSettingsFromSupabase,
   getCaseFromSupabase,
   regenerateOutreachForCaseInSupabase,
+  saveUserEmailSettingsToSupabase,
   updateCaseInSupabase,
 } from "./cloud-data.js";
 
@@ -403,6 +405,8 @@ function setCloudBridge() {
   window.MB_GET_CASE = getCaseFromSupabase;
   window.MB_UPDATE_CASE = updateCaseInSupabase;
   window.MB_REGENERATE_OUTREACH = regenerateOutreachForCaseInSupabase;
+  window.MB_GET_USER_SETTINGS = getUserEmailSettingsFromSupabase;
+  window.MB_SAVE_USER_SETTINGS = saveUserEmailSettingsToSupabase;
 }
 
 function handleLogout() {
@@ -413,6 +417,8 @@ function handleLogout() {
   window.MB_GET_CASE = null;
   window.MB_UPDATE_CASE = null;
   window.MB_REGENERATE_OUTREACH = null;
+  window.MB_GET_USER_SETTINGS = null;
+  window.MB_SAVE_USER_SETTINGS = null;
   setAdminAccess(false);
   document.getElementById("auth-bar")?.remove();
   location.reload();

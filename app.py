@@ -14,6 +14,8 @@ import sys
 import webbrowser
 import threading
 import time
+from datetime import datetime, timezone
+from urllib import request as urllib_request
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
@@ -47,6 +49,9 @@ _maps_key = None
 _supabase_url = None
 _supabase_service_key = None
 _supabase_jwt_secret = None
+_resend_api_key = None
+_resend_from_email = None
+_dashboard_url = None
 try:
     from dotenv import load_dotenv
     load_dotenv(SCOUT_DIR / ".env")
@@ -55,6 +60,9 @@ try:
     _supabase_url = os.environ.get("SUPABASE_URL", "").strip()
     _supabase_service_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
     _supabase_jwt_secret = os.environ.get("SUPABASE_JWT_SECRET", "").strip()
+    _resend_api_key = os.environ.get("RESEND_API_KEY", "").strip()
+    _resend_from_email = os.environ.get("RESEND_FROM_EMAIL", "").strip()
+    _dashboard_url = os.environ.get("SCOUT_APP_URL", "").strip() or os.environ.get("VITE_APP_URL", "").strip()
     _env_loaded = True
 except ImportError:
     pass
@@ -70,8 +78,12 @@ def _env_flag(name: str, default: bool = False) -> bool:
 # Railway backend-only mode should not require npm or frontend assets.
 # Enable only when intentionally serving frontend from this process.
 SERVE_FRONTEND = _env_flag("SERVE_FRONTEND", default=False)
+ENABLE_SCHEDULED_SCOUT = _env_flag("ENABLE_SCHEDULED_SCOUT", default=True)
+SCHEDULED_SCOUT_HOUR = int(os.environ.get("SCHEDULED_SCOUT_HOUR", "6"))
 
 app = FastAPI(title="Massive Brain", version="2.0")
+
+_scheduler = None
 
 # CORS for Vercel frontend calling Railway backend.
 # Configure explicit origins with ALLOWED_ORIGINS="https://your-app.vercel.app,https://other-domain.com"
@@ -443,6 +455,297 @@ def getTopOpportunities(workspace_id: str | None):
     return leads
 
 
+def _default_user_settings() -> dict:
+    return {
+        "email_notifications_enabled": True,
+        "email_frequency": "daily",
+        "include_new_leads": True,
+        "include_followups": True,
+        "include_top_opportunities": True,
+    }
+
+
+def _normalize_user_settings(payload: dict | None) -> dict:
+    defaults = _default_user_settings()
+    src = payload or {}
+    normalized = {
+        "email_notifications_enabled": bool(src.get("email_notifications_enabled", defaults["email_notifications_enabled"])),
+        "email_frequency": str(src.get("email_frequency", defaults["email_frequency"]) or "daily").strip().lower(),
+        "include_new_leads": bool(src.get("include_new_leads", defaults["include_new_leads"])),
+        "include_followups": bool(src.get("include_followups", defaults["include_followups"])),
+        "include_top_opportunities": bool(src.get("include_top_opportunities", defaults["include_top_opportunities"])),
+    }
+    if normalized["email_frequency"] not in {"daily", "weekly", "off"}:
+        normalized["email_frequency"] = "daily"
+    if normalized["email_frequency"] == "off":
+        normalized["email_notifications_enabled"] = False
+    return normalized
+
+
+def _ensure_user_settings(sb, user_id: str, workspace_id: str | None) -> dict:
+    defaults = _default_user_settings()
+    if not workspace_id:
+        return defaults
+    row = {"user_id": user_id, "workspace_id": workspace_id, **defaults}
+    try:
+        existing = (
+            sb.table("user_settings")
+            .select("*")
+            .eq("user_id", user_id)
+            .eq("workspace_id", workspace_id)
+            .limit(1)
+            .execute()
+        )
+        if existing.data:
+            return _normalize_user_settings(existing.data[0])
+        created = (
+            sb.table("user_settings")
+            .insert(row)
+            .execute()
+        )
+        if created.data:
+            return _normalize_user_settings(created.data[0])
+    except Exception:
+        pass
+    return defaults
+
+
+def _load_user_settings(sb, user_id: str, workspace_id: str | None) -> dict:
+    if not workspace_id:
+        return _default_user_settings()
+    try:
+        res = (
+            sb.table("user_settings")
+            .select("*")
+            .eq("user_id", user_id)
+            .eq("workspace_id", workspace_id)
+            .limit(1)
+            .execute()
+        )
+        if res.data:
+            return _normalize_user_settings(res.data[0])
+    except Exception:
+        pass
+    return _ensure_user_settings(sb, user_id, workspace_id)
+
+
+def _save_user_settings(sb, user_id: str, workspace_id: str | None, updates: dict) -> dict:
+    if not workspace_id:
+        return _default_user_settings()
+    normalized = _normalize_user_settings(updates)
+    row = {"user_id": user_id, "workspace_id": workspace_id, **normalized}
+    try:
+        res = (
+            sb.table("user_settings")
+            .upsert(row, on_conflict="user_id,workspace_id")
+            .execute()
+        )
+        if res.data:
+            return _normalize_user_settings(res.data[0])
+    except Exception:
+        pass
+    return normalized
+
+
+def _count_followups_due(sb, workspace_id: str | None) -> int:
+    if not workspace_id:
+        return 0
+    try:
+        rows = (
+            sb.table("case_files")
+            .select("id,status,follow_up_due")
+            .eq("workspace_id", workspace_id)
+            .execute()
+        )
+        now = datetime.now(timezone.utc).date()
+        due = 0
+        for row in rows.data or []:
+            status = (row.get("status") or "").strip().lower()
+            follow_up_due = (row.get("follow_up_due") or "").strip()
+            if status == "follow up":
+                due += 1
+                continue
+            if follow_up_due:
+                try:
+                    date_str = follow_up_due.split("T")[0]
+                    if datetime.fromisoformat(date_str).date() <= now:
+                        due += 1
+                except Exception:
+                    continue
+        return due
+    except Exception:
+        return 0
+
+
+def _count_new_leads_today(sb, workspace_id: str | None) -> int:
+    if not workspace_id:
+        return 0
+    try:
+        rows = (
+            sb.table("opportunities")
+            .select("created_at")
+            .eq("workspace_id", workspace_id)
+            .execute()
+        )
+        today = datetime.now(timezone.utc).date()
+        count = 0
+        for row in rows.data or []:
+            created = (row.get("created_at") or "").strip()
+            if not created:
+                continue
+            try:
+                iso = created.replace("Z", "+00:00")
+                if datetime.fromisoformat(iso).astimezone(timezone.utc).date() == today:
+                    count += 1
+            except Exception:
+                continue
+        return count
+    except Exception:
+        return 0
+
+
+def _build_lead_briefing_summary(sb, workspace_id: str | None, workspace_name: str | None = None) -> dict:
+    top = getTopOpportunities(workspace_id)
+    return {
+        "workspace_name": workspace_name or "Workspace",
+        "new_leads": _count_new_leads_today(sb, workspace_id),
+        "top_opportunities": top,
+        "followups_due": _count_followups_due(sb, workspace_id),
+        "dashboard_url": _dashboard_url or "",
+    }
+
+
+def sendLeadBriefingEmail(user: dict, summary: dict):
+    if not _resend_api_key or not _resend_from_email:
+        print("  email alerts disabled")
+        return False
+    to_email = (user.get("email") or "").strip()
+    if not to_email:
+        print("  email alerts disabled")
+        return False
+
+    top = summary.get("top_opportunities") or []
+    top_lines = []
+    for lead in top[:5]:
+        lane = "No Website" if str(lead.get("lane") or "") == "no_website" else "Weak Website"
+        top_lines.append(
+            f"- {lead.get('business_name') or 'Lead'} | {lane} | Score {lead.get('score') or 0} | "
+            f"{lead.get('best_contact_method') or 'Contact unknown'}"
+        )
+
+    subject = (
+        f"Scout-Brain Daily Lead Briefing — {summary.get('new_leads', 0)} New Opportunities"
+    )
+    body = "\n".join(
+        [
+            f"Hi {(user.get('display_name') or user.get('email') or 'there')},",
+            "",
+            "Here is your Scout-Brain lead briefing.",
+            "",
+            "Summary",
+            f"- New leads discovered: {summary.get('new_leads', 0)}",
+            f"- Follow-ups due: {summary.get('followups_due', 0)}",
+            "",
+            "Top Opportunities",
+            *(top_lines or ["- No top opportunities right now."]),
+            "",
+            "Open Scout-Brain Dashboard",
+            summary.get("dashboard_url") or "Open your Scout-Brain dashboard",
+            "",
+            "— Scout-Brain",
+        ]
+    )
+
+    print("  email alert sending")
+    payload = {
+        "from": _resend_from_email,
+        "to": [to_email],
+        "subject": subject,
+        "text": body,
+    }
+    req = urllib_request.Request(
+        "https://api.resend.com/emails",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {_resend_api_key}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib_request.urlopen(req, timeout=20) as resp:
+            code = getattr(resp, "status", 200)
+            if 200 <= code < 300:
+                print("  email alert sent")
+                return True
+    except Exception as e:
+        print(f"  [Scout] email alert error: {e}", file=sys.stderr)
+    return False
+
+
+def _frequency_allows_send(settings: dict) -> bool:
+    if not settings.get("email_notifications_enabled"):
+        return False
+    freq = (settings.get("email_frequency") or "daily").strip().lower()
+    if freq == "off":
+        return False
+    if freq == "weekly":
+        return datetime.now(timezone.utc).weekday() == 0
+    return True
+
+
+def _send_workspace_briefing_if_enabled(sb, owner_user: dict, workspace: dict) -> None:
+    workspace_id = workspace.get("id")
+    user_id = owner_user.get("id")
+    if not workspace_id or not user_id:
+        return
+    settings = _load_user_settings(sb, user_id, workspace_id)
+    if not _frequency_allows_send(settings):
+        print("  email alerts disabled")
+        return
+
+    summary = _build_lead_briefing_summary(sb, workspace_id, workspace.get("name"))
+    if not settings.get("include_new_leads"):
+        summary["new_leads"] = 0
+    if not settings.get("include_followups"):
+        summary["followups_due"] = 0
+    if not settings.get("include_top_opportunities"):
+        summary["top_opportunities"] = []
+    sendLeadBriefingEmail(owner_user, summary)
+
+
+def _run_scheduled_scout_job():
+    if not _supabase_url or not _supabase_service_key:
+        return
+    print("  scheduled scout starting")
+    try:
+        from supabase import create_client
+        sb = create_client(_supabase_url, _supabase_service_key)
+        _run_morning_runner()
+
+        workspaces = sb.table("workspaces").select("id,name,owner_user_id").execute().data or []
+        for ws in workspaces:
+            owner_id = ws.get("owner_user_id")
+            if not owner_id:
+                continue
+            _sync_scout_to_supabase(owner_id, workspace_id=ws.get("id"))
+            user_rows = (
+                sb.table("profiles")
+                .select("id,email,display_name")
+                .eq("id", owner_id)
+                .limit(1)
+                .execute()
+                .data
+                or []
+            )
+            if user_rows:
+                _send_workspace_briefing_if_enabled(sb, user_rows[0], ws)
+
+        print("  scheduled scout finished")
+    except Exception as e:
+        print(f"  [Scout] scheduled scout error: {e}", file=sys.stderr)
+
+
 def _append_history(count: int, summary: str):
     history = []
     if HISTORY_PATH.exists():
@@ -532,6 +835,14 @@ class RunScoutBody(BaseModel):
     current_lng: float | None = None
 
 
+class UserSettingsBody(BaseModel):
+    email_notifications_enabled: bool = True
+    email_frequency: str = "daily"
+    include_new_leads: bool = True
+    include_followups: bool = True
+    include_top_opportunities: bool = True
+
+
 @app.post("/run-scout")
 def post_run_scout(request: Request, body: RunScoutBody | None = None):
     try:
@@ -603,6 +914,42 @@ def post_run_scout(request: Request, body: RunScoutBody | None = None):
             str(e),
             f"Scout failed: {str(e)}",
         )
+
+
+@app.get("/user-settings")
+def get_user_settings(request: Request):
+    user_id = _get_user_id_from_request(request)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not _supabase_url or not _supabase_service_key:
+        return _default_user_settings()
+    try:
+        from supabase import create_client
+        sb = create_client(_supabase_url, _supabase_service_key)
+        requested_workspace = _get_workspace_id_from_request(request)
+        workspace_id = _resolve_workspace_id_for_user(sb, user_id, requested_workspace)
+        settings = _load_user_settings(sb, user_id, workspace_id)
+        return settings
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not load settings: {e}")
+
+
+@app.post("/user-settings")
+def post_user_settings(request: Request, body: UserSettingsBody):
+    user_id = _get_user_id_from_request(request)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not _supabase_url or not _supabase_service_key:
+        return _normalize_user_settings(body.model_dump())
+    try:
+        from supabase import create_client
+        sb = create_client(_supabase_url, _supabase_service_key)
+        requested_workspace = _get_workspace_id_from_request(request)
+        workspace_id = _resolve_workspace_id_for_user(sb, user_id, requested_workspace)
+        settings = _save_user_settings(sb, user_id, workspace_id, body.model_dump())
+        return settings
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not save settings: {e}")
 
 
 class AuditBody(BaseModel):
@@ -764,6 +1111,48 @@ if SERVE_FRONTEND:
         return _serve_frontend_index()
 
 
+def _start_scheduler():
+    global _scheduler
+    if _scheduler is not None or not ENABLE_SCHEDULED_SCOUT:
+        return
+    try:
+        from apscheduler.schedulers.background import BackgroundScheduler
+        from apscheduler.triggers.cron import CronTrigger
+        _scheduler = BackgroundScheduler(timezone="UTC")
+        _scheduler.add_job(
+            _run_scheduled_scout_job,
+            CronTrigger(hour=SCHEDULED_SCOUT_HOUR, minute=0),
+            id="scheduled-scout-daily",
+            replace_existing=True,
+        )
+        _scheduler.start()
+        print(f"  Scheduled scout enabled at {SCHEDULED_SCOUT_HOUR:02d}:00 UTC")
+    except Exception as e:
+        print(f"  [Scout] scheduler start failed: {e}", file=sys.stderr)
+        _scheduler = None
+
+
+def _stop_scheduler():
+    global _scheduler
+    if _scheduler is None:
+        return
+    try:
+        _scheduler.shutdown(wait=False)
+    except Exception:
+        pass
+    _scheduler = None
+
+
+@app.on_event("startup")
+def _on_startup():
+    _start_scheduler()
+
+
+@app.on_event("shutdown")
+def _on_shutdown():
+    _stop_scheduler()
+
+
 def _open_browser():
     time.sleep(1.2)
     webbrowser.open("http://localhost:8760")
@@ -777,6 +1166,8 @@ def main():
     print("  -------------------------")
     print(f"  App running at:  http://0.0.0.0:{port}")
     print(f"  FRONTEND_SERVING: {'enabled' if SERVE_FRONTEND else 'disabled (api-only)'}")
+    print(f"  SCHEDULED_SCOUT: {'enabled' if ENABLE_SCHEDULED_SCOUT else 'disabled'}")
+    print(f"  SCHEDULED_SCOUT_HOUR: {SCHEDULED_SCOUT_HOUR:02d}:00 UTC")
     print()
     if _env_loaded:
         if _maps_key:
@@ -787,6 +1178,10 @@ def main():
             print("  SUPABASE: configured (scout results will sync)")
         else:
             print("  SUPABASE: not set (scout results local only)")
+        if _resend_api_key and _resend_from_email:
+            print("  EMAIL_ALERTS: configured (Resend)")
+        else:
+            print("  EMAIL_ALERTS: not set (daily briefing emails disabled)")
     else:
         print("  .env: python-dotenv not installed or .env missing")
     print(f"  ALLOWED_ORIGINS: {', '.join(_allowed_origins)}")

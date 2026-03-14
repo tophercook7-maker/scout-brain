@@ -359,3 +359,90 @@ export async function saveScoutRunToSupabase({ summary, processed_count, saved_c
   }
   if (error) throw error;
 }
+
+function defaultEmailAlertSettings() {
+  return {
+    email_notifications_enabled: true,
+    email_frequency: "daily",
+    include_new_leads: true,
+    include_followups: true,
+    include_top_opportunities: true,
+  };
+}
+
+export async function getUserEmailSettingsFromSupabase() {
+  if (!supabase) return defaultEmailAlertSettings();
+  const { data: authData, error: authError } = await supabase.auth.getUser();
+  if (authError) throw authError;
+  const user = authData?.user || null;
+  if (!user) throw new Error("Not authenticated");
+
+  let workspaceId = null;
+  try {
+    const ctx = await resolveWorkspaceContext();
+    workspaceId = ctx?.workspaceId || null;
+  } catch {
+    workspaceId = null;
+  }
+  if (!workspaceId) return defaultEmailAlertSettings();
+
+  let query = supabase
+    .from("user_settings")
+    .select("*")
+    .eq("user_id", user.id)
+    .eq("workspace_id", workspaceId)
+    .limit(1);
+
+  let { data, error } = await query;
+  if (error && isMissingWorkspaceSchemaError(error)) {
+    return defaultEmailAlertSettings();
+  }
+  if (error) throw error;
+  if (!data || !data.length) return defaultEmailAlertSettings();
+  const row = data[0];
+  return {
+    email_notifications_enabled: !!row.email_notifications_enabled,
+    email_frequency: row.email_frequency || "daily",
+    include_new_leads: !!row.include_new_leads,
+    include_followups: !!row.include_followups,
+    include_top_opportunities: !!row.include_top_opportunities,
+  };
+}
+
+export async function saveUserEmailSettingsToSupabase(settings) {
+  if (!supabase) throw new Error("Not authenticated");
+  const { data: authData, error: authError } = await supabase.auth.getUser();
+  if (authError) throw authError;
+  const user = authData?.user || null;
+  if (!user) throw new Error("Not authenticated");
+
+  let workspaceId = null;
+  try {
+    const ctx = await resolveWorkspaceContext();
+    workspaceId = ctx?.workspaceId || null;
+  } catch {
+    workspaceId = null;
+  }
+  if (!workspaceId) throw new Error("Workspace context unavailable");
+
+  const payload = withWorkspaceId({
+    user_id: user.id,
+    email_notifications_enabled: !!settings.email_notifications_enabled,
+    email_frequency: settings.email_frequency || "daily",
+    include_new_leads: !!settings.include_new_leads,
+    include_followups: !!settings.include_followups,
+    include_top_opportunities: !!settings.include_top_opportunities,
+    updated_at: new Date().toISOString(),
+  }, workspaceId);
+
+  let { error } = await supabase
+    .from("user_settings")
+    .upsert(payload, { onConflict: "user_id,workspace_id" });
+
+  if (error && workspaceId && isMissingWorkspaceSchemaError(error)) {
+    throw new Error("user_settings table not available yet. Run latest migration.");
+  }
+  if (error) throw error;
+
+  return getUserEmailSettingsFromSupabase();
+}

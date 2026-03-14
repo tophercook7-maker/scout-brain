@@ -206,6 +206,9 @@ function applyAdminRouteView() {
   const path = (window.location.pathname || "").replace(/\/$/, "");
   if (!(path === "/admin" || path.startsWith("/admin/"))) return;
   const module = currentAdminModule();
+  if (module === "dashboard") {
+    console.log("dashboard route active");
+  }
   setActiveAdminModuleNav(module);
   const routeLabel = document.getElementById("adminRouteLabel");
   if (routeLabel) routeLabel.textContent = path;
@@ -253,6 +256,18 @@ function applyAdminRouteView() {
     _runnerSort = "priority";
     setVisible(dashboardGrid, true);
     setVisible(morningRunnerPanel, false);
+    console.log("rendering dashboard view");
+    const fallbackToday = {
+      generated_at: null,
+      summary: "No scout run yet.",
+      top_opportunities: [],
+      case_slugs: [],
+    };
+    const today = _runnerLastPayload?.today || fallbackToday;
+    const opportunities = _runnerLastPayload?.opportunities || [];
+    updateAdminSummary(today, opportunities);
+    console.log("dashboard data loaded");
+    console.log("dashboard render complete");
   } else if (module === "scout") {
     _runnerStatusFilter = "all";
     _runnerSort = "priority";
@@ -629,6 +644,113 @@ async function fetchCase(slug) {
   const res = await fetch(`${apiBase}/case/${encodeURIComponent(slug)}`);
   if (!res.ok) throw new Error("Could not load case");
   return res.json();
+}
+
+function defaultEmailAlertSettings() {
+  return {
+    email_notifications_enabled: true,
+    email_frequency: "daily",
+    include_new_leads: true,
+    include_followups: true,
+    include_top_opportunities: true,
+  };
+}
+
+function collectEmailAlertSettingsFromUI() {
+  const enabledEl = document.getElementById("emailAlertsEnabled");
+  const frequencyEl = document.getElementById("emailAlertsFrequency");
+  const newLeadsEl = document.getElementById("emailAlertsIncludeNewLeads");
+  const followupsEl = document.getElementById("emailAlertsIncludeFollowups");
+  const topEl = document.getElementById("emailAlertsIncludeTopOpportunities");
+  return {
+    email_notifications_enabled: !!enabledEl?.checked,
+    email_frequency: (frequencyEl?.value || "daily").toLowerCase(),
+    include_new_leads: !!newLeadsEl?.checked,
+    include_followups: !!followupsEl?.checked,
+    include_top_opportunities: !!topEl?.checked,
+  };
+}
+
+function applyEmailAlertSettingsToUI(settings) {
+  const merged = { ...defaultEmailAlertSettings(), ...(settings || {}) };
+  const enabledEl = document.getElementById("emailAlertsEnabled");
+  const frequencyEl = document.getElementById("emailAlertsFrequency");
+  const newLeadsEl = document.getElementById("emailAlertsIncludeNewLeads");
+  const followupsEl = document.getElementById("emailAlertsIncludeFollowups");
+  const topEl = document.getElementById("emailAlertsIncludeTopOpportunities");
+  if (enabledEl) enabledEl.checked = !!merged.email_notifications_enabled;
+  if (frequencyEl) frequencyEl.value = merged.email_frequency || "daily";
+  if (newLeadsEl) newLeadsEl.checked = !!merged.include_new_leads;
+  if (followupsEl) followupsEl.checked = !!merged.include_followups;
+  if (topEl) topEl.checked = !!merged.include_top_opportunities;
+}
+
+function setEmailAlertsStatus(text, isError = false) {
+  const el = document.getElementById("emailAlertsStatus");
+  if (!el) return;
+  el.textContent = text;
+  el.classList.toggle("status-failed", !!isError);
+}
+
+async function loadEmailAlertSettings() {
+  try {
+    let settings = null;
+    if (window.MB_GET_USER_SETTINGS) {
+      settings = await window.MB_GET_USER_SETTINGS();
+    } else {
+      const apiBase = (window.MB_API_BASE || "").replace(/\/$/, "");
+      const headers = {};
+      if (window.MB_SESSION?.access_token) headers.Authorization = `Bearer ${window.MB_SESSION.access_token}`;
+      if (window.MB_WORKSPACE?.workspaceId) headers["X-Workspace-Id"] = window.MB_WORKSPACE.workspaceId;
+      const res = await fetch(`${apiBase}/user-settings`, { headers });
+      if (!res.ok) throw new Error("Could not load email settings");
+      settings = await res.json();
+    }
+    applyEmailAlertSettingsToUI(settings || defaultEmailAlertSettings());
+    setEmailAlertsStatus("Loaded");
+  } catch (err) {
+    console.error("email settings load failed", err);
+    applyEmailAlertSettingsToUI(defaultEmailAlertSettings());
+    setEmailAlertsStatus("Unavailable", true);
+  }
+}
+
+async function saveEmailAlertSettings() {
+  const saveBtn = document.getElementById("saveEmailAlertsBtn");
+  const original = saveBtn?.textContent || "Save Email Alerts";
+  try {
+    const payload = collectEmailAlertSettingsFromUI();
+    if (saveBtn) {
+      saveBtn.disabled = true;
+      saveBtn.textContent = "Saving...";
+    }
+    let saved = null;
+    if (window.MB_SAVE_USER_SETTINGS) {
+      saved = await window.MB_SAVE_USER_SETTINGS(payload);
+    } else {
+      const apiBase = (window.MB_API_BASE || "").replace(/\/$/, "");
+      const headers = { "Content-Type": "application/json" };
+      if (window.MB_SESSION?.access_token) headers.Authorization = `Bearer ${window.MB_SESSION.access_token}`;
+      if (window.MB_WORKSPACE?.workspaceId) headers["X-Workspace-Id"] = window.MB_WORKSPACE.workspaceId;
+      const res = await fetch(`${apiBase}/user-settings`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) throw new Error("Could not save email settings");
+      saved = await res.json();
+    }
+    applyEmailAlertSettingsToUI(saved || payload);
+    setEmailAlertsStatus("Saved");
+  } catch (err) {
+    console.error("email settings save failed", err);
+    setEmailAlertsStatus("Save failed", true);
+  } finally {
+    if (saveBtn) {
+      saveBtn.disabled = false;
+      saveBtn.textContent = original;
+    }
+  }
 }
 
 let _runnerPreviousCount = null;
@@ -1799,8 +1921,10 @@ async function refreshScoutData(options = {}) {
       if ((data?.opportunities?.length || 0) >= minExpectedCount || attempt === retries) break;
       if (retryDelayMs > 0) await sleep(retryDelayMs);
     }
+    console.log("dashboard data loaded");
     renderMorningRunner(data.today, data.opportunities);
     updateAdminSummary(data.today, data.opportunities);
+    await loadEmailAlertSettings();
     console.log("dashboard data refreshed");
     return data;
   } catch (err) {
@@ -1819,7 +1943,11 @@ window.addEventListener("error", (e) => {
 
 function navigateAdminRoute(href) {
   if (!href) return;
-  history.pushState({}, "", href);
+  const current = (window.location.pathname || "").replace(/\/$/, "");
+  const target = href.replace(/\/$/, "");
+  if (current !== target) {
+    history.pushState({}, "", href);
+  }
   window.dispatchEvent(new PopStateEvent("popstate"));
   applyAdminRouteView();
 }
@@ -1865,6 +1993,9 @@ function bindButtons() {
     link.addEventListener("click", (e) => {
       e.preventDefault();
       const href = link.getAttribute("href");
+      if (link.getAttribute("data-admin-module") === "dashboard") {
+        console.log("dashboard nav clicked");
+      }
       navigateAdminRoute(href);
     });
   });
@@ -1880,6 +2011,8 @@ function bindButtons() {
   if (quickLeads) quickLeads.addEventListener("click", () => navigateAdminRoute("/admin/leads"));
   const quickOutreach = document.getElementById("dashboardQuickOutreach");
   if (quickOutreach) quickOutreach.addEventListener("click", () => navigateAdminRoute("/admin/outreach"));
+  const saveEmailAlertsBtn = document.getElementById("saveEmailAlertsBtn");
+  if (saveEmailAlertsBtn) saveEmailAlertsBtn.addEventListener("click", saveEmailAlertSettings);
 
   const runScoutBtn = document.getElementById("runScoutBtn");
   console.log("runScoutBtn element:", runScoutBtn);
