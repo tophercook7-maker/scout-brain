@@ -1,11 +1,14 @@
 /**
  * Bootstrap: init Supabase auth, set cloud data bridge, load app.
+ * Current product reality: this UI runs as the standalone Scout-Brain app.
+ * MixedMakerShop admin integration is a later roadmap phase.
  */
 import "./styles.css";
 import { initDebugOverlay, setDebugValue } from "../src/debug-overlay.js";
 console.log("frontend loaded");
 
-// API base URL for backend (Vercel frontend -> Railway/backend host). Empty = same-origin calls.
+// API base URL for standalone Railway-hosted Scout-Brain backend.
+// Empty means same-origin calls for local development.
 const apiBase = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
 window.MB_API_BASE = apiBase;
 

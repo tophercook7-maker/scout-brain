@@ -5,6 +5,25 @@ Massive Brain is a split-deploy full-stack app:
 - FastAPI backend (deploy to Railway)
 - Supabase for auth and shared data
 
+## Current product reality
+
+- The active working product is the standalone Scout-Brain app hosted on Railway:
+  - `https://web-production-61047.up.railway.app/`
+- MixedMakerShop admin and Scout-Brain are currently separate systems.
+- Integration into `mixedmakershop.com/admin` is planned later, not treated as complete today.
+
+## Current development focus
+
+Current work should prioritize polishing the live Railway-hosted Scout-Brain app:
+
+- dashboard polish
+- better lead refresh after Run Scout
+- stronger contact matrix quality
+- deeper lead dossier detail
+- tighter outreach workflow
+- cleaner route naming and admin feel
+- improved scoring and prioritization
+
 ## Project structure (current)
 
 This repo is intentionally a single-root project (no file moves required).
@@ -181,3 +200,16 @@ ALLOWED_ORIGINS=https://your-app.vercel.app,https://www.yourdomain.com
 2. Set Vercel `VITE_API_BASE_URL` to that Railway URL.
 3. Set Supabase env vars on frontend and backend as listed above.
 4. Redeploy Vercel so frontend calls Railway for `/run-scout`, `/audit`, and `/scout-data`.
+
+## TODO roadmap
+
+### Phase 1 - polish standalone Scout-Brain (now)
+
+- Refine the live Railway app UX and data quality.
+- Improve lead freshness, dossier completeness, scoring, and outreach conversion flow.
+- Keep Railway deployment as the primary target environment.
+
+### Phase 2 - MixedMakerShop integration (later)
+
+- Integrate or deep-link Scout-Brain into MixedMakerShop admin once standalone quality goals are met.
+- Unify auth/navigation only after Phase 1 polish is complete.

@@ -195,6 +195,32 @@ h1 {
   margin-bottom: 10px;
 }
 
+.dashboard-top-opps {
+  display: grid;
+  gap: 8px;
+}
+
+.dashboard-top-opp {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px;
+  background: color-mix(in oklab, var(--panel) 94%, #0f172a 6%);
+}
+
+.dashboard-top-opp-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 4px;
+}
+
+.dashboard-top-opp-meta {
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+
 .main-nav {
   max-width: 1200px;
   margin: 0 auto;

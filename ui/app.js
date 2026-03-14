@@ -588,14 +588,17 @@ function saveAnalyzeAsIdea() {
   alert("Saved to Ideas.");
 }
 
-async function fetchScoutData() {
+async function fetchScoutData(options = {}) {
+  const cacheBust = !!options.cacheBust;
   if (window.MB_FETCH_SCOUT_DATA) {
     console.log("fetchScoutData: using Supabase");
-    return window.MB_FETCH_SCOUT_DATA();
+    return window.MB_FETCH_SCOUT_DATA(options);
   }
   const apiBase = (window.MB_API_BASE || "").replace(/\/$/, "");
-  console.log("fetchScoutData: calling GET", apiBase + "/scout-data");
-  const response = await fetch(`${apiBase}/scout-data`);
+  const query = cacheBust ? `?t=${Date.now()}` : "";
+  const url = `${apiBase}/scout-data${query}`;
+  console.log("fetchScoutData: calling GET", url);
+  const response = await fetch(url, { cache: "no-store" });
   console.log("fetchScoutData: status", response.status);
   if (!response.ok) throw new Error("Could not load scout data");
   return response.json();
@@ -794,6 +797,8 @@ async function runScoutNow() {
     const newCount = opportunities.length;
 
     renderMorningRunner(data.today, opportunities, data.stdout, data.stderr);
+    updateAdminSummary(data.today, opportunities);
+    console.log("run scout success");
 
     setRunnerStatus("Complete");
     if (summary) {
@@ -809,6 +814,21 @@ async function runScoutNow() {
 
     _runnerPreviousCount = newCount;
     flashRunnerPanel();
+
+    console.log("refreshing leads after scout");
+    const refreshed = await refreshScoutData({
+      reason: "post-run",
+      cacheBust: true,
+      minExpectedCount: newCount,
+      retries: window.MB_FETCH_SCOUT_DATA ? 4 : 1,
+      retryDelayMs: 1200,
+    });
+    const refreshedCount = refreshed?.opportunities?.length ?? newCount;
+    const refreshedMetrics = summarizeRunMetrics(refreshed?.today, refreshed?.opportunities || opportunities);
+    console.log(`lead count after refresh: ${refreshedCount}`);
+    if (summary) {
+      summary.textContent = `Scout complete — ${refreshedCount} leads refreshed. Processed ${refreshedMetrics.processed}, saved ${refreshedMetrics.saved}, skipped ${refreshedMetrics.skipped}, location ${refreshedMetrics.location}.`;
+    }
   } catch (err) {
     console.error("Scout run exception:", err);
     const deployMsg = window.MB_USE_CLOUD
@@ -1549,6 +1569,26 @@ function inferRunLocation(today) {
   return "Saved home location";
 }
 
+function summarizeRunMetrics(today, opportunities) {
+  const list = opportunities || [];
+  const processed = Number(today?.processed_count ?? today?.processed ?? list.length);
+  const saved = Number(today?.saved_count ?? today?.saved ?? list.length);
+  const skipped = Number(today?.skipped_count ?? today?.skipped ?? Math.max(0, processed - saved));
+  const noWebsite = list.filter((o) => o.no_website || o.lane === "no_website").length;
+  const weakWebsite = Math.max(0, list.length - noWebsite);
+  const location = inferRunLocation(today);
+  const runTime = today?.generated_at || today?.timestamp || today?.generatedAt || null;
+  return {
+    processed: Number.isFinite(processed) ? processed : list.length,
+    saved: Number.isFinite(saved) ? saved : list.length,
+    skipped: Number.isFinite(skipped) ? skipped : 0,
+    noWebsite,
+    weakWebsite,
+    location,
+    runTime,
+  };
+}
+
 function renderDashboardSimpleList(containerId, items, emptyLabel) {
   const el = document.getElementById(containerId);
   if (!el) return;
@@ -1583,6 +1623,7 @@ function renderDashboardCommandCenter(today, opportunities) {
   const topRanked = [...opportunities]
     .sort((a, b) => rankTopOpportunity(b) - rankTopOpportunity(a))
     .slice(0, 5);
+  console.log("top opportunities computed", { count: topRanked.length });
 
   const setText = (id, val) => {
     const el = document.getElementById(id);
@@ -1609,42 +1650,73 @@ function renderDashboardCommandCenter(today, opportunities) {
       topEl.appendChild(empty);
     } else {
       topRanked.forEach((opp) => {
-        const row = document.createElement("a");
-        row.href = "#";
-        row.className = "runner-today-item";
+        const row = document.createElement("div");
+        row.className = "dashboard-top-opp";
         const noWebsite = opp.no_website || opp.lane === "no_website" ? "No website" : "Has website";
         const score = getLeadScore(opp);
-        const contact = hasReachableContact(opp) ? "Reachable" : "Contact unclear";
-        row.textContent = `${opp.name || "Unknown"} — ${noWebsite} • Score ${score} • ${contact} • ${opp.status || "New"}`;
-        row.onclick = (e) => {
+        const contact = opp.recommended_contact || opp.backup_contact_method || "Contact unclear";
+        const meta = `${opp.category || "Unknown category"} • ${opp.distance_miles ?? "?"} mi • ${noWebsite} • Score ${score}`;
+        row.innerHTML = `
+          <div class="dashboard-top-opp-head">
+            <strong>${escapeHtml(opp.name || "Unknown")}</strong>
+            <span class="tag">${escapeHtml(opp.status || "New")}</span>
+          </div>
+          <div class="dashboard-top-opp-meta">${escapeHtml(meta)}</div>
+          <div class="dashboard-top-opp-meta">Recommended contact: ${escapeHtml(contact)}</div>
+        `;
+        const openBtn = document.createElement("button");
+        openBtn.type = "button";
+        openBtn.className = "ghost-btn";
+        openBtn.textContent = "Open case";
+        openBtn.onclick = (e) => {
           e.preventDefault();
           openCaseDetail(opp);
         };
+        row.appendChild(openBtn);
         topEl.appendChild(row);
       });
     }
   }
 
-  const processed = Number(today?.processed_count ?? today?.processed ?? opportunities.length);
-  const saved = Number(today?.saved_count ?? today?.saved ?? opportunities.length);
-  const skipped = Number(today?.skipped_count ?? today?.skipped ?? Math.max(0, processed - saved));
+  const metrics = summarizeRunMetrics(today, opportunities);
   setText("dashboardRunSummary", today?.summary || "No scout run yet.");
-  setText("dashboardRunLocation", inferRunLocation(today));
-  setText("dashboardRunProcessed", String(Number.isFinite(processed) ? processed : opportunities.length));
-  setText("dashboardRunSaved", String(Number.isFinite(saved) ? saved : opportunities.length));
-  setText("dashboardRunSkipped", String(Number.isFinite(skipped) ? skipped : 0));
+  setText("dashboardRunLocation", metrics.location);
+  setText("dashboardRunTime", metrics.runTime || "No run yet");
+  setText("dashboardRunProcessed", String(metrics.processed));
+  setText("dashboardRunSaved", String(metrics.saved));
+  setText("dashboardRunSkipped", String(metrics.skipped));
+  setText("dashboardRunNoWebsite", String(metrics.noWebsite));
+  setText("dashboardRunWeakWebsite", String(metrics.weakWebsite));
 }
 
-async function refreshScoutData() {
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function refreshScoutData(options = {}) {
   const summary = document.getElementById("morningRunnerSummary");
+  const retries = Math.max(1, Number(options.retries || 1));
+  const retryDelayMs = Math.max(0, Number(options.retryDelayMs || 0));
+  const minExpectedCount = Number(options.minExpectedCount || 0);
+  const reason = options.reason || "manual";
+  const cacheBust = !!options.cacheBust;
   try {
-    const data = await fetchScoutData();
+    let data = null;
+    for (let attempt = 1; attempt <= retries; attempt += 1) {
+      data = await fetchScoutData({ cacheBust });
+      console.log("leads fetch complete", { reason, attempt, count: data?.opportunities?.length || 0 });
+      if ((data?.opportunities?.length || 0) >= minExpectedCount || attempt === retries) break;
+      if (retryDelayMs > 0) await sleep(retryDelayMs);
+    }
     renderMorningRunner(data.today, data.opportunities);
     updateAdminSummary(data.today, data.opportunities);
+    console.log("dashboard data refreshed");
+    return data;
   } catch (err) {
     console.error(err);
     if (summary) summary.textContent = "Could not load scout data. Check that the backend API is reachable.";
     updateAdminSummary(null, []);
+    return null;
   }
 }
 window.refreshScoutData = refreshScoutData;

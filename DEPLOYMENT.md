@@ -2,10 +2,16 @@
 
 Use this checklist to deploy Massive Brain so it runs from any device without your MacBook.
 
+## Current product reality
+
+- Live active Scout-Brain app: `https://web-production-61047.up.railway.app/`
+- MixedMakerShop admin is currently separate from Scout-Brain.
+- This deployment guide targets improving and operating the standalone Scout-Brain app first.
+
 ## Architecture
 
-- **Frontend**: Vercel (brain.mixedmakershop.com)
-- **Backend**: Railway (brain-api.mixedmakershop.com)
+- **Frontend**: Vercel (standalone Scout-Brain frontend)
+- **Backend**: Railway (standalone Scout-Brain backend)
 - **Database / Auth**: Supabase (already set up)
 
 ---
@@ -123,3 +129,14 @@ The backend runs the scout using config from the **repo** (e.g. `scout/config.js
 | Frontend | https://brain.mixedmakershop.com | UI; auth; loads data from Supabase; calls backend for Run Scout / Audit |
 | Backend | https://brain-api.mixedmakershop.com | Run Scout, Audit; syncs scout results to Supabase when user is logged in |
 | Supabase | (dashboard) | Auth, opportunities, case_files, notes, scout_runs |
+
+## Roadmap
+
+### Phase 1 - standalone Scout-Brain polish (current)
+
+- Improve dashboard usefulness, lead refresh timing, dossier quality, outreach flow, and prioritization.
+- Treat Railway-hosted Scout-Brain as the primary environment.
+
+### Phase 2 - MixedMakerShop integration (later)
+
+- Integrate or link Scout-Brain into MixedMakerShop admin once standalone polish targets are met.
