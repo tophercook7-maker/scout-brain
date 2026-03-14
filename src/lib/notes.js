@@ -2,7 +2,9 @@ import { supabase } from "./supabaseClient.js";
 
 export async function addNote(opportunityId, body) {
   if (!supabase) throw new Error("Supabase not configured");
-  const { data: { user } } = await supabase.auth.getUser();
+  const { data: authData, error: authError } = await supabase.auth.getUser();
+  if (authError) throw authError;
+  const user = authData?.user || null;
   if (!user) throw new Error("Not authenticated");
 
   const { data, error } = await supabase

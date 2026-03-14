@@ -77,6 +77,16 @@ npm run build
 
 `vercel.json` is already configured for Vite output (`dist`).
 
+### Immediate Vercel setup (live Railway backend)
+
+- Framework: `Vite`
+- Build command: `npm run build`
+- Output directory: `dist`
+- Required Vercel environment variables:
+  - `VITE_SUPABASE_URL`
+  - `VITE_SUPABASE_ANON_KEY`
+  - `VITE_API_BASE_URL=https://web-production-61047.up.railway.app`
+
 ## Railway deployment
 
 Use repo root as service root.

@@ -2,6 +2,7 @@
  * Bootstrap: init Supabase auth, set cloud data bridge, load app.
  */
 import "./styles.css";
+import { initDebugOverlay, setDebugValue } from "../src/debug-overlay.js";
 console.log("frontend loaded");
 
 // API base URL for backend (Vercel frontend -> Railway/backend host). Empty = same-origin calls.
@@ -19,6 +20,36 @@ import {
   getCaseFromSupabase,
   updateCaseInSupabase,
 } from "./cloud-data.js";
+
+let modulesLoaded = false;
+
+async function loadAppModules() {
+  if (modulesLoaded) return;
+  await import("./analyzer.js");
+  await import("./app.js");
+  modulesLoaded = true;
+  setDebugValue("dbg-init", "complete");
+}
+
+function setAuthEmailDisplay(session) {
+  const email = session?.user?.email || "";
+  const el = document.getElementById("auth-email-display");
+  if (el) el.textContent = email;
+}
+
+async function checkBackend() {
+  try {
+    const backendBase = import.meta.env.VITE_API_BASE_URL || "";
+    const res = await fetch(`${backendBase}/scout-data`);
+    if (res.ok) {
+      setDebugValue("dbg-backend", "reachable");
+    } else {
+      setDebugValue("dbg-backend", "error");
+    }
+  } catch (e) {
+    setDebugValue("dbg-backend", "offline");
+  }
+}
 
 function renderAuthUI(container, onLoggedIn) {
   const root = document.createElement("div");
@@ -50,17 +81,36 @@ function renderAuthUI(container, onLoggedIn) {
   form.onsubmit = async (e) => {
     e.preventDefault();
     errorEl.textContent = "";
+    console.log("sign in clicked");
     try {
       if (isSignUp) {
-        await signUp(emailEl.value, passwordEl.value);
+        const { error } = await signUp(emailEl.value, passwordEl.value);
+        if (error) {
+          console.error("sign in failed", error);
+          errorEl.textContent = error.message || "Login failed. Check email and password.";
+          return;
+        }
         errorEl.textContent = "Check your email to confirm.";
       } else {
-        await signIn(emailEl.value, passwordEl.value);
+        const { data, error } = await signIn(emailEl.value, passwordEl.value);
+        if (error) {
+          console.error("sign in failed", error);
+          errorEl.textContent = error.message || "Login failed. Check email and password.";
+          return;
+        }
+        const user = data?.user || data?.session?.user || null;
+        if (!user) {
+          console.error("sign in failed", { message: "No user returned from Supabase auth response." });
+          errorEl.textContent = "Login failed. Check email and password.";
+          return;
+        }
+        console.log("sign in success");
         root.remove();
         onLoggedIn();
       }
     } catch (err) {
-      errorEl.textContent = err.message || "Sign in failed";
+      console.error("sign in failed", err);
+      errorEl.textContent = err.message || "Login failed. Check email and password.";
     }
   };
 
@@ -88,50 +138,79 @@ function renderLoggedInBar(onLogout) {
 }
 
 async function boot() {
+  console.log("auth bootstrap start");
+  setDebugValue("dbg-init", "booting");
   const cssOk = document.styleSheets.length > 0 && getComputedStyle(document.documentElement).getPropertyValue("--bg").trim();
   console.log("[Massive Brain] Boot | stylesheets:", document.styleSheets.length, "| --bg set:", !!cssOk);
-  if (!isCloudMode()) {
-    window.MB_USE_CLOUD = false;
-    await import("./analyzer.js");
-    await import("./app.js");
-    return;
-  }
-
-  if (!supabase) {
-  console.warn("Supabase URL/key missing, running in local mode");
-  window.MB_USE_CLOUD = false;
-  await import("./analyzer.js");
-  await import("./app.js");
-  return;
-  }
-
-  const { data: { session } } = await supabase.auth.getSession();
-  if (!session) {
-    const container = document.getElementById("auth-container");
-    if (container) {
-      document.querySelector("main.dashboard")?.classList.add("showing-auth");
-      renderAuthUI(container, async () => {
-        document.querySelector("main.dashboard")?.classList.remove("showing-auth");
-        window.MB_SESSION = (await supabase.auth.getSession()).data.session;
-        setCloudBridge();
-        renderLoggedInBar(handleLogout);
-        document.getElementById("auth-email-display").textContent = window.MB_SESSION.user.email;
-        await import("./analyzer.js");
-        await import("./app.js");
-      });
-    } else {
-      await import("./analyzer.js");
-      await import("./app.js");
+  void checkBackend();
+  try {
+    if (!isCloudMode() || !supabase) {
+      window.MB_USE_CLOUD = false;
+      setDebugValue("dbg-auth", "no user");
+      await loadAppModules();
+      return;
     }
-    return;
-  }
 
-  window.MB_SESSION = session;
-  setCloudBridge();
-  renderLoggedInBar(handleLogout);
-  document.getElementById("auth-email-display").textContent = session.user.email;
-  await import("./analyzer.js");
-  await import("./app.js");
+    let session = null;
+    try {
+      const { data, error } = await supabase.auth.getSession();
+      if (error) {
+        console.error("auth bootstrap getSession failed:", error);
+      }
+      session = data?.session || null;
+    } catch (err) {
+      console.error("auth bootstrap getSession exception:", err);
+    }
+
+    console.log(`auth bootstrap user: ${session?.user ? "present" : "missing"}`);
+    setDebugValue("dbg-auth", session?.user ? "signed-in" : "no user");
+
+    if (!session?.user) {
+      window.MB_USE_CLOUD = false;
+      const container = document.getElementById("auth-container");
+      if (container) {
+        document.querySelector("main.dashboard")?.classList.add("showing-auth");
+        renderAuthUI(container, async () => {
+          document.querySelector("main.dashboard")?.classList.remove("showing-auth");
+          let freshSession = null;
+          try {
+            const { data, error } = await supabase.auth.getSession();
+            if (error) console.error("post-login getSession failed:", error);
+            freshSession = data?.session || null;
+          } catch (err) {
+            console.error("post-login getSession exception:", err);
+          }
+
+          if (freshSession?.user) {
+            window.MB_SESSION = freshSession;
+            setCloudBridge();
+            renderLoggedInBar(handleLogout);
+            setAuthEmailDisplay(freshSession);
+            setDebugValue("dbg-auth", "signed-in");
+            await window.refreshScoutData?.();
+          } else {
+            window.MB_USE_CLOUD = false;
+            setDebugValue("dbg-auth", "no user");
+          }
+        });
+      }
+      await loadAppModules();
+      return;
+    }
+
+    window.MB_SESSION = session;
+    setCloudBridge();
+    renderLoggedInBar(handleLogout);
+    setAuthEmailDisplay(session);
+    setDebugValue("dbg-auth", "signed-in");
+    await loadAppModules();
+  } catch (err) {
+    console.error("auth bootstrap failed:", err);
+    window.MB_USE_CLOUD = false;
+    setDebugValue("dbg-auth", "no user");
+    setDebugValue("dbg-init", "error");
+    await loadAppModules();
+  }
 }
 
 function setCloudBridge() {
@@ -152,10 +231,24 @@ function handleLogout() {
 }
 
 initAuth?.((session) => {
-  if (session && window.MB_USE_CLOUD) {
-    document.getElementById("auth-email-display").textContent = session.user.email;
+  if (session?.user && window.MB_USE_CLOUD) {
+    setAuthEmailDisplay(session);
+    setDebugValue("dbg-auth", "signed-in");
+  } else if (!session?.user) {
+    setDebugValue("dbg-auth", "no user");
   }
 });
+
+window.addEventListener("error", (e) => {
+  console.error("Global JS error:", e.error || e.message);
+});
+
+initDebugOverlay();
+setDebugValue("dbg-api", import.meta.env.VITE_API_BASE_URL || "missing");
+setDebugValue("dbg-supabase", import.meta.env.VITE_SUPABASE_URL ? "configured" : "missing");
+setDebugValue("dbg-auth", "...");
+setDebugValue("dbg-init", "starting");
+setDebugValue("dbg-backend", "checking");
 
 if (document.readyState === "loading") {
   document.addEventListener("DOMContentLoaded", boot);

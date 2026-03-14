@@ -163,7 +163,12 @@ export async function saveNoteToSupabase({ opportunity_id, body }) {
 
 export async function saveScoutRunToSupabase({ summary, processed_count, saved_count, skipped_count }) {
   if (!supabase) return;
-  const { data: { user } } = await supabase.auth.getUser();
+  const { data: authData, error: authError } = await supabase.auth.getUser();
+  if (authError) {
+    console.error("saveScoutRunToSupabase auth error:", authError);
+    return;
+  }
+  const user = authData?.user || null;
   if (!user) return;
 
   await supabase.from("scout_runs").insert({
