@@ -53,17 +53,53 @@ def generate_outreach_pack(
         lane = "no_website" if case.get("no_website") else "weak_website"
 
     category = _first(case.get("category"))
-    owner_name = _first(case.get("owner_manager_name"), (_as_list(case.get("owner_names")) or [None])[0])
+    owner_name = _first(
+        case.get("owner_name"),
+        case.get("owner_manager_name"),
+        (_as_list(case.get("owner_names")) or [None])[0],
+    )
     recommended_contact = _first(case.get("recommended_contact_method"), case.get("recommended_contact"))
     strongest_pitch = _first(case.get("strongest_pitch_angle"), case.get("pitch_angle"))
     best_service = _first(case.get("best_service_to_offer"))
-    best_demo = _first(case.get("best_demo_to_show"), case.get("demo_to_show"))
+    best_demo = _first(case.get("best_demo_to_show"), case.get("demo_to_show"), case.get("demo_url"))
+    demo_url = _first(case.get("demo_url"))
     location = _first(city_hint, case.get("address"))
     distance = case.get("distance_miles")
+    review_rating = case.get("rating")
+    review_count = case.get("review_count")
+    website_score = case.get("website_score")
+    website_status = _first(case.get("website_status"))
     review_themes = _as_list(case.get("review_themes"))
     strongest_problems = _as_list(case.get("strongest_problems")) or _as_list(
         (case.get("website_analysis") or {}).get("issues")
     )
+    audit_issues = _as_list(case.get("audit_issues"))
+    issue_pool = list(dict.fromkeys([*strongest_problems, *audit_issues]))
+
+    issue_fallback = None
+    if lane == "no_website":
+        issue_fallback = "No website found for the business"
+    elif website_status == "unreachable":
+        issue_fallback = "Website appears unreachable"
+    elif website_status == "weak":
+        issue_fallback = "Website has visible quality issues"
+    main_issue = _first((issue_pool or [None])[0], issue_fallback, "Web presence can be improved")
+
+    why_this_lead = []
+    if lane == "no_website":
+        why_this_lead.append("No website creates a clear first-build opportunity.")
+    if website_status == "weak":
+        why_this_lead.append("Current site quality leaves room for conversion improvements.")
+    if website_status == "unreachable":
+        why_this_lead.append("Unreachable website is hurting trust and discoverability.")
+    try:
+        if float(review_rating or 0) >= 4.2 and int(review_count or 0) >= 20:
+            why_this_lead.append("Strong reviews suggest demand, but web presence is underperforming.")
+    except Exception:
+        pass
+    if not why_this_lead:
+        why_this_lead.append("The business has demand signals and a clear web improvement angle.")
+    why_this_lead_text = " ".join(why_this_lead)
 
     greeting = f"Hi {owner_name}," if owner_name else "Hi there,"
     category_fragment = f" ({category})" if category else ""
@@ -76,7 +112,7 @@ def generate_outreach_pack(
             "A simple, professional site can help local customers find your hours, services, and best contact info."
         )
     else:
-        weak_site_observation = strongest_problems[0] if strongest_problems else None
+        weak_site_observation = main_issue
         primary_observation = weak_site_observation or (
             f"I noticed a few easy website improvements for {business_name}{category_fragment}."
         )
@@ -85,8 +121,8 @@ def generate_outreach_pack(
         )
 
     proof_lines: list[str] = []
-    if strongest_problems:
-        proof_lines.extend(strongest_problems[:2])
+    if issue_pool:
+        proof_lines.extend(issue_pool[:2])
     if review_themes:
         proof_lines.append(f"Customers often mention: {', '.join(review_themes[:2])}.")
     if distance is not None:
@@ -151,9 +187,13 @@ def generate_outreach_pack(
         f"{value_angle} Happy to send one simple idea if useful."
     ).strip()
 
-    follow_up_note = (
+    follow_up_1 = (
         f"Quick follow-up on my note about {business_name}. "
         "If you'd like, I can send that one-page idea and keep it brief."
+    )
+    follow_up_2 = (
+        f"Final quick follow-up for {business_name}: happy to share a simple before/after plan "
+        f"focused on {main_issue.lower()}."
     )
 
     missing_fields: list[str] = []
@@ -174,6 +214,16 @@ def generate_outreach_pack(
         "longer_email": longer_email,
         "contact_form_version": contact_form_version,
         "social_dm_version": social_dm_version,
-        "follow_up_note": follow_up_note,
-        "follow_up_line": follow_up_note,
+        "follow_up_note": follow_up_1,
+        "follow_up_1": follow_up_1,
+        "follow_up_2": follow_up_2,
+        "follow_up_line": follow_up_1,
+        "why_this_lead": why_this_lead_text,
+        "main_issue_observed": main_issue,
+        "best_opening_angle": value_angle,
+        "best_offer_to_make": offer_line,
+        "demo_url": demo_url or best_demo,
+        "review_rating": review_rating,
+        "review_count": review_count,
+        "website_score": website_score,
     }

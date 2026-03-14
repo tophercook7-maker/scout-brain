@@ -221,6 +221,7 @@ def empty_case(slug: str = "") -> dict[str, Any]:
         "desktop_screenshot_url": None,
         "mobile_screenshot_url": None,
         "internal_screenshot_url": None,
+        "screenshot_failed": False,
         # Outreach queue
         "status": "New",
         "first_contacted_at": None,

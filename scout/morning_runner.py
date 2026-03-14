@@ -8,6 +8,7 @@ Uses config: home_city, search_radius_miles, categories, max_results_per_categor
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -583,13 +584,14 @@ def _build_no_website_case(place: dict, home_city: str, categories: list, index:
     merged_signals = list(dict.fromkeys(base_signals + score_signals))
     case["opportunity_signals"] = merged_signals[:8]
 
-    pack = generate_outreach_pack(case, city_hint=home_city, logger=log.append)
-    case["short_email"] = pack["short_email"]
-    case["longer_email"] = pack["longer_email"]
-    case["contact_form_version"] = pack["contact_form_version"]
-    case["social_dm_version"] = pack["social_dm_version"]
-    case["follow_up_note"] = pack["follow_up_note"]
-    case["follow_up_line"] = pack["follow_up_line"]
+    # Outreach is generated on demand (case open / explicit regenerate), not during main scout run.
+    case["short_email"] = None
+    case["longer_email"] = None
+    case["contact_form_version"] = None
+    case["social_dm_version"] = None
+    case["follow_up_note"] = None
+    case["follow_up_line"] = None
+    case["screenshot_failed"] = False
 
     valid, reason = _validate_case(case)
     if not valid:
@@ -600,8 +602,20 @@ def _build_no_website_case(place: dict, home_city: str, categories: list, index:
     return case
 
 
-def _build_weak_website_case(place: dict, home_city: str, categories: list, index: int, log: list, category: str = "") -> dict | None:
-    """Build case from enriched Place Details. Has website; run investigator."""
+def _build_weak_website_case(
+    place: dict,
+    home_city: str,
+    categories: list,
+    index: int,
+    log: list,
+    category: str = "",
+    *,
+    deep_scan: bool = False,
+    capture_screenshots: bool = False,
+    website_fetch_timeout: int = 6,
+    screenshot_timeout: int = 14,
+) -> dict | None:
+    """Build case from Place Details. Light scan by default, optional deep scan."""
     name = (place.get("name") or "").strip()
     website = (place.get("website") or "").strip()
     if not name:
@@ -642,11 +656,16 @@ def _build_weak_website_case(place: dict, home_city: str, categories: list, inde
     case["review_snippets"] = place.get("review_snippets") or []
     case["review_themes"] = place.get("review_themes") or []
 
-    log.append(f"  Investigating: {website}")
-    screenshot_dir = CASE_FILES_DIR / slug
+    log.append(f"  Investigating ({'deep' if deep_scan else 'light'}): {website}")
+    screenshot_dir = CASE_FILES_DIR / slug if (deep_scan and capture_screenshots) else None
     inv = None
     try:
-        inv = investigate(website, crawl_internal=True, timeout=14, screenshot_dir=str(screenshot_dir))
+        inv = investigate(
+            website,
+            crawl_internal=deep_scan,
+            timeout=screenshot_timeout if deep_scan else website_fetch_timeout,
+            screenshot_dir=str(screenshot_dir) if screenshot_dir else None,
+        )
     except Exception as e:
         log.append(f"  INVESTIGATION FAILED: {e}")
 
@@ -744,13 +763,14 @@ def _build_weak_website_case(place: dict, home_city: str, categories: list, inde
         case["recommended_contact_method"] = "Website or phone"
     case["backup_contact_method"] = "Phone" if case["email"] else "Email" if (case["phone"] or case["phone_from_site"]) else None
 
-    pack = generate_outreach_pack(case, city_hint=home_city, logger=log.append)
-    case["short_email"] = pack["short_email"]
-    case["longer_email"] = pack["longer_email"]
-    case["contact_form_version"] = pack["contact_form_version"]
-    case["social_dm_version"] = pack["social_dm_version"]
-    case["follow_up_note"] = pack["follow_up_note"]
-    case["follow_up_line"] = pack["follow_up_line"]
+    # Outreach is generated on demand (case open / explicit regenerate), not during main scout run.
+    case["short_email"] = None
+    case["longer_email"] = None
+    case["contact_form_version"] = None
+    case["social_dm_version"] = None
+    case["follow_up_note"] = None
+    case["follow_up_line"] = None
+    case["screenshot_failed"] = False
 
     case["why_worth_pursuing"] = f"{name} — real business with website, worth outreach."
     case["why_this_lead_is_worth_pursuing"] = case["why_worth_pursuing"]
@@ -778,6 +798,22 @@ def _build_weak_website_case(place: dict, home_city: str, categories: list, inde
     save_case(CASES_DIR, case)
     log.append(f"  case_file_written: {case['slug']}.json")
     return case
+
+
+def _deep_priority_rank(case: dict) -> tuple[int, float]:
+    lane = str(case.get("lane") or "").strip().lower()
+    if lane == "no_website" or bool(case.get("no_website")):
+        return (0, -float(case.get("opportunity_score") or 0))
+    mobile_score = _as_int(case.get("mobile_score"), 100)
+    website_speed = _as_float(case.get("website_speed"), 0.0)
+    outdated = bool(case.get("outdated_design_clues"))
+    if mobile_score <= 45 or case.get("mobile_ready") is False:
+        return (1, -float(case.get("opportunity_score") or 0))
+    if website_speed > 3.0:
+        return (2, -float(case.get("opportunity_score") or 0))
+    if outdated:
+        return (3, -float(case.get("opportunity_score") or 0))
+    return (4, -float(case.get("opportunity_score") or 0))
 
 
 def run(
@@ -828,9 +864,42 @@ def run(
         "contractor",
     ])
     radii_miles = config.get("search_radii_miles", [2, 5, 10, 15])
-    max_total_results = int(config.get("max_total_results_per_run", 120))
+    max_total_results = int(
+        config.get(
+            "DISCOVERY_MAX_PER_RUN",
+            config.get("discovery_max_per_run", config.get("max_total_results_per_run", 60)),
+        )
+    )
     max_per = max(1, config.get("max_results_per_category", 5))
     ignore_chains = config.get("ignore_chains", True)
+    deep_scan_max_per_run = max(
+        1, int(config.get("DEEP_SCAN_MAX_PER_RUN", config.get("deep_scan_max_per_run", 15)))
+    )
+    screenshot_max_per_run = max(
+        1, int(config.get("SCREENSHOT_MAX_PER_RUN", config.get("screenshot_max_per_run", 10)))
+    )
+    screenshot_concurrency = max(
+        1, min(5, int(config.get("SCREENSHOT_CONCURRENCY", config.get("screenshot_concurrency", 3))))
+    )
+    deep_scan_concurrency = max(
+        1,
+        min(
+            5,
+            int(
+                config.get(
+                    "DEEP_SCAN_CONCURRENCY",
+                    config.get("deep_scan_concurrency", screenshot_concurrency),
+                )
+            ),
+        ),
+    )
+    website_fetch_timeout = max(
+        2, int(config.get("WEBSITE_FETCH_TIMEOUT_SECONDS", config.get("website_fetch_timeout_seconds", 6)))
+    )
+    screenshot_timeout = max(
+        5, int(config.get("SCREENSHOT_TIMEOUT_SECONDS", config.get("screenshot_timeout_seconds", 12)))
+    )
+    deep_analysis_timeout = max(10, int(config.get("deep_analysis_timeout_seconds", 45)))
     api_key = os.environ.get("GOOGLE_MAPS_API_KEY", "").strip()
 
     print("Morning Runner — automated local client finder")
@@ -838,7 +907,17 @@ def run(
     print(f"  target cities: {len(target_cities)}")
     print(f"  search_radii_miles: {radii_miles}")
     print(f"  categories: {categories}, max_per: {max_per}, ignore_chains: {ignore_chains}")
-    print(f"  max_total_results_per_run: {max_total_results}")
+    print(f"  discovery_max_per_run: {max_total_results}")
+    print(f"  deep_scan_max_per_run: {deep_scan_max_per_run}")
+    print(f"  screenshot_max_per_run: {screenshot_max_per_run}")
+    print(f"  screenshot_concurrency: {screenshot_concurrency}")
+    print(f"  deep_scan_concurrency: {deep_scan_concurrency}")
+    print(
+        "  timeouts (sec): "
+        f"website_fetch={website_fetch_timeout}, "
+        f"screenshot={screenshot_timeout}, "
+        f"deep_analysis={deep_analysis_timeout}"
+    )
     if current_lat is not None and current_lng is not None:
         print(f"  location mode: current ({current_lat}, {current_lng})")
     else:
@@ -974,6 +1053,8 @@ def run(
     processed = 0
     saved = 0
     skipped = 0
+    weak_light_cases: list[dict] = []
+    weak_place_by_slug: dict[str, dict] = {}
 
     total_to_analyze = max(1, total_businesses)
     for i, place in enumerate(no_website):
@@ -990,7 +1071,7 @@ def run(
             case_slugs.append(case["slug"])
         else:
             skipped += 1
-        fetch_progress = 50 + int((processed / total_to_analyze) * 8)
+        fetch_progress = 50 + int((processed / total_to_analyze) * 10)
         report_progress(
             "fetching_websites",
             fetch_progress,
@@ -998,7 +1079,7 @@ def run(
             analyzed_count=processed,
             total_businesses=total_to_analyze,
         )
-        analysis_progress = 70 + int((processed / total_to_analyze) * 10)
+        analysis_progress = 65 + int((processed / total_to_analyze) * 5)
         print(f"  analyzing business {processed}/{total_to_analyze}")
         report_progress(
             "analyzing_websites",
@@ -1012,22 +1093,17 @@ def run(
         cat = place.get("category") or (categories[0] if categories else "")
         print(f"  [{cat}] ", end="")
         processed += 1
-        weak_idx = i + 1
-        report_progress(
-            "fetching_websites",
-            50 + int((weak_idx / max(1, len(weak_website))) * 8),
-            f"Fetching websites for {processed + 1} of {total_to_analyze} businesses",
-            fetched_count=processed + 1,
-            total_businesses=total_to_analyze,
+        case = _build_weak_website_case(
+            place,
+            home_city,
+            categories,
+            len(no_website) + i,
+            debug_log,
+            category=cat,
+            deep_scan=False,
+            website_fetch_timeout=website_fetch_timeout,
+            screenshot_timeout=screenshot_timeout,
         )
-        report_progress(
-            "capturing_screenshots",
-            58 + int((weak_idx / max(1, len(weak_website))) * 10),
-            f"Capturing screenshots for {weak_idx} of {len(weak_website)} businesses",
-            screenshots_count=weak_idx,
-            screenshot_targets=len(weak_website),
-        )
-        case = _build_weak_website_case(place, home_city, categories, len(no_website) + i, debug_log, category=cat)
         for line in debug_log:
             print(line)
         debug_log.clear()
@@ -1035,9 +1111,19 @@ def run(
             saved += 1
             weak_website_slugs.append(case["slug"])
             case_slugs.append(case["slug"])
+            weak_light_cases.append(case)
+            weak_place_by_slug[case["slug"]] = place
         else:
             skipped += 1
-        analysis_progress = 70 + int((processed / total_to_analyze) * 10)
+        fetch_progress = 50 + int((processed / total_to_analyze) * 10)
+        report_progress(
+            "fetching_websites",
+            fetch_progress,
+            f"Fetching websites for {processed} of {total_to_analyze} businesses",
+            fetched_count=processed,
+            total_businesses=total_to_analyze,
+        )
+        analysis_progress = 65 + int((processed / total_to_analyze) * 5)
         print(f"  analyzing business {processed}/{total_to_analyze}")
         report_progress(
             "analyzing_websites",
@@ -1047,6 +1133,111 @@ def run(
             total_businesses=total_to_analyze,
         )
 
+    # Phase 2: deep scan top candidates only (priority: no website, mobile, speed, outdated).
+    no_website_cases = []
+    for slug in no_website_slugs:
+        p = CASES_DIR / f"{slug}.json"
+        if not p.exists():
+            continue
+        try:
+            with open(p, encoding="utf-8") as f:
+                no_website_cases.append(json.load(f))
+        except Exception:
+            continue
+
+    all_candidates = no_website_cases + weak_light_cases
+    ranked_candidates = sorted(all_candidates, key=_deep_priority_rank)
+    deep_candidates = ranked_candidates[:deep_scan_max_per_run]
+    for c in deep_candidates:
+        print(f"  deep scan candidate selected: {c.get('slug') or c.get('business_name')}")
+    for c in ranked_candidates[deep_scan_max_per_run:]:
+        print(f"  deep scan skipped due to run cap: {c.get('slug') or c.get('business_name')}")
+    deep_total = len(deep_candidates)
+    if deep_total:
+        report_progress(
+            "capturing_screenshots",
+            70,
+            f"Capturing screenshots for 0 of {deep_total} businesses",
+            screenshots_count=0,
+            screenshot_targets=deep_total,
+        )
+
+        screenshot_candidate_slugs = [
+            c.get("slug")
+            for c in deep_candidates
+            if not bool(c.get("no_website"))
+        ][:screenshot_max_per_run]
+        screenshot_candidate_set = {str(s) for s in screenshot_candidate_slugs if s}
+
+        def _run_deep(case_slug: str, position: int):
+            place = weak_place_by_slug.get(case_slug) or {}
+            cat = place.get("category") or (categories[0] if categories else "")
+            local_log: list[str] = []
+            capture = str(case_slug or "") in screenshot_candidate_set
+            if capture:
+                print(f"  screenshot capture started: {case_slug}")
+            else:
+                print(f"  screenshot skipped for lower-priority lead: {case_slug}")
+            deep_case = _build_weak_website_case(
+                place,
+                home_city,
+                categories,
+                len(no_website) + position,
+                local_log,
+                category=cat,
+                deep_scan=True,
+                capture_screenshots=capture,
+                website_fetch_timeout=website_fetch_timeout,
+                screenshot_timeout=screenshot_timeout,
+            )
+            return deep_case, local_log
+
+        completed_deep = 0
+        with ThreadPoolExecutor(max_workers=min(deep_scan_concurrency, screenshot_concurrency)) as executor:
+            futures = []
+            for idx, case in enumerate(deep_candidates, start=1):
+                slug = case.get("slug")
+                if not slug or bool(case.get("no_website")):
+                    completed_deep += 1
+                    continue
+                futures.append((idx, slug, executor.submit(_run_deep, slug, idx)))
+            for idx, slug, future in futures:
+                try:
+                    deep_case, local_log = future.result(timeout=deep_analysis_timeout)
+                    for line in local_log:
+                        print(line)
+                    if deep_case and slug:
+                        print(f"  deep scan saved: {slug}")
+                except FutureTimeoutError:
+                    print(f"  screenshot capture timed out: {slug}")
+                    print(f"  deep scan timeout: {slug}")
+                    try:
+                        path = CASES_DIR / f"{slug}.json"
+                        if path.exists():
+                            with open(path, encoding="utf-8") as f:
+                                timed_out_case = json.load(f)
+                            timed_out_case["screenshot_failed"] = True
+                            save_case(CASES_DIR, timed_out_case)
+                    except Exception:
+                        pass
+                except Exception as e:
+                    print(f"  deep scan failed: {slug} ({e})")
+                completed_deep += 1
+                report_progress(
+                    "capturing_screenshots",
+                    70 + int((completed_deep / max(1, deep_total)) * 10),
+                    f"Capturing screenshots {completed_deep} of {deep_total}",
+                    screenshots_count=completed_deep,
+                    screenshot_targets=deep_total,
+                )
+                report_progress(
+                    "analyzing_websites",
+                    80 + int((completed_deep / max(1, deep_total)) * 5),
+                    f"Analyzing {completed_deep} of {deep_total} deep-scan businesses",
+                    analyzed_count=completed_deep,
+                    total_businesses=deep_total,
+                )
+
     print()
     print(f"  Processed: {processed}")
     print(f"  Saved valid case files: {saved}")
@@ -1055,7 +1246,7 @@ def run(
 
     if not case_slugs:
         _write_empty("No case files written. Check Places API and config.")
-        report_progress("generating_dossiers", 82, "No valid leads to generate dossiers")
+        report_progress("generating_dossiers", 85, "No valid leads to generate dossiers")
         return
 
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
