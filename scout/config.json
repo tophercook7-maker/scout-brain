@@ -1,11 +1,32 @@
 {
   "home_city": "Hot Springs, Arkansas",
   "search_radius_miles": 25,
+  "search_radii_miles": [2, 5, 10, 15],
   "categories": [
-    "coffee shop",
-    "diner",
-    "church"
+    "restaurant",
+    "cafe",
+    "bakery",
+    "auto repair",
+    "dentist",
+    "plumber",
+    "lawyer",
+    "gym",
+    "church",
+    "salon",
+    "barber shop",
+    "chiropractor",
+    "contractor"
   ],
   "max_results_per_category": 5,
-  "ignore_chains": true
+  "max_total_results_per_run": 120,
+  "ignore_chains": true,
+  "multi_city_enabled": true,
+  "max_cities_per_run": 5,
+  "target_cities": [
+    {"city_name": "Hot Springs", "state": "AR"},
+    {"city_name": "Little Rock", "state": "AR"},
+    {"city_name": "Dallas", "state": "TX"},
+    {"city_name": "Austin", "state": "TX"},
+    {"city_name": "Nashville", "state": "TN"}
+  ]
 }

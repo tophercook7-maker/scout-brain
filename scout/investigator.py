@@ -5,6 +5,7 @@ data, platform clues, owner names, and builds a contact matrix.
 Used by Morning Runner to build detailed research per opportunity.
 """
 import re
+from pathlib import Path
 import urllib.request
 import urllib.error
 from urllib.parse import urljoin, urlparse
@@ -24,6 +25,8 @@ CRAWL_PATHS = [
     "/donate", "/donations", "/give",
     "/staff", "/team", "/our-team", "/meet-the-team", "/leadership",
 ]
+
+INTERNAL_SCREENSHOT_PRIORITY = ["menu", "services", "about", "contact"]
 
 
 def _fetch(url: str, timeout: int = 10) -> tuple[str, int]:
@@ -108,41 +111,76 @@ def _extract_reservation_order_links(html: str, base: str) -> dict[str, str]:
     return found
 
 
-def _extract_owner_names(html: str) -> list[str]:
-    """Look for Owner, Founder, Pastor, Chef, Manager, Director and extract nearby names."""
-    titles = ["owner", "founder", "pastor", "chef", "manager", "director", "proprietor", "lead"]
-    names = []
-    # Strip script/style to reduce noise
-    html = re.sub(r"<script[^>]*>.*?</script>", "", html, flags=re.I | re.S)
-    html = re.sub(r"<style[^>]*>.*?</style>", "", html, flags=re.I | re.S)
+def _normalize_title(raw: str) -> str:
+    title = (raw or "").strip().lower()
+    mapping = {
+        "co founder": "co-founder",
+        "cofounder": "co-founder",
+        "ceo": "ceo",
+        "owner": "owner",
+        "founder": "founder",
+        "co-founder": "co-founder",
+        "director": "director",
+        "manager": "manager",
+        "pastor": "pastor",
+    }
+    return mapping.get(title, title)
+
+
+def _extract_owner_candidates(html: str) -> list[dict[str, str]]:
+    """
+    Extract likely owner/decision-maker mentions from text snippets.
+    Returns list of {name, title}.
+    """
+    titles = ["owner", "founder", "co-founder", "co founder", "ceo", "director", "manager", "pastor"]
+    seen: set[tuple[str, str]] = set()
+    candidates: list[dict[str, str]] = []
+
+    cleaned = re.sub(r"<script[^>]*>.*?</script>", " ", html, flags=re.I | re.S)
+    cleaned = re.sub(r"<style[^>]*>.*?</style>", " ", cleaned, flags=re.I | re.S)
+    cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+    name_pat = r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})"
+
+    patterns: list[tuple[str, str]] = []
     for title in titles:
-        # Pattern: "Name — Owner" or "Owner: Name" or "Name, Owner" or <strong>Name</strong> ... Owner
-        for m in re.finditer(
-            rf"(?:^|[>\s])([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s*[—\-:,]\s*{re.escape(title)}\b",
-            html,
-            re.I,
-        ):
-            name = m.group(1).strip()
-            if len(name) > 3 and name not in names:
-                names.append(name)
-        for m in re.finditer(
-            rf"\b{re.escape(title)}\s*[:\s]+\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)",
-            html,
-            re.I,
-        ):
-            name = m.group(1).strip()
-            if len(name) > 3 and name not in names:
-                names.append(name)
-        # Near heading: <h3>John Smith</h3> ... Owner
-        for m in re.finditer(
-            r"<h[2-4][^>]*>([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)</h[2-4]>[\s\S]{0,80}?" + re.escape(title),
-            html,
-            re.I,
-        ):
-            name = m.group(1).strip()
-            if len(name) > 3 and name not in names:
-                names.append(name)
-    return names[:5]
+        t = re.escape(title)
+        patterns.extend(
+            [
+                (title, rf"\b{t}\b\s*[:\-]\s*{name_pat}\b"),
+                (title, rf"\b{name_pat}\b\s*[—\-:,]\s*{t}\b"),
+                (title, rf"\b{t}\b\s+(?:is|is\s+our|at)\s+{name_pat}\b"),
+            ]
+        )
+    patterns.extend(
+        [
+            ("founder", rf"\bfounded\s+by\s+{name_pat}\b"),
+            ("founder", rf"\bour\s+founder\s+{name_pat}\b"),
+            ("manager", rf"\bmanaged\s+by\s+{name_pat}\b"),
+        ]
+    )
+
+    for raw_title, pat in patterns:
+        for m in re.finditer(pat, cleaned, re.I):
+            groups = [g for g in m.groups() if g]
+            if not groups:
+                continue
+            # Name is always the last capturing group in our patterns.
+            name = groups[-1].strip()
+            if len(name) < 5:
+                continue
+            title = _normalize_title(raw_title)
+            key = (name.lower(), title)
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append({"name": name, "title": title})
+    return candidates[:10]
+
+
+def _extract_owner_names(html: str) -> list[str]:
+    return [c["name"] for c in _extract_owner_candidates(html)[:5]]
 
 
 def _extract_internal_links(html: str, base: str) -> dict[str, str]:
@@ -211,6 +249,7 @@ def _analyze_page(html: str, url: str) -> dict[str, Any]:
         "internal_links": _extract_internal_links(html, url),
         "reservation_order": _extract_reservation_order_links(html, url),
         "owner_names": _extract_owner_names(html),
+        "owner_candidates": _extract_owner_candidates(html),
         "nav_items": _extract_nav_items(html),
         "platform": _detect_platform(html),
         "viewport_ok": "viewport" in lower and 'name="viewport"' in lower,
@@ -239,7 +278,165 @@ def _get_title_meta(html: str) -> tuple[str | None, str | None]:
     return title, meta
 
 
-def investigate(url: str, crawl_internal: bool = True, timeout: int = 12) -> dict[str, Any]:
+def _clamp_score(v: float) -> int:
+    return int(max(0, min(100, round(v))))
+
+
+def auditWebsite(html: str, metadata: dict[str, Any], screenshots: dict[str, str | None]) -> dict[str, Any]:
+    """
+    Lightweight AI-style website audit (heuristic scoring).
+    Returns category scores (0-100), overall website_score, and audit issues.
+    """
+    lower = (html or "").lower()
+    issues: list[str] = []
+
+    viewport_ok = metadata.get("viewport_ok") is True
+    tap_to_call = metadata.get("tap_to_call_present") is True
+    menu_visibility = metadata.get("menu_visibility") is True
+    contact_form_present = metadata.get("contact_form_present") is True
+    outdated_design = metadata.get("outdated_design_clues") is True
+    text_heavy = metadata.get("text_heavy_clues") is True
+    has_email = bool(metadata.get("emails"))
+    has_phone = bool(metadata.get("phones"))
+    has_contact_page = bool(metadata.get("contact_page"))
+    has_ordering_or_booking = bool(metadata.get("order_link")) or bool(metadata.get("reservation_link"))
+    nav_items = metadata.get("navigation_items") or metadata.get("page_navigation_items") or []
+    cta_present = ("book" in lower or "order" in lower or "call now" in lower or "get quote" in lower)
+
+    desktop_shot = bool(screenshots.get("desktop_homepage_path"))
+    mobile_shot = bool(screenshots.get("mobile_homepage_path"))
+
+    mobile_score = 85.0
+    if not viewport_ok:
+        mobile_score -= 35
+        issues.append("poor mobile layout")
+    if not tap_to_call:
+        mobile_score -= 10
+    if not mobile_shot:
+        mobile_score -= 5
+
+    design_score = 80.0
+    if outdated_design:
+        design_score -= 25
+        issues.append("outdated design")
+    if text_heavy:
+        design_score -= 20
+        issues.append("text-heavy homepage")
+    if not desktop_shot:
+        design_score -= 5
+
+    navigation_score = 80.0
+    if not menu_visibility:
+        navigation_score -= 20
+        issues.append("menu difficult to find")
+    if len(nav_items) < 3:
+        navigation_score -= 15
+    if not has_contact_page:
+        navigation_score -= 10
+
+    conversion_score = 82.0
+    if not cta_present:
+        conversion_score -= 20
+        issues.append("missing call-to-action")
+    if not contact_form_present and not has_email and not has_phone:
+        conversion_score -= 20
+        issues.append("missing contact information")
+    if not has_ordering_or_booking:
+        conversion_score -= 15
+        issues.append("no online ordering/booking")
+
+    mobile_score_i = _clamp_score(mobile_score)
+    design_score_i = _clamp_score(design_score)
+    navigation_score_i = _clamp_score(navigation_score)
+    conversion_score_i = _clamp_score(conversion_score)
+    website_score = _clamp_score(
+        (mobile_score_i + design_score_i + navigation_score_i + conversion_score_i) / 4.0
+    )
+
+    deduped_issues = list(dict.fromkeys(issues))
+    return {
+        "website_score": website_score,
+        "mobile_score": mobile_score_i,
+        "design_score": design_score_i,
+        "navigation_score": navigation_score_i,
+        "conversion_score": conversion_score_i,
+        "audit_issues": deduped_issues,
+        "detected_issues": deduped_issues,
+    }
+
+
+def _capture_website_screenshots(
+    homepage_url: str,
+    internal_url: str | None,
+    output_dir: Path,
+    timeout: int,
+    debug_log: list[str],
+) -> dict[str, str | None]:
+    screenshots = {
+        "desktop_homepage_path": None,
+        "mobile_homepage_path": None,
+        "internal_page_path": None,
+    }
+    debug_log.append("screenshot capture started")
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as e:
+        debug_log.append(f"screenshot failed: playwright unavailable ({e})")
+        return screenshots
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    desktop_path = output_dir / "desktop.png"
+    mobile_path = output_dir / "mobile.png"
+    internal_path = output_dir / "internal.png"
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(viewport={"width": 1280, "height": 800})
+            page = context.new_page()
+            page.goto(homepage_url, wait_until="networkidle", timeout=timeout * 1000)
+            page.screenshot(path=str(desktop_path), full_page=True)
+            screenshots["desktop_homepage_path"] = str(desktop_path)
+            debug_log.append("screenshot captured: desktop_homepage")
+            context.close()
+
+            mobile_context = browser.new_context(
+                viewport={"width": 390, "height": 844},
+                user_agent=(
+                    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+                ),
+                is_mobile=True,
+            )
+            mobile_page = mobile_context.new_page()
+            mobile_page.goto(homepage_url, wait_until="networkidle", timeout=timeout * 1000)
+            mobile_page.screenshot(path=str(mobile_path), full_page=True)
+            screenshots["mobile_homepage_path"] = str(mobile_path)
+            debug_log.append("screenshot captured: mobile_homepage")
+            mobile_context.close()
+
+            if internal_url:
+                internal_context = browser.new_context(viewport={"width": 1280, "height": 800})
+                internal_page = internal_context.new_page()
+                internal_page.goto(internal_url, wait_until="networkidle", timeout=timeout * 1000)
+                internal_page.screenshot(path=str(internal_path), full_page=True)
+                screenshots["internal_page_path"] = str(internal_path)
+                debug_log.append("screenshot captured: key_internal_page")
+                internal_context.close()
+
+            browser.close()
+    except Exception as e:
+        debug_log.append(f"screenshot failed: {e}")
+
+    return screenshots
+
+
+def investigate(
+    url: str,
+    crawl_internal: bool = True,
+    timeout: int = 12,
+    screenshot_dir: str | None = None,
+) -> dict[str, Any]:
     """
     Deep-investigate a website: homepage + internal pages.
     Extracts emails, phones, social, owner names, platform, contact matrix.
@@ -265,6 +462,9 @@ def investigate(url: str, crawl_internal: bool = True, timeout: int = 12) -> dic
             "internal_links_found": {},
             "discovered_pages": [],
             "owner_names": [],
+            "owner_name": None,
+            "owner_title": None,
+            "owner_source_page": None,
             "reservation_link": None, "order_link": None,
             "contact_matrix": {},
             "platform_used": None,
@@ -277,8 +477,17 @@ def investigate(url: str, crawl_internal: bool = True, timeout: int = 12) -> dic
             "hours_visibility": None,
             "directions_visibility": None,
             "text_heavy_clues": None,
+            "website_score": None,
+            "mobile_score": None,
+            "design_score": None,
+            "navigation_score": None,
+            "conversion_score": None,
+            "audit_issues": [],
             "problems": ["Website could not be fetched"],
             "pitch": ["review manually"],
+            "desktop_homepage_path": None,
+            "mobile_homepage_path": None,
+            "internal_page_path": None,
         }
 
     debug_log.append("website: fetched")
@@ -288,6 +497,7 @@ def investigate(url: str, crawl_internal: bool = True, timeout: int = 12) -> dic
     all_social: dict[str, str] = {}
     all_internal: dict[str, str] = {}
     all_owner_names: set[str] = set()
+    all_owner_candidates: list[dict[str, str | None]] = []
     reservation_link: str | None = None
     order_link: str | None = None
     contact_page_url: str | None = None
@@ -321,6 +531,14 @@ def investigate(url: str, crawl_internal: bool = True, timeout: int = 12) -> dic
     all_internal.update(home_result["internal_links"])
     for n in home_result["owner_names"]:
         all_owner_names.add(n)
+    for c in home_result.get("owner_candidates") or []:
+        all_owner_candidates.append(
+            {
+                "name": c.get("name"),
+                "title": c.get("title"),
+                "source_page": url,
+            }
+        )
     if home_result["reservation_order"].get("reservations"):
         reservation_link = home_result["reservation_order"]["reservations"]
     if home_result["reservation_order"].get("order"):
@@ -347,6 +565,14 @@ def investigate(url: str, crawl_internal: bool = True, timeout: int = 12) -> dic
                 all_internal.update(pr["internal_links"])
                 for n in pr["owner_names"]:
                     all_owner_names.add(n)
+                for c in pr.get("owner_candidates") or []:
+                    all_owner_candidates.append(
+                        {
+                            "name": c.get("name"),
+                            "title": c.get("title"),
+                            "source_page": candidate,
+                        }
+                    )
                 if not contact_page_url and path.startswith("/contact"):
                     contact_page_url = candidate
                 if not reservation_link and pr["reservation_order"].get("reservations"):
@@ -392,6 +618,70 @@ def investigate(url: str, crawl_internal: bool = True, timeout: int = 12) -> dic
         problems = ["Site could be clearer and more conversion-focused"]
         pitch = ["create a cleaner mobile-friendly layout"]
 
+    owner_priority = {
+        "owner": 0,
+        "founder": 1,
+        "co-founder": 2,
+        "ceo": 3,
+        "director": 4,
+        "manager": 5,
+        "pastor": 6,
+    }
+    deduped_owner_hits: list[dict[str, str | None]] = []
+    owner_seen = set()
+    for hit in all_owner_candidates:
+        nm = (hit.get("name") or "").strip()
+        tt = (hit.get("title") or "").strip().lower()
+        key = (nm.lower(), tt)
+        if not nm or key in owner_seen:
+            continue
+        owner_seen.add(key)
+        deduped_owner_hits.append(hit)
+    deduped_owner_hits.sort(key=lambda h: owner_priority.get(str(h.get("title") or "").lower(), 99))
+    selected_owner = deduped_owner_hits[0] if deduped_owner_hits else None
+
+    internal_screenshot_url = None
+    for key in INTERNAL_SCREENSHOT_PRIORITY:
+        if all_internal.get(key):
+            internal_screenshot_url = all_internal.get(key)
+            break
+    if not internal_screenshot_url and discovered_pages:
+        internal_screenshot_url = discovered_pages[0]
+
+    shot_paths = {
+        "desktop_homepage_path": None,
+        "mobile_homepage_path": None,
+        "internal_page_path": None,
+    }
+    if screenshot_dir:
+        shot_paths = _capture_website_screenshots(
+            homepage_url=url,
+            internal_url=internal_screenshot_url,
+            output_dir=Path(screenshot_dir),
+            timeout=timeout,
+            debug_log=debug_log,
+        )
+
+    audit = auditWebsite(
+        combined,
+        {
+            "viewport_ok": viewport_ok,
+            "tap_to_call_present": tap_to_call,
+            "menu_visibility": menu_vis,
+            "contact_form_present": contact_form,
+            "outdated_design_clues": bool(platform and "weebly" in (platform or "").lower()),
+            "text_heavy_clues": text_heavy,
+            "emails": list(all_emails),
+            "phones": list(all_phones),
+            "contact_page": contact_page_url,
+            "order_link": order_link,
+            "reservation_link": reservation_link,
+            "navigation_items": page_nav_items,
+        },
+        shot_paths,
+    )
+    issues_for_pitch = list(dict.fromkeys((audit.get("audit_issues") or []) + problems))
+
     best_contact = "email" if all_emails else "phone" if all_phones else "contact_form" if contact_form else "social" if all_social else "unknown"
     backup_contact = "phone" if all_emails and all_phones else "email" if all_phones and not all_emails else "contact_form" if all_social else None
 
@@ -406,7 +696,9 @@ def investigate(url: str, crawl_internal: bool = True, timeout: int = 12) -> dic
         "facebook": all_social.get("facebook"),
         "instagram": all_social.get("instagram"),
         "linkedin": all_social.get("linkedin"),
-        "owner_name": (list(all_owner_names)[:1] or [None])[0],
+        "owner_name": selected_owner.get("name") if selected_owner else (list(all_owner_names)[:1] or [None])[0],
+        "owner_title": selected_owner.get("title") if selected_owner else None,
+        "owner_source_page": selected_owner.get("source_page") if selected_owner else None,
         "phone_available": bool(all_phones),
         "contact_form_available": contact_form,
         "social_available": bool(all_social),
@@ -435,6 +727,10 @@ def investigate(url: str, crawl_internal: bool = True, timeout: int = 12) -> dic
         "important_internal_links": all_internal,
         "discovered_pages": discovered_pages[:15],
         "owner_names": list(all_owner_names)[:5],
+        "owner_name": selected_owner.get("name") if selected_owner else None,
+        "owner_title": selected_owner.get("title") if selected_owner else None,
+        "owner_source_page": selected_owner.get("source_page") if selected_owner else None,
+        "owner_candidates": deduped_owner_hits[:10],
         "reservation_link": reservation_link,
         "order_link": order_link,
         "contact_matrix": contact_matrix,
@@ -442,7 +738,17 @@ def investigate(url: str, crawl_internal: bool = True, timeout: int = 12) -> dic
         "navigation_items": page_nav_items,
         "text_heavy_clues": text_heavy,
         "outdated_design_clues": bool(platform and "weebly" in (platform or "").lower()),
-        "problems": problems[:6],
-        "strongest_problems": problems[:6],
+        "problems": issues_for_pitch[:8],
+        "strongest_problems": issues_for_pitch[:8],
         "pitch": pitch[:6],
+        "website_score": audit.get("website_score"),
+        "mobile_score": audit.get("mobile_score"),
+        "design_score": audit.get("design_score"),
+        "navigation_score": audit.get("navigation_score"),
+        "conversion_score": audit.get("conversion_score"),
+        "audit_issues": audit.get("audit_issues") or [],
+        "detected_issues": audit.get("detected_issues") or [],
+        "desktop_homepage_path": shot_paths.get("desktop_homepage_path"),
+        "mobile_homepage_path": shot_paths.get("mobile_homepage_path"),
+        "internal_page_path": shot_paths.get("internal_page_path"),
     }

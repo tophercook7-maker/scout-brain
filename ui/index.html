@@ -20,7 +20,6 @@
         <a href="/services" class="ghost-btn public-nav-link" data-public-route="/services">Services</a>
         <a href="/portfolio" class="ghost-btn public-nav-link" data-public-route="/portfolio">Portfolio</a>
         <a href="/contact" class="ghost-btn public-nav-link" data-public-route="/contact">Contact</a>
-        <a href="/admin" class="primary-btn public-nav-link" data-public-route="/admin">Admin Login</a>
       </nav>
     </header>
     <main class="public-main">
@@ -46,6 +45,13 @@
         <article class="panel">
           <h2>Contact</h2>
           <p>Reach out for project inquiries and partnership opportunities.</p>
+        </article>
+      </section>
+      <section class="public-page hidden" data-public-page="/login">
+        <article class="panel">
+          <h2>Login</h2>
+          <p>Sign in to access your private Scout-Brain workspace.</p>
+          <div id="public-auth-container"></div>
         </article>
       </section>
     </main>
@@ -119,26 +125,37 @@
 
           <div class="dashboard-kpi-grid">
             <article class="dashboard-kpi-card">
-              <p class="dashboard-kpi-label">Leads discovered today</p>
-              <h4 id="kpiLeadsToday">0</h4>
+              <p class="dashboard-kpi-label">Businesses Discovered</p>
+              <h4 id="kpiBusinessesDiscovered">0</h4>
             </article>
             <article class="dashboard-kpi-card">
-              <p class="dashboard-kpi-label">Ready to contact</p>
-              <h4 id="kpiReadyToContact">0</h4>
+              <p class="dashboard-kpi-label">Websites Audited</p>
+              <h4 id="kpiWebsitesAudited">0</h4>
             </article>
             <article class="dashboard-kpi-card">
-              <p class="dashboard-kpi-label">Follow-ups due</p>
-              <h4 id="kpiFollowUpsDue">0</h4>
+              <p class="dashboard-kpi-label">High Opportunities</p>
+              <h4 id="kpiHighOpportunities">0</h4>
             </article>
             <article class="dashboard-kpi-card">
-              <p class="dashboard-kpi-label">Total active cases</p>
-              <h4 id="kpiActiveCases">0</h4>
+              <p class="dashboard-kpi-label">Outreach Sent</p>
+              <h4 id="kpiOutreachSent">0</h4>
             </article>
+          </div>
+          <div class="case-field-list">
+            <div class="case-field"><span class="case-field-label">Last Scout Run:</span> <span id="scoutSummaryLastRun">No run yet</span></div>
+            <div class="case-field"><span class="case-field-label">New Leads Today:</span> <span id="scoutSummaryLeadsToday">0</span></div>
+            <div class="case-field"><span class="case-field-label">Top Opportunities:</span> <span id="scoutSummaryTopOpps">0</span></div>
+            <div class="case-field"><span class="case-field-label">Follow-ups Due:</span> <span id="scoutSummaryFollowups">0</span></div>
+          </div>
+          <div class="case-field-list">
+            <div class="case-field"><span class="case-field-label">Today's Scout Results — Businesses discovered:</span> <span id="scoutSummaryBusinessesDiscovered">0</span></div>
+            <div class="case-field"><span class="case-field-label">Today's Scout Results — Analyzed:</span> <span id="scoutSummaryAnalyzedTotal">0</span></div>
+            <div class="case-field"><span class="case-field-label">Today's Scout Results — High opportunities:</span> <span id="scoutSummaryHighOppTotal">0</span></div>
           </div>
 
           <div class="dashboard-command-grid">
             <article class="item-card">
-              <h4>Top 5 Contacts Today</h4>
+              <h4>Top Opportunities Today</h4>
               <p class="runner-today-hint">Best leads to contact now based on score and outreach readiness.</p>
               <div id="dashboardTopOpps" class="dashboard-top-opps"></div>
             </article>
@@ -184,6 +201,10 @@
             <h4>Email Alerts</h4>
             <p class="runner-today-hint">Customize your daily lead briefing email.</p>
             <div class="case-field-list">
+              <div class="case-field"><span class="case-field-label">Current plan:</span> <span id="workspacePlanBadge">free</span></div>
+              <div class="case-field"><span class="case-field-label">Plan usage:</span> <span id="workspacePlanUsage">Scout runs this month: 0 | Saved leads: 0</span></div>
+            </div>
+            <div class="case-field-list">
               <label class="case-field"><input type="checkbox" id="emailAlertsEnabled" checked /> Enable email alerts</label>
               <label class="case-field">
                 <span class="case-field-label">Frequency:</span>
@@ -199,8 +220,10 @@
             </div>
             <div class="runner-copy-row">
               <button type="button" class="primary-btn" id="saveEmailAlertsBtn">Save Email Alerts</button>
+              <button type="button" class="ghost-btn" id="upgradePlanBtn">Upgrade to Pro</button>
               <span class="tag" id="emailAlertsStatus">Loading…</span>
             </div>
+            <p class="subtext hidden" id="planLimitMessage">Free plan limit reached. Upgrade to Pro for unlimited scouting.</p>
           </article>
         </section>
 
@@ -394,6 +417,11 @@
       </div>
     </div>
   </div>
+
+  <div id="globalLoadingBar" class="global-loading hidden" aria-live="polite">
+    <span id="globalLoadingText">Loading…</span>
+  </div>
+  <div id="toastContainer" class="toast-container" aria-live="polite" aria-atomic="true"></div>
 
   <script type="module" src="/main.js"></script>
 </body>

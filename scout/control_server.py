@@ -39,7 +39,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/status":
-            self._send(200, {"ok": True, "service": "massive-brain-control"})
+            self._send(200, {"ok": True, "service": "scout-brain-control"})
             return
 
         if self.path == "/scout-data":

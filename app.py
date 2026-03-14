@@ -14,7 +14,8 @@ import sys
 import webbrowser
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 from urllib import request as urllib_request
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,6 +30,7 @@ DIST_ASSETS_DIR = DIST_DIR / "assets"
 DIST_INDEX_PATH = DIST_DIR / "index.html"
 SCOUT_DIR = APP_DIR / "scout"
 CASES_DIR = SCOUT_DIR / "cases"
+CASE_FILES_DIR = SCOUT_DIR / "case_files"
 CONFIG_PATH = SCOUT_DIR / "config.json"
 HISTORY_PATH = SCOUT_DIR / "history.json"
 OPPORTUNITIES_PATH = SCOUT_DIR / "opportunities.json"
@@ -79,11 +81,22 @@ def _env_flag(name: str, default: bool = False) -> bool:
 # Enable only when intentionally serving frontend from this process.
 SERVE_FRONTEND = _env_flag("SERVE_FRONTEND", default=False)
 ENABLE_SCHEDULED_SCOUT = _env_flag("ENABLE_SCHEDULED_SCOUT", default=True)
-SCHEDULED_SCOUT_HOUR = int(os.environ.get("SCHEDULED_SCOUT_HOUR", "6"))
+SCHEDULED_SCOUT_HOUR = int(os.environ.get("SCHEDULED_SCOUT_HOUR", "7"))
+SCHEDULED_SCOUT_TIMEZONE = (os.environ.get("SCHEDULED_SCOUT_TIMEZONE", "local") or "local").strip()
+SCHEDULED_SCOUT_SCOPE = (os.environ.get("SCHEDULED_SCOUT_SCOPE", "internal") or "internal").strip().lower()
+SCHEDULED_SCOUT_WORKSPACE_NAME = (os.environ.get("SCHEDULED_SCOUT_WORKSPACE_NAME", "MixedMakerShop") or "MixedMakerShop").strip()
+CRM_AUTO_INTAKE_ENABLED = _env_flag("CRM_AUTO_INTAKE_ENABLED", default=True)
+CRM_INTAKE_MIN_SCORE = float(os.environ.get("CRM_INTAKE_MIN_SCORE", "80"))
+CRM_INTAKE_MAX_CANDIDATES = int(os.environ.get("CRM_INTAKE_MAX_CANDIDATES", "250"))
+CRM_SUPABASE_URL = (os.environ.get("CRM_SUPABASE_URL", "") or "").strip() or _supabase_url
+CRM_SUPABASE_SERVICE_ROLE_KEY = (os.environ.get("CRM_SUPABASE_SERVICE_ROLE_KEY", "") or "").strip() or _supabase_service_key
+CRM_LEADS_TABLE = (os.environ.get("CRM_LEADS_TABLE", "leads") or "leads").strip()
 
 app = FastAPI(title="Massive Brain", version="2.0")
 
 _scheduler = None
+_scout_jobs: dict[str, dict] = {}
+_scout_jobs_lock = threading.Lock()
 
 # CORS for Vercel frontend calling Railway backend.
 # Configure explicit origins with ALLOWED_ORIGINS="https://your-app.vercel.app,https://other-domain.com"
@@ -161,6 +174,31 @@ def _load_scout_data():
     today = dict(today)
     today["top_opportunities"] = opportunities
     return {"today": today, "opportunities": opportunities}
+
+
+def _job_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _job_store(job: dict) -> None:
+    with _scout_jobs_lock:
+        _scout_jobs[job["id"]] = dict(job)
+
+
+def _job_get(job_id: str) -> dict | None:
+    with _scout_jobs_lock:
+        job = _scout_jobs.get(job_id)
+        return dict(job) if job else None
+
+
+def _job_update(job_id: str, **updates) -> dict | None:
+    with _scout_jobs_lock:
+        job = _scout_jobs.get(job_id)
+        if not job:
+            return None
+        job.update(updates)
+        _scout_jobs[job_id] = job
+        return dict(job)
 
 
 def _get_user_id_from_request(request: Request) -> str | None:
@@ -260,7 +298,115 @@ def _insert_with_workspace_fallback(sb, table_name: str, row: dict):
         raise
 
 
-def _sync_scout_to_supabase(user_id: str, workspace_id: str | None = None) -> None:
+def _normalize_plan(plan: str | None) -> str:
+    raw = (plan or "").strip().lower()
+    if raw in {"internal", "free", "pro", "agency"}:
+        return raw
+    return "free"
+
+
+def _get_workspace_for_user(sb, user_id: str, requested_workspace_id: str | None = None) -> dict:
+    workspace_id = _resolve_workspace_id_for_user(sb, user_id, requested_workspace_id=requested_workspace_id)
+    if workspace_id:
+        try:
+            ws = (
+                sb.table("workspaces")
+                .select("id,name,plan")
+                .eq("id", workspace_id)
+                .limit(1)
+                .execute()
+            )
+            if ws.data:
+                row = ws.data[0]
+                return {
+                    "id": row.get("id"),
+                    "name": row.get("name") or "Workspace",
+                    "plan": _normalize_plan(row.get("plan")),
+                }
+        except Exception:
+            pass
+    return {"id": workspace_id, "name": "Workspace", "plan": "free"}
+
+
+def _get_workspace_usage(sb, workspace_id: str | None) -> dict:
+    if not workspace_id:
+        return {"monthly_scout_runs": 0, "saved_leads": 0}
+    month_start = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+    runs_count = 0
+    leads_count = 0
+    try:
+        runs = (
+            sb.table("scout_runs")
+            .select("id,created_at")
+            .eq("workspace_id", workspace_id)
+            .gte("created_at", month_start)
+            .execute()
+        )
+        runs_count = len(runs.data or [])
+    except Exception:
+        runs_count = 0
+    try:
+        leads = (
+            sb.table("opportunities")
+            .select("id")
+            .eq("workspace_id", workspace_id)
+            .execute()
+        )
+        leads_count = len(leads.data or [])
+    except Exception:
+        leads_count = 0
+    return {"monthly_scout_runs": runs_count, "saved_leads": leads_count}
+
+
+def _plan_limits(plan: str) -> dict:
+    normalized = _normalize_plan(plan)
+    if normalized == "free":
+        return {
+            "max_scout_runs_per_month": 5,
+            "max_saved_leads": 10,
+            "full_outreach": False,
+            "top_opportunities_dashboard": False,
+            "daily_email_briefing": False,
+        }
+    return {
+        "max_scout_runs_per_month": None,
+        "max_saved_leads": None,
+        "full_outreach": True,
+        "top_opportunities_dashboard": True,
+        "daily_email_briefing": True,
+    }
+
+
+def _plan_limit_message() -> str:
+    return "Free plan limit reached. Upgrade to Pro for unlimited scouting."
+
+
+def _check_plan_limits_for_run(plan: str, usage: dict) -> tuple[bool, str | None]:
+    limits = _plan_limits(plan)
+    max_runs = limits.get("max_scout_runs_per_month")
+    max_leads = limits.get("max_saved_leads")
+    if max_runs is not None and int(usage.get("monthly_scout_runs") or 0) >= int(max_runs):
+        print("  plan limit reached")
+        return False, _plan_limit_message()
+    if max_leads is not None and int(usage.get("saved_leads") or 0) >= int(max_leads):
+        print("  plan limit reached")
+        return False, _plan_limit_message()
+    return True, None
+
+
+def _apply_outreach_plan_limits(case_row: dict, plan: str) -> dict:
+    if _plan_limits(plan).get("full_outreach", True):
+        return case_row
+    limited = dict(case_row)
+    limited["longer_email"] = None
+    limited["contact_form_version"] = None
+    limited["social_dm_version"] = None
+    limited["follow_up_note"] = None
+    limited["follow_up_line"] = None
+    return limited
+
+
+def _sync_scout_to_supabase(user_id: str, workspace_id: str | None = None, workspace_plan: str | None = None) -> None:
     """Load scout results from local files and upsert into Supabase (opportunities + case_files)."""
     if not _supabase_url or not _supabase_service_key:
         return
@@ -272,6 +418,7 @@ def _sync_scout_to_supabase(user_id: str, workspace_id: str | None = None) -> No
             return
         sb = create_client(_supabase_url, _supabase_service_key)
         effective_workspace_id = _resolve_workspace_id_for_user(sb, user_id, requested_workspace_id=workspace_id)
+        effective_workspace_plan = _normalize_plan(workspace_plan)
         for opp_ui in opportunities_ui:
             slug = opp_ui.get("slug") or opp_ui.get("id")
             name = (opp_ui.get("name") or opp_ui.get("business_name") or "").strip()
@@ -281,6 +428,10 @@ def _sync_scout_to_supabase(user_id: str, workspace_id: str | None = None) -> No
                 "user_id": user_id,
                 "workspace_id": effective_workspace_id,
                 "business_name": name,
+                "place_id": opp_ui.get("place_id"),
+                "city": opp_ui.get("city"),
+                "state": opp_ui.get("state"),
+                "industry": opp_ui.get("industry") or opp_ui.get("category"),
                 "category": opp_ui.get("category"),
                 "lane": opp_ui.get("lane"),
                 "distance_miles": opp_ui.get("distance_miles"),
@@ -289,6 +440,7 @@ def _sync_scout_to_supabase(user_id: str, workspace_id: str | None = None) -> No
                 "website": opp_ui.get("website"),
                 "maps_link": opp_ui.get("maps_url") or opp_ui.get("maps_link"),
                 "rating": opp_ui.get("rating"),
+                "website_score": opp_ui.get("website_score"),
                 "review_count": opp_ui.get("review_count"),
                 "hours": opp_ui.get("hours"),
                 "no_website": bool(opp_ui.get("no_website")),
@@ -297,18 +449,73 @@ def _sync_scout_to_supabase(user_id: str, workspace_id: str | None = None) -> No
                 "strongest_pitch_angle": opp_ui.get("pitch_angle") or opp_ui.get("strongest_pitch_angle"),
                 "best_service_to_offer": opp_ui.get("best_service_to_offer"),
                 "demo_to_show": opp_ui.get("demo_to_show"),
+                "opportunity_score": opp_ui.get("opportunity_score") if opp_ui.get("opportunity_score") is not None else opp_ui.get("score") or opp_ui.get("internal_score"),
                 "internal_score": opp_ui.get("score") or opp_ui.get("internal_score"),
+                "lead_tier": opp_ui.get("lead_tier"),
                 "priority": opp_ui.get("priority"),
                 "status": opp_ui.get("status") or "New",
             }
-            ins = _insert_with_workspace_fallback(sb, "opportunities", opp_row)
-            if not ins.data or len(ins.data) == 0:
+            try:
+                existing_id = None
+                if opp_row.get("place_id") and effective_workspace_id:
+                    try:
+                        existing = (
+                            sb.table("opportunities")
+                            .select("id")
+                            .eq("workspace_id", effective_workspace_id)
+                            .eq("place_id", opp_row.get("place_id"))
+                            .limit(1)
+                            .execute()
+                        )
+                        if existing.data:
+                            existing_id = existing.data[0].get("id")
+                    except Exception:
+                        existing_id = None
+                if existing_id:
+                    ins = sb.table("opportunities").update(opp_row).eq("id", existing_id).execute()
+                    if not ins.data:
+                        ins = {"data": [{"id": existing_id}]}
+                else:
+                    ins = _insert_with_workspace_fallback(sb, "opportunities", opp_row)
+            except Exception as e:
+                msg = str(e).lower()
+                if any(
+                    k in msg
+                    for k in [
+                        "opportunity_score",
+                        "lead_tier",
+                        "place_id",
+                        "city",
+                        "state",
+                        "industry",
+                        "website_score",
+                    ]
+                ):
+                    legacy_opp = dict(opp_row)
+                    legacy_opp.pop("opportunity_score", None)
+                    legacy_opp.pop("lead_tier", None)
+                    legacy_opp.pop("place_id", None)
+                    legacy_opp.pop("city", None)
+                    legacy_opp.pop("state", None)
+                    legacy_opp.pop("industry", None)
+                    legacy_opp.pop("website_score", None)
+                    if existing_id:
+                        ins = sb.table("opportunities").update(legacy_opp).eq("id", existing_id).execute()
+                        if not ins.data:
+                            ins = {"data": [{"id": existing_id}]}
+                    else:
+                        ins = _insert_with_workspace_fallback(sb, "opportunities", legacy_opp)
+                else:
+                    raise
+            ins_data = ins.data if hasattr(ins, "data") else ins.get("data")
+            if not ins_data or len(ins_data) == 0:
                 continue
-            opp_id = ins.data[0]["id"]
+            opp_id = ins_data[0]["id"]
             case_path = CASES_DIR / f"{slug}.json"
             if case_path.exists():
                 with open(case_path, encoding="utf-8") as f:
                     case = json.load(f)
+                case = _apply_outreach_plan_limits(case, effective_workspace_plan)
                 cf_row = {
                     "opportunity_id": opp_id,
                     "workspace_id": effective_workspace_id,
@@ -318,6 +525,9 @@ def _sync_scout_to_supabase(user_id: str, workspace_id: str | None = None) -> No
                     "facebook": case.get("facebook"),
                     "instagram": case.get("instagram"),
                     "owner_manager_name": case.get("owner_manager_name"),
+                    "owner_name": case.get("owner_name"),
+                    "owner_title": case.get("owner_title"),
+                    "owner_source_page": case.get("owner_source_page"),
                     "platform_used": case.get("platform_used"),
                     "homepage_title": case.get("homepage_title"),
                     "meta_description": case.get("meta_description"),
@@ -327,37 +537,301 @@ def _sync_scout_to_supabase(user_id: str, workspace_id: str | None = None) -> No
                     "hours_visibility": str(case.get("hours_visibility")) if case.get("hours_visibility") is not None else None,
                     "directions_visibility": str(case.get("directions_visibility")) if case.get("directions_visibility") is not None else None,
                     "contact_form_present": case.get("contact_form_present"),
+                    "website_score": case.get("website_score"),
+                    "mobile_score": case.get("mobile_score"),
+                    "design_score": case.get("design_score"),
+                    "navigation_score": case.get("navigation_score"),
+                    "conversion_score": case.get("conversion_score"),
+                    "audit_issues": case.get("audit_issues") or [],
+                    "high_opportunity": bool(case.get("high_opportunity")),
                     "strongest_problems": case.get("strongest_problems"),
                     "short_email": case.get("short_email"),
                     "longer_email": case.get("longer_email"),
                     "contact_form_version": case.get("contact_form_version"),
                     "follow_up_note": case.get("follow_up_note"),
+                    "desktop_screenshot_url": case.get("desktop_screenshot_url"),
+                    "mobile_screenshot_url": case.get("mobile_screenshot_url"),
+                    "internal_screenshot_url": case.get("internal_screenshot_url"),
                     "outreach_notes": case.get("outreach_notes"),
                     "follow_up_due": case.get("follow_up_due"),
                     "outcome": case.get("outcome"),
                     "status": case.get("status") or "New",
                 }
-                _insert_with_workspace_fallback(sb, "case_files", cf_row)
+                try:
+                    _insert_with_workspace_fallback(sb, "case_files", cf_row)
+                except Exception as e:
+                    msg = str(e).lower()
+                    if any(
+                        k in msg
+                        for k in [
+                            "desktop_screenshot_url",
+                            "mobile_screenshot_url",
+                            "internal_screenshot_url",
+                            "owner_name",
+                            "owner_title",
+                            "owner_source_page",
+                            "website_score",
+                            "mobile_score",
+                            "design_score",
+                            "navigation_score",
+                            "conversion_score",
+                            "audit_issues",
+                            "high_opportunity",
+                        ]
+                    ):
+                        legacy_cf = dict(cf_row)
+                        legacy_cf.pop("desktop_screenshot_url", None)
+                        legacy_cf.pop("mobile_screenshot_url", None)
+                        legacy_cf.pop("internal_screenshot_url", None)
+                        legacy_cf.pop("owner_name", None)
+                        legacy_cf.pop("owner_title", None)
+                        legacy_cf.pop("owner_source_page", None)
+                        legacy_cf.pop("website_score", None)
+                        legacy_cf.pop("mobile_score", None)
+                        legacy_cf.pop("design_score", None)
+                        legacy_cf.pop("navigation_score", None)
+                        legacy_cf.pop("conversion_score", None)
+                        legacy_cf.pop("audit_issues", None)
+                        legacy_cf.pop("high_opportunity", None)
+                        _insert_with_workspace_fallback(sb, "case_files", legacy_cf)
+                    else:
+                        raise
     except Exception as e:
         print(f"  [Scout] Supabase sync error: {e}", file=sys.stderr)
         raise
+
+
+def _record_scout_run_supabase(
+    user_id: str,
+    workspace_id: str | None,
+    today: dict | None,
+    opportunities: list | None,
+) -> None:
+    if not _supabase_url or not _supabase_service_key:
+        return
+    try:
+        from supabase import create_client
+        sb = create_client(_supabase_url, _supabase_service_key)
+        opps = opportunities or []
+        summary = (today or {}).get("summary") or ""
+        processed_count = int((today or {}).get("processed_count") or len(opps))
+        saved_count = int((today or {}).get("saved_count") or len(opps))
+        skipped_count = int((today or {}).get("skipped_count") or max(0, processed_count - saved_count))
+        no_website_count = int((today or {}).get("no_website") or len([o for o in opps if o.get("no_website") or o.get("lane") == "no_website"]))
+        weak_websites_count = int((today or {}).get("weak_websites") or max(0, len(opps) - no_website_count))
+        strong_opportunities = int(
+            len(
+                [
+                    o
+                    for o in opps
+                    if float(o.get("opportunity_score") or o.get("score") or o.get("internal_score") or 0) >= 70
+                ]
+            )
+        )
+        businesses_discovered = int((today or {}).get("businesses_discovered") or len(opps))
+        analyzed_total = int((today or {}).get("processed_count") or len(opps))
+        high_opportunity_total = int(strong_opportunities)
+        leads_found = int((today or {}).get("leads_found") or len(opps))
+        run_date = datetime.now().date().isoformat()
+        row = {
+            "user_id": user_id,
+            "workspace_id": workspace_id,
+            "run_date": run_date,
+            "run_time": datetime.now(timezone.utc).isoformat(),
+            "summary": summary,
+            "processed_count": processed_count,
+            "saved_count": saved_count,
+            "skipped_count": skipped_count,
+            "businesses_discovered": businesses_discovered,
+            "analyzed_total": analyzed_total,
+            "high_opportunity_total": high_opportunity_total,
+            "leads_found": leads_found,
+            "strong_opportunities": strong_opportunities,
+            "weak_websites": weak_websites_count,
+            "no_website": no_website_count,
+        }
+        try:
+            _insert_with_workspace_fallback(sb, "scout_runs", row)
+        except Exception as e:
+            msg = str(e).lower()
+            if any(
+                k in msg
+                for k in [
+                    "run_date",
+                    "run_time",
+                    "businesses_discovered",
+                    "analyzed_total",
+                    "high_opportunity_total",
+                    "leads_found",
+                    "strong_opportunities",
+                    "weak_websites",
+                    "no_website",
+                ]
+            ):
+                legacy = dict(row)
+                legacy.pop("run_date", None)
+                legacy.pop("run_time", None)
+                legacy.pop("businesses_discovered", None)
+                legacy.pop("analyzed_total", None)
+                legacy.pop("high_opportunity_total", None)
+                legacy.pop("leads_found", None)
+                legacy.pop("strong_opportunities", None)
+                legacy.pop("weak_websites", None)
+                legacy.pop("no_website", None)
+                _insert_with_workspace_fallback(sb, "scout_runs", legacy)
+            else:
+                raise
+        print(f"  leads discovered: {leads_found}")
+        print("  scout run stored")
+    except Exception as e:
+        print(f"  [Scout] scout_runs insert error: {e}", file=sys.stderr)
+
+
+def _upsert_job_supabase(job: dict) -> None:
+    if not _supabase_url or not _supabase_service_key:
+        return
+    try:
+        from supabase import create_client
+        sb = create_client(_supabase_url, _supabase_service_key)
+        row = {
+            "id": job.get("id"),
+            "workspace_id": job.get("workspace_id"),
+            "type": job.get("type"),
+            "status": job.get("status"),
+            "progress": int(job.get("progress") or 0),
+            "payload": job.get("payload") or {},
+            "result_summary": job.get("result_summary"),
+            "error": job.get("error"),
+            "created_at": job.get("created_at"),
+            "started_at": job.get("started_at"),
+            "finished_at": job.get("finished_at"),
+        }
+        sb.table("jobs").upsert(row, on_conflict="id").execute()
+    except Exception:
+        # Keep async jobs running even when jobs table is not migrated yet.
+        return
+
+
+def _load_job_from_supabase(job_id: str, workspace_id: str | None = None) -> dict | None:
+    if not _supabase_url or not _supabase_service_key:
+        return None
+    try:
+        from supabase import create_client
+        sb = create_client(_supabase_url, _supabase_service_key)
+        query = sb.table("jobs").select("*").eq("id", job_id).limit(1)
+        if workspace_id:
+            query = query.eq("workspace_id", workspace_id)
+        res = query.execute()
+        if not res.data:
+            return None
+        row = res.data[0]
+        return {
+            "id": row.get("id"),
+            "workspace_id": row.get("workspace_id"),
+            "type": row.get("type"),
+            "status": row.get("status"),
+            "progress": int(row.get("progress") or 0),
+            "payload": row.get("payload") or {},
+            "result_summary": row.get("result_summary"),
+            "error": row.get("error"),
+            "created_at": row.get("created_at"),
+            "started_at": row.get("started_at"),
+            "finished_at": row.get("finished_at"),
+        }
+    except Exception:
+        return None
+
+
+def _job_progress(job_id: str, progress: int, status: str | None = None, result_summary: str | None = None) -> None:
+    updates: dict = {"progress": max(0, min(100, int(progress)))}
+    if status:
+        updates["status"] = status
+    if result_summary is not None:
+        updates["result_summary"] = result_summary
+    job = _job_update(job_id, **updates)
+    if job:
+        print("  scout job progress updated")
+        _upsert_job_supabase(job)
+
+
+def _execute_scout_job(
+    job_id: str,
+    user_id: str | None,
+    workspace_id: str | None,
+    workspace_plan: str,
+    current_lat: float | None,
+    current_lng: float | None,
+) -> None:
+    job = _job_update(
+        job_id,
+        status="running",
+        started_at=_job_now_iso(),
+        progress=5,
+        result_summary="Morning scout started",
+    )
+    if job:
+        print("  scout job started")
+        _upsert_job_supabase(job)
+    try:
+        _job_progress(job_id, 20, status="running", result_summary="Discovery in progress")
+        _run_morning_runner(current_lat=current_lat, current_lng=current_lng)
+        _job_progress(job_id, 65, status="running", result_summary="Discovery completed, loading analysis")
+
+        data = _load_scout_data()
+        today = data["today"]
+        opportunities = data["opportunities"]
+        _append_history(len(opportunities), today.get("summary", ""))
+        _job_progress(job_id, 80, status="running", result_summary="Analysis completed, syncing results")
+
+        if user_id and _supabase_url and _supabase_service_key:
+            _sync_scout_to_supabase(user_id, workspace_id=workspace_id, workspace_plan=workspace_plan)
+            _record_scout_run_supabase(user_id, workspace_id, today, opportunities)
+
+        processed = int((today or {}).get("processed_count") or len(opportunities))
+        saved = int((today or {}).get("saved_count") or len(opportunities))
+        skipped = int((today or {}).get("skipped_count") or max(0, processed - saved))
+        summary = (
+            f"Scout complete — {len(opportunities)} leads discovered. "
+            f"Processed {processed}, saved {saved}, skipped {skipped}."
+        )
+        finished = _job_update(
+            job_id,
+            status="completed",
+            progress=100,
+            result_summary=summary,
+            finished_at=_job_now_iso(),
+            error=None,
+        )
+        if finished:
+            print("  scout job finished")
+            _upsert_job_supabase(finished)
+    except Exception as e:
+        failed = _job_update(
+            job_id,
+            status="failed",
+            progress=100,
+            error=str(e),
+            finished_at=_job_now_iso(),
+            result_summary="Scout job failed",
+        )
+        print("  scout job failed")
+        if failed:
+            _upsert_job_supabase(failed)
 
 
 def _is_ignored_lead_status(status: str | None) -> bool:
     raw = (status or "").strip().lower()
     ignored = {
         "closed",
-        "contacted",
-        "not interested",
         "do not contact",
-        "skip",
+        "do_not_contact",
     }
     return raw in ignored
 
 
 def _lead_rank(row: dict) -> float:
     lane = (row.get("lane") or "").strip().lower()
-    score = float(row.get("internal_score") or 0)
+    score = float(row.get("opportunity_score") or row.get("internal_score") or 0)
     review_count = int(row.get("review_count") or 0)
     rating = float(row.get("rating") or 0) if row.get("rating") is not None else 0.0
     distance = row.get("distance_miles")
@@ -408,17 +882,35 @@ def getTopOpportunities(workspace_id: str | None):
                 query = query.eq("workspace_id", workspace_id)
             res = query.execute()
             rows = res.data or []
+            linked_opp_ids = set()
+            crm_sb = _create_crm_client()
+            if crm_sb is not None and workspace_id:
+                linked_opp_ids = _crm_linked_opportunity_ids_for_workspace(crm_sb, workspace_id)
 
-            filtered = [r for r in rows if not _is_ignored_lead_status(r.get("status"))]
-            ranked = sorted(filtered, key=_lead_rank, reverse=True)[:5]
+            filtered = [
+                r
+                for r in rows
+                if not _is_ignored_lead_status(r.get("status"))
+                and str(r.get("id") or "") not in linked_opp_ids
+            ]
+            ranked = sorted(
+                filtered,
+                key=lambda r: float(r.get("opportunity_score") or r.get("internal_score") or 0),
+                reverse=True,
+            )[:5]
             leads = [
                 {
                     "business_name": r.get("business_name"),
                     "category": r.get("category"),
                     "distance": r.get("distance_miles"),
-                    "score": r.get("internal_score"),
+                    "score": r.get("opportunity_score") if r.get("opportunity_score") is not None else r.get("internal_score"),
+                    "rating": r.get("rating"),
+                    "review_count": r.get("review_count"),
+                    "lead_tier": r.get("lead_tier"),
+                    "city": r.get("city") or r.get("address"),
                     "lane": "no_website" if r.get("no_website") else (r.get("lane") or "weak_website"),
                     "best_contact_method": r.get("recommended_contact_method") or r.get("backup_contact_method"),
+                    "opportunity_signals": r.get("opportunity_signals") or [],
                     "slug": r.get("id"),
                 }
                 for r in ranked
@@ -439,15 +931,24 @@ def getTopOpportunities(workspace_id: str | None):
             except Exception:
                 continue
         filtered = [r for r in rows if not _is_ignored_lead_status(r.get("status"))]
-        ranked = sorted(filtered, key=_lead_rank, reverse=True)[:5]
+        ranked = sorted(
+            filtered,
+            key=lambda r: float(r.get("opportunity_score") or r.get("internal_score") or 0),
+            reverse=True,
+        )[:5]
         leads = [
             {
                 "business_name": r.get("business_name"),
                 "category": r.get("category"),
                 "distance": r.get("distance_miles"),
-                "score": r.get("internal_score"),
+                "score": r.get("opportunity_score") if r.get("opportunity_score") is not None else r.get("internal_score"),
+                "rating": r.get("rating"),
+                "review_count": r.get("review_count"),
+                "lead_tier": r.get("lead_tier"),
+                "city": r.get("city") or r.get("address"),
                 "lane": "no_website" if r.get("no_website") else (r.get("lane") or "weak_website"),
                 "best_contact_method": r.get("recommended_contact_method") or r.get("backup_contact_method"),
+                "opportunity_signals": r.get("opportunity_signals") or [],
                 "slug": r.get("id"),
             }
             for r in ranked
@@ -628,8 +1129,9 @@ def sendLeadBriefingEmail(user: dict, summary: dict):
     top_lines = []
     for lead in top[:5]:
         lane = "No Website" if str(lead.get("lane") or "") == "no_website" else "Weak Website"
+        city = lead.get("city") or "Unknown city"
         top_lines.append(
-            f"- {lead.get('business_name') or 'Lead'} | {lane} | Score {lead.get('score') or 0} | "
+            f"- {lead.get('business_name') or 'Lead'} | {city} | {lane} | Score {lead.get('score') or 0} | "
             f"{lead.get('best_contact_method') or 'Contact unknown'}"
         )
 
@@ -683,6 +1185,176 @@ def sendLeadBriefingEmail(user: dict, summary: dict):
     return False
 
 
+def _send_resend_email(to_email: str, subject: str, body: str):
+    if not _resend_api_key:
+        raise RuntimeError("RESEND_API_KEY is not configured")
+    from_email = (os.environ.get("OUTREACH_FROM_EMAIL") or _resend_from_email or "").strip()
+    from_name = (os.environ.get("OUTREACH_FROM_NAME") or "Scout-Brain").strip()
+    if not from_email:
+        raise RuntimeError("OUTREACH_FROM_EMAIL is not configured")
+    html_body = "<br/>".join((body or "").splitlines())
+    payload = {
+        "from": f"{from_name} <{from_email}>",
+        "to": [to_email],
+        "subject": subject,
+        "html": f"<div>{html_body}</div>",
+        "text": body,
+    }
+    req = urllib_request.Request(
+        "https://api.resend.com/emails",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {_resend_api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib_request.urlopen(req, timeout=20) as resp:
+        status_code = getattr(resp, "status", 200)
+        raw = resp.read().decode("utf-8", errors="ignore")
+        parsed = {}
+        try:
+            parsed = json.loads(raw) if raw else {}
+        except Exception:
+            parsed = {}
+        if not (200 <= status_code < 300):
+            raise RuntimeError(f"email_send_failed_http_{status_code}")
+        return {"provider_message_id": parsed.get("id"), "provider_raw": parsed}
+
+
+def _insert_email_event(crm_sb, row: dict):
+    try:
+        crm_sb.table("email_events").insert(row).execute()
+    except Exception as e:
+        # Keep sends resilient if table is not migrated yet.
+        print(f"  [Scout] email_events insert skipped: {e}", file=sys.stderr)
+
+
+def _crm_fetch_lead(crm_sb, lead_id: str, user_id: str | None):
+    q = crm_sb.table(CRM_LEADS_TABLE).select("*").eq("id", lead_id).limit(1)
+    if user_id:
+        q = q.eq("owner_id", user_id)
+    res = q.execute()
+    rows = res.data or []
+    return rows[0] if rows else None
+
+
+def _mark_lead_contacted_after_email(crm_sb, lead: dict, message_type: str):
+    now = datetime.now(timezone.utc)
+    is_follow_up = str(message_type or "").strip().lower() in {"follow_up", "follow-up", "followup"}
+    next_days = 7 if is_follow_up else 4
+    next_follow_up = now + timedelta(days=next_days)
+    current_status = str(lead.get("status") or "").strip().lower()
+    updates = {
+        "last_contacted_at": now.isoformat(),
+        "next_follow_up_at": next_follow_up.isoformat(),
+    }
+    if current_status == "new":
+        updates["status"] = "contacted"
+        print("  lead marked contacted")
+    elif current_status == "follow_up_due":
+        updates["status"] = "contacted"
+    if is_follow_up:
+        updates["follow_up_count"] = int(lead.get("follow_up_count") or 0) + 1
+    crm_sb.table(CRM_LEADS_TABLE).update(updates).eq("id", lead.get("id")).execute()
+    return updates
+
+
+def _load_outreach_template_for_opportunity(linked_opportunity_id: str, workspace_id: str | None = None) -> dict:
+    if not linked_opportunity_id:
+        return {}
+    if not _supabase_url or not _supabase_service_key:
+        return {}
+    try:
+        from supabase import create_client
+        sb = create_client(_supabase_url, _supabase_service_key)
+
+        case_row = None
+        case_queries = [
+            lambda: (
+                sb.table("case_files")
+                .select(
+                    "opportunity_id,short_email,longer_email,contact_form_version,social_dm_version,follow_up_note,owner_name,owner_manager_name"
+                )
+                .eq("opportunity_id", linked_opportunity_id)
+                .eq("workspace_id", workspace_id)
+                .limit(1)
+                .execute()
+            ),
+            lambda: (
+                sb.table("case_files")
+                .select(
+                    "opportunity_id,short_email,longer_email,contact_form_version,social_dm_version,follow_up_note,owner_name,owner_manager_name"
+                )
+                .eq("opportunity_id", linked_opportunity_id)
+                .limit(1)
+                .execute()
+            ),
+        ]
+        for q in case_queries:
+            try:
+                res = q()
+                rows = res.data or []
+                if rows:
+                    case_row = rows[0]
+                    break
+            except Exception:
+                continue
+
+        opp_row = None
+        opp_queries = [
+            lambda: (
+                sb.table("opportunities")
+                .select("id,business_name,lane,opportunity_score,strongest_pitch_angle")
+                .eq("id", linked_opportunity_id)
+                .eq("workspace_id", workspace_id)
+                .limit(1)
+                .execute()
+            ),
+            lambda: (
+                sb.table("opportunities")
+                .select("id,business_name,lane,opportunity_score,strongest_pitch_angle")
+                .eq("id", linked_opportunity_id)
+                .limit(1)
+                .execute()
+            ),
+        ]
+        for q in opp_queries:
+            try:
+                res = q()
+                rows = res.data or []
+                if rows:
+                    opp_row = rows[0]
+                    break
+            except Exception:
+                continue
+
+        owner_name = ""
+        if case_row:
+            owner_name = str(
+                case_row.get("owner_name") or case_row.get("owner_manager_name") or ""
+            ).strip()
+
+        return {
+            "linked_opportunity_id": linked_opportunity_id,
+            "short_email": (case_row or {}).get("short_email"),
+            "longer_email": (case_row or {}).get("longer_email"),
+            "contact_form_version": (case_row or {}).get("contact_form_version"),
+            "social_dm_version": (case_row or {}).get("social_dm_version"),
+            "follow_up_note": (case_row or {}).get("follow_up_note"),
+            "metadata": {
+                "business_name": (opp_row or {}).get("business_name"),
+                "owner_name": owner_name or None,
+                "lane": (opp_row or {}).get("lane"),
+                "score": (opp_row or {}).get("opportunity_score"),
+                "strongest_pitch_angle": (opp_row or {}).get("strongest_pitch_angle"),
+            },
+        }
+    except Exception as e:
+        print(f"  [Scout] outreach template load failed: {e}", file=sys.stderr)
+        return {}
+
+
 def _frequency_allows_send(settings: dict) -> bool:
     if not settings.get("email_notifications_enabled"):
         return False
@@ -700,11 +1372,18 @@ def _send_workspace_briefing_if_enabled(sb, owner_user: dict, workspace: dict) -
     if not workspace_id or not user_id:
         return
     settings = _load_user_settings(sb, user_id, workspace_id)
+    plan = _normalize_plan(workspace.get("plan"))
+    if not _plan_limits(plan).get("daily_email_briefing", True):
+        print("  email alerts disabled")
+        return
     if not _frequency_allows_send(settings):
         print("  email alerts disabled")
         return
 
     summary = _build_lead_briefing_summary(sb, workspace_id, workspace.get("name"))
+    if int(len(summary.get("top_opportunities") or [])) < 1:
+        print("  email alerts disabled")
+        return
     if not settings.get("include_new_leads"):
         summary["new_leads"] = 0
     if not settings.get("include_followups"):
@@ -714,21 +1393,414 @@ def _send_workspace_briefing_if_enabled(sb, owner_user: dict, workspace: dict) -
     sendLeadBriefingEmail(owner_user, summary)
 
 
-def _run_scheduled_scout_job():
+def _normalize_text(value) -> str:
+    return str(value or "").strip().lower()
+
+
+def _normalize_website(value) -> str:
+    site = _normalize_text(value)
+    if site.startswith("https://"):
+        site = site[8:]
+    elif site.startswith("http://"):
+        site = site[7:]
+    return site.rstrip("/")
+
+
+def _normalize_phone(value) -> str:
+    raw = str(value or "")
+    digits = [c for c in raw if c.isdigit()]
+    if len(digits) == 11 and digits[0] == "1":
+        digits = digits[1:]
+    return "".join(digits)
+
+
+def _is_closed_or_dnc(status_text: str) -> bool:
+    s = _normalize_text(status_text)
+    if not s:
+        return False
+    blocked_tokens = {
+        "closed",
+        "do_not_contact",
+        "do not contact",
+        "dnc",
+        "unqualified",
+        "lost",
+    }
+    return any(token in s for token in blocked_tokens)
+
+
+def _lane_priority(lane: str) -> int:
+    key = _normalize_text(lane)
+    if key == "no_website":
+        return 0
+    if key == "weak_website":
+        return 1
+    return 2
+
+
+def _build_name_address_key(business_name: str, address: str) -> str:
+    return f"{_normalize_text(business_name)}|{_normalize_text(address)}"
+
+
+def _create_crm_client():
+    if not CRM_SUPABASE_URL or not CRM_SUPABASE_SERVICE_ROLE_KEY:
+        return None
+    try:
+        from supabase import create_client
+        return create_client(CRM_SUPABASE_URL, CRM_SUPABASE_SERVICE_ROLE_KEY)
+    except Exception:
+        return None
+
+
+def _load_existing_crm_leads_for_owner(crm_sb, owner_id: str) -> list[dict]:
+    select_sets = [
+        "id,business_name,address,phone,website,place_id,status,linked_opportunity_id",
+        "id,business_name,phone,website,status,linked_opportunity_id",
+    ]
+    for cols in select_sets:
+        try:
+            rows = (
+                crm_sb.table(CRM_LEADS_TABLE)
+                .select(cols)
+                .eq("owner_id", owner_id)
+                .limit(5000)
+                .execute()
+            )
+            return rows.data or []
+        except Exception:
+            continue
+    return []
+
+
+def _crm_linked_opportunity_ids_for_workspace(crm_sb, workspace_id: str) -> set[str]:
+    if not workspace_id:
+        return set()
+    select_sets = [
+        "linked_opportunity_id,status",
+        "linked_opportunity_id",
+    ]
+    for cols in select_sets:
+        try:
+            rows = (
+                crm_sb.table(CRM_LEADS_TABLE)
+                .select(cols)
+                .eq("workspace_id", workspace_id)
+                .limit(5000)
+                .execute()
+            )
+            linked = set()
+            for row in rows.data or []:
+                linked_id = str(row.get("linked_opportunity_id") or "").strip()
+                if not linked_id:
+                    continue
+                linked.add(linked_id)
+            return linked
+        except Exception:
+            continue
+    return set()
+
+
+def _case_map_for_workspace(sb, workspace_id: str, opp_ids: list[str]) -> dict:
+    if not opp_ids:
+        return {}
+    queries = [
+        lambda: (
+            sb.table("case_files")
+            .select(
+                "opportunity_id,email,contact_page,phone_from_site,facebook,instagram,status,outcome"
+            )
+            .eq("workspace_id", workspace_id)
+            .in_("opportunity_id", opp_ids)
+            .execute()
+        ),
+        lambda: (
+            sb.table("case_files")
+            .select(
+                "opportunity_id,email,contact_page,phone_from_site,facebook,instagram,status,outcome"
+            )
+            .in_("opportunity_id", opp_ids)
+            .execute()
+        ),
+    ]
+    data = []
+    for q in queries:
+        try:
+            res = q()
+            data = res.data or []
+            break
+        except Exception:
+            continue
+    return {str(row.get("opportunity_id")): row for row in data if row.get("opportunity_id")}
+
+
+def _opportunity_has_contact_path(opp: dict, case: dict | None) -> bool:
+    case = case or {}
+    checks = [
+        opp.get("phone"),
+        opp.get("website"),
+        opp.get("recommended_contact_method"),
+        opp.get("backup_contact_method"),
+        case.get("email"),
+        case.get("contact_page"),
+        case.get("phone_from_site"),
+        case.get("facebook"),
+        case.get("instagram"),
+    ]
+    return any(str(v or "").strip() for v in checks)
+
+
+def _insert_crm_lead(crm_sb, row: dict) -> bool:
+    try:
+        crm_sb.table(CRM_LEADS_TABLE).insert(row).execute()
+        return True
+    except Exception as e:
+        # Schema fallback for older CRM deployments that have fewer intake columns.
+        if "column" not in str(e).lower():
+            raise
+        minimal = {
+            "owner_id": row.get("owner_id"),
+            "business_name": row.get("business_name"),
+            "contact_name": row.get("contact_name"),
+            "email": row.get("email"),
+            "phone": row.get("phone"),
+            "website": row.get("website"),
+            "industry": row.get("industry"),
+            "lead_source": row.get("lead_source"),
+            "status": row.get("status"),
+            "notes": row.get("notes"),
+        }
+        crm_sb.table(CRM_LEADS_TABLE).insert(minimal).execute()
+        return True
+
+
+def _refresh_workspace_followups(crm_sb, workspace_id: str, owner_id: str) -> None:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        crm_sb.table(CRM_LEADS_TABLE).update({"status": "follow_up_due"}).eq(
+            "owner_id", owner_id
+        ).eq("workspace_id", workspace_id).in_(
+            "status", ["contacted", "replied"]
+        ).lte("next_follow_up_at", now_iso).execute()
+    except Exception:
+        try:
+            crm_sb.table(CRM_LEADS_TABLE).update({"status": "follow_up_due"}).eq(
+                "owner_id", owner_id
+            ).in_("status", ["contacted", "replied"]).lte("next_follow_up_at", now_iso).execute()
+        except Exception:
+            pass
+
+
+def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str) -> dict:
+    stats = {
+        "evaluated": 0,
+        "created": 0,
+        "duplicate": 0,
+        "filtered": 0,
+        "top_contacts": [],
+    }
+    workspace_id = str(workspace.get("id") or "").strip()
+    if not CRM_AUTO_INTAKE_ENABLED or not workspace_id or not owner_id:
+        return stats
+
+    crm_sb = _create_crm_client()
+    if crm_sb is None:
+        print("  [Scout] crm intake skipped: CRM Supabase not configured")
+        return stats
+
+    _refresh_workspace_followups(crm_sb, workspace_id, owner_id)
+    print("  evaluating opportunities for CRM intake")
+    try:
+        opportunities = (
+            sb.table("opportunities")
+            .select(
+                "id,workspace_id,business_name,category,lane,address,phone,website,place_id,"
+                "recommended_contact_method,backup_contact_method,opportunity_score,status"
+            )
+            .eq("workspace_id", workspace_id)
+            .gte("opportunity_score", CRM_INTAKE_MIN_SCORE)
+            .order("opportunity_score", desc=True)
+            .limit(CRM_INTAKE_MAX_CANDIDATES)
+            .execute()
+            .data
+            or []
+        )
+    except Exception as e:
+        print(f"  [Scout] crm intake query failed: {e}", file=sys.stderr)
+        return stats
+
+    if not opportunities:
+        print("  morning intake complete (no qualifying opportunities)")
+        return stats
+
+    opp_ids = [str(opp.get("id")) for opp in opportunities if opp.get("id")]
+    case_by_opp = _case_map_for_workspace(sb, workspace_id, opp_ids)
+    existing = _load_existing_crm_leads_for_owner(crm_sb, owner_id)
+
+    existing_place_ids = {
+        _normalize_text(row.get("place_id")) for row in existing if _normalize_text(row.get("place_id"))
+    }
+    existing_websites = {
+        _normalize_website(row.get("website")) for row in existing if _normalize_website(row.get("website"))
+    }
+    existing_phones = {
+        _normalize_phone(row.get("phone")) for row in existing if _normalize_phone(row.get("phone"))
+    }
+    existing_name_addr = {
+        _build_name_address_key(row.get("business_name"), row.get("address"))
+        for row in existing
+        if _normalize_text(row.get("business_name"))
+    }
+    existing_linked_opps = {
+        str(row.get("linked_opportunity_id") or "").strip()
+        for row in existing
+        if str(row.get("linked_opportunity_id") or "").strip()
+    }
+
+    candidates: list[dict] = []
+    for opp in opportunities:
+        stats["evaluated"] += 1
+        case = case_by_opp.get(str(opp.get("id"))) or {}
+
+        status_tokens = " ".join(
+            [
+                str(opp.get("status") or ""),
+                str(case.get("status") or ""),
+                str(case.get("outcome") or ""),
+            ]
+        )
+        if _is_closed_or_dnc(status_tokens):
+            stats["filtered"] += 1
+            continue
+
+        if not _opportunity_has_contact_path(opp, case):
+            stats["filtered"] += 1
+            continue
+
+        candidates.append({"opp": opp, "case": case})
+
+    candidates.sort(
+        key=lambda item: (
+            _lane_priority(item["opp"].get("lane")),
+            -float(item["opp"].get("opportunity_score") or 0),
+        )
+    )
+
+    for item in candidates:
+        opp = item["opp"]
+        case = item["case"] or {}
+        opp_id = str(opp.get("id") or "").strip()
+
+        if opp_id and opp_id in existing_linked_opps:
+            stats["duplicate"] += 1
+            print("  duplicate crm lead skipped")
+            continue
+
+        place_key = _normalize_text(opp.get("place_id"))
+        site_key = _normalize_website(opp.get("website"))
+        phone_key = _normalize_phone(opp.get("phone") or case.get("phone_from_site"))
+        name_addr_key = _build_name_address_key(opp.get("business_name"), opp.get("address"))
+
+        is_duplicate = (
+            (place_key and place_key in existing_place_ids)
+            or (site_key and site_key in existing_websites)
+            or (phone_key and phone_key in existing_phones)
+            or (name_addr_key and name_addr_key in existing_name_addr)
+        )
+        if is_duplicate:
+            stats["duplicate"] += 1
+            print("  duplicate crm lead skipped")
+            continue
+
+        best_contact = (
+            str(opp.get("recommended_contact_method") or "").strip()
+            or str(opp.get("backup_contact_method") or "").strip()
+            or "website"
+        )
+        score = float(opp.get("opportunity_score") or 0)
+        business_name = str(opp.get("business_name") or "").strip()
+        if not business_name:
+            stats["filtered"] += 1
+            continue
+
+        row = {
+            "owner_id": owner_id,
+            "workspace_id": workspace_id,
+            "linked_opportunity_id": opp.get("id"),
+            "business_name": business_name,
+            "contact_name": None,
+            "email": case.get("email"),
+            "phone": opp.get("phone") or case.get("phone_from_site"),
+            "website": opp.get("website"),
+            "industry": opp.get("category"),
+            "lead_source": "scout-brain",
+            "address": opp.get("address"),
+            "place_id": opp.get("place_id"),
+            "best_contact_method": best_contact,
+            "opportunity_score": score,
+            "auto_intake": True,
+            "status": "new",
+            "notes": f"Auto-added from Scout-Brain (lane: {opp.get('lane') or 'unknown'}).",
+        }
+        try:
+            _insert_crm_lead(crm_sb, row)
+            stats["created"] += 1
+            print("  crm lead created from scout opportunity")
+            if len(stats["top_contacts"]) < 5:
+                stats["top_contacts"].append(
+                    {
+                        "business_name": business_name,
+                        "score": score,
+                        "best_contact_method": best_contact,
+                    }
+                )
+            if place_key:
+                existing_place_ids.add(place_key)
+            if site_key:
+                existing_websites.add(site_key)
+            if phone_key:
+                existing_phones.add(phone_key)
+            if name_addr_key:
+                existing_name_addr.add(name_addr_key)
+            if opp_id:
+                existing_linked_opps.add(opp_id)
+        except Exception as e:
+            print(f"  [Scout] crm intake insert failed: {e}", file=sys.stderr)
+
+    print(
+        "  morning intake complete "
+        f"(evaluated={stats['evaluated']}, created={stats['created']}, "
+        f"duplicate={stats['duplicate']}, filtered={stats['filtered']})"
+    )
+    return stats
+
+
+def daily_scout_job():
     if not _supabase_url or not _supabase_service_key:
         return
-    print("  scheduled scout starting")
+    print("  morning scout started")
     try:
         from supabase import create_client
         sb = create_client(_supabase_url, _supabase_service_key)
         _run_morning_runner()
+        print("  discovery completed")
+        print("  analysis completed")
 
-        workspaces = sb.table("workspaces").select("id,name,owner_user_id").execute().data or []
+        workspaces = sb.table("workspaces").select("id,name,owner_user_id,plan").execute().data or []
+        if SCHEDULED_SCOUT_SCOPE == "internal":
+            scoped = [
+                w for w in workspaces
+                if str((w.get("name") or "")).strip().lower() == SCHEDULED_SCOUT_WORKSPACE_NAME.lower()
+            ]
+            workspaces = scoped
+
         for ws in workspaces:
             owner_id = ws.get("owner_user_id")
             if not owner_id:
                 continue
             _sync_scout_to_supabase(owner_id, workspace_id=ws.get("id"))
+            data = _load_scout_data()
+            _record_scout_run_supabase(owner_id, ws.get("id"), data.get("today"), data.get("opportunities"))
+            _run_workspace_crm_intake(sb, ws, owner_id)
             user_rows = (
                 sb.table("profiles")
                 .select("id,email,display_name")
@@ -742,8 +1814,9 @@ def _run_scheduled_scout_job():
                 _send_workspace_briefing_if_enabled(sb, user_rows[0], ws)
 
         print("  scheduled scout finished")
+        print("  morning scout finished")
     except Exception as e:
-        print(f"  [Scout] scheduled scout error: {e}", file=sys.stderr)
+        print(f"  [Scout] morning scout error: {e}", file=sys.stderr)
 
 
 def _bootstrap_workspace_for_user(sb, user_id: str) -> dict:
@@ -780,7 +1853,7 @@ def _bootstrap_workspace_for_user(sb, user_id: str) -> dict:
 
     created_ws = (
         sb.table("workspaces")
-        .insert({"name": workspace_name, "owner_user_id": user_id, "plan": None})
+        .insert({"name": workspace_name, "owner_user_id": user_id, "plan": "free"})
         .execute()
     )
     if not created_ws.data:
@@ -877,8 +1950,104 @@ def get_scout_data():
 @app.get("/top-opportunities")
 def get_top_opportunities(request: Request):
     workspace_id = _get_workspace_id_from_request(request)
+    user_id = _get_user_id_from_request(request)
+    if user_id and _supabase_url and _supabase_service_key:
+        try:
+            from supabase import create_client
+            sb = create_client(_supabase_url, _supabase_service_key)
+            workspace = _get_workspace_for_user(sb, user_id, workspace_id)
+            plan = workspace.get("plan") or "free"
+            if not _plan_limits(plan).get("top_opportunities_dashboard", True):
+                print("  upgrade prompt shown")
+                return {"leads": [], "plan_notice": _plan_limit_message(), "plan": plan}
+            workspace_id = workspace.get("id")
+        except Exception:
+            pass
     leads = getTopOpportunities(workspace_id)
     return {"leads": leads}
+
+
+@app.get("/opportunities/search")
+def search_opportunities(
+    request: Request,
+    city: str | None = None,
+    state: str | None = None,
+    industry: str | None = None,
+    website_score: float | None = None,
+    rating: float | None = None,
+    limit: int = 100,
+):
+    workspace_id = _get_workspace_id_from_request(request)
+    user_id = _get_user_id_from_request(request)
+
+    def _row_matches(row: dict) -> bool:
+        if city and city.lower() not in str(row.get("city") or "").lower():
+            return False
+        if state and state.lower() not in str(row.get("state") or "").lower():
+            return False
+        if industry and industry.lower() not in str(row.get("industry") or row.get("category") or "").lower():
+            return False
+        if website_score is not None:
+            try:
+                ws = float(row.get("website_score"))
+                if ws > float(website_score):
+                    return False
+            except Exception:
+                return False
+        if rating is not None:
+            try:
+                rv = float(row.get("rating"))
+                if rv < float(rating):
+                    return False
+            except Exception:
+                return False
+        return True
+
+    rows: list[dict] = []
+    if _supabase_url and _supabase_service_key:
+        try:
+            from supabase import create_client
+            sb = create_client(_supabase_url, _supabase_service_key)
+            if user_id:
+                try:
+                    ws = _get_workspace_for_user(sb, user_id, workspace_id)
+                    workspace_id = ws.get("id")
+                except Exception:
+                    pass
+            query = sb.table("opportunities").select("*")
+            if workspace_id:
+                query = query.eq("workspace_id", workspace_id)
+            if city:
+                query = query.ilike("city", f"%{city}%")
+            if state:
+                query = query.ilike("state", f"%{state}%")
+            if industry:
+                query = query.or_(f"industry.ilike.%{industry}%,category.ilike.%{industry}%")
+            if website_score is not None:
+                query = query.lte("website_score", float(website_score))
+            if rating is not None:
+                query = query.gte("rating", float(rating))
+            res = query.limit(max(1, min(500, int(limit)))).execute()
+            rows = res.data or []
+        except Exception:
+            rows = []
+
+    if not rows and CASES_DIR.is_dir():
+        for path in CASES_DIR.glob("*.json"):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    row = json.load(f)
+                if _row_matches(row):
+                    rows.append(row)
+            except Exception:
+                continue
+
+    ranked = sorted(
+        rows,
+        key=lambda r: float(r.get("opportunity_score") or r.get("internal_score") or 0),
+        reverse=True,
+    )[: max(1, min(500, int(limit)))]
+    return {"count": len(ranked), "opportunities": ranked}
 
 
 def _scout_error_response(error_type: str, error_message: str, user_friendly_message: str):
@@ -908,25 +2077,115 @@ class UserSettingsBody(BaseModel):
     include_top_opportunities: bool = True
 
 
+class OutreachSendBody(BaseModel):
+    workspace_id: str | None = None
+    lead_id: str
+    case_id: str | None = None
+    to: str | None = None
+    subject: str
+    body: str
+    message_type: str = "short_email"
+
+
+class OutreachTemplateBody(BaseModel):
+    workspace_id: str | None = None
+    lead_id: str | None = None
+    linked_opportunity_id: str | None = None
+
+
+class OutreachTestBody(BaseModel):
+    to: str
+    subject: str | None = None
+    body: str | None = None
+
+
+@app.get("/job/{job_id}")
+def get_job_status(request: Request, job_id: str):
+    workspace_id = _get_workspace_id_from_request(request)
+    job = _job_get(job_id)
+    if not job:
+        job = _load_job_from_supabase(job_id, workspace_id=workspace_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if workspace_id and job.get("workspace_id") and job.get("workspace_id") != workspace_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return {
+        "id": job.get("id"),
+        "status": job.get("status"),
+        "progress": int(job.get("progress") or 0),
+        "summary": job.get("result_summary"),
+        "error": job.get("error"),
+        "created_at": job.get("created_at"),
+        "started_at": job.get("started_at"),
+        "finished_at": job.get("finished_at"),
+    }
+
+
 @app.post("/run-scout")
 def post_run_scout(request: Request, body: RunScoutBody | None = None):
     try:
+        user_id = _get_user_id_from_request(request)
+        requested_workspace_id = _get_workspace_id_from_request(request)
+        workspace_plan = "free"
+        workspace_id = requested_workspace_id
+        if user_id and _supabase_url and _supabase_service_key:
+            try:
+                from supabase import create_client
+                sb = create_client(_supabase_url, _supabase_service_key)
+                ws = _get_workspace_for_user(sb, user_id, requested_workspace_id)
+                workspace_id = ws.get("id")
+                workspace_plan = _normalize_plan(ws.get("plan"))
+                allowed, limit_msg = _check_plan_limits_for_run(workspace_plan, _get_workspace_usage(sb, workspace_id))
+                if not allowed:
+                    print("  upgrade prompt shown")
+                    return _scout_error_response(
+                        "plan_limit_reached",
+                        limit_msg or _plan_limit_message(),
+                        limit_msg or _plan_limit_message(),
+                    )
+            except Exception:
+                # Never block scout run if plan lookup fails unexpectedly.
+                workspace_plan = "free"
+
         current_lat = body.current_lat if body else None
         current_lng = body.current_lng if body else None
-        if current_lat is not None and current_lng is not None:
-            print(f"  [Scout] run scout using current location: {current_lat}, {current_lng}")
-        else:
-            print("  [Scout] run scout using saved config location")
-        _run_morning_runner(current_lat=current_lat, current_lng=current_lng)
-        data = _load_scout_data()
-        today = data["today"]
-        opportunities = data["opportunities"]
-        _append_history(len(opportunities), today.get("summary", ""))
-        user_id = _get_user_id_from_request(request)
-        workspace_id = _get_workspace_id_from_request(request)
-        if user_id and _supabase_url and _supabase_service_key:
-            _sync_scout_to_supabase(user_id, workspace_id=workspace_id)
-        return {"ok": True, "success": True, "stdout": "", "stderr": "", "today": today, "opportunities": opportunities}
+        payload = {
+            "current_lat": current_lat,
+            "current_lng": current_lng,
+            "location_mode": "current" if current_lat is not None and current_lng is not None else "saved",
+        }
+        job_id = str(uuid4())
+        job = {
+            "id": job_id,
+            "workspace_id": workspace_id,
+            "type": "run_morning_scout",
+            "status": "queued",
+            "progress": 0,
+            "payload": payload,
+            "result_summary": "Scout job queued",
+            "error": None,
+            "created_at": _job_now_iso(),
+            "started_at": None,
+            "finished_at": None,
+        }
+        _job_store(job)
+        _upsert_job_supabase(job)
+        print("  scout job created")
+
+        worker = threading.Thread(
+            target=_execute_scout_job,
+            args=(job_id, user_id, workspace_id, workspace_plan, current_lat, current_lng),
+            daemon=True,
+        )
+        worker.start()
+        return {
+            "ok": True,
+            "success": True,
+            "job_id": job_id,
+            "status": "queued",
+            "progress": 0,
+            "poll_url": f"/job/{job_id}",
+        }
     except Exception as e:
         err_str = str(e).upper()
         err_lower = str(e).lower()
@@ -981,6 +2240,163 @@ def post_run_scout(request: Request, body: RunScoutBody | None = None):
         )
 
 
+@app.post("/outreach/send")
+def post_outreach_send(request: Request, body: OutreachSendBody):
+    user_id = _get_user_id_from_request(request)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    recipient = (body.to or "").strip()
+    subject = (body.subject or "").strip()
+    content = (body.body or "").strip()
+    message_type = (body.message_type or "short_email").strip().lower()
+    if not recipient:
+        raise HTTPException(status_code=400, detail="recipient email is missing")
+    if not content:
+        raise HTTPException(status_code=400, detail="message body is empty")
+
+    crm_sb = _create_crm_client()
+    if crm_sb is None:
+        raise HTTPException(status_code=500, detail="CRM client is not configured")
+
+    lead = _crm_fetch_lead(crm_sb, body.lead_id, user_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="lead not found")
+
+    lead_status = str(lead.get("status") or "").strip().lower()
+    if lead_status == "do_not_contact":
+        raise HTTPException(status_code=400, detail="lead is marked do_not_contact")
+    if lead_status == "closed_lost":
+        raise HTTPException(status_code=400, detail="lead is marked closed_lost")
+
+    if not subject:
+        raise HTTPException(status_code=400, detail="email subject is required")
+
+    workspace_id = (
+        (body.workspace_id or "").strip()
+        or str(lead.get("workspace_id") or "").strip()
+        or _get_workspace_id_from_request(request)
+    )
+    if not workspace_id and _supabase_url and _supabase_service_key:
+        try:
+            from supabase import create_client
+            sb = create_client(_supabase_url, _supabase_service_key)
+            workspace_id = _resolve_workspace_id_for_user(sb, user_id, None) or ""
+        except Exception:
+            workspace_id = ""
+
+    print("  sending outreach email")
+    provider_message_id = None
+    try:
+        send_result = _send_resend_email(recipient, subject, content)
+        provider_message_id = send_result.get("provider_message_id")
+        updates = _mark_lead_contacted_after_email(crm_sb, lead, message_type)
+        print("  outreach email sent")
+        _insert_email_event(
+            crm_sb,
+            {
+                "workspace_id": workspace_id or None,
+                "lead_id": body.lead_id,
+                "case_id": body.case_id,
+                "recipient_email": recipient,
+                "subject": subject,
+                "body": content,
+                "message_type": message_type,
+                "send_status": "sent",
+                "provider_message_id": provider_message_id,
+                "sent_at": datetime.now(timezone.utc).isoformat(),
+                "owner_id": user_id,
+            },
+        )
+        return {
+            "ok": True,
+            "provider_message_id": provider_message_id,
+            "lead_id": body.lead_id,
+            "lead_updates": updates,
+        }
+    except Exception as e:
+        print(f"  outreach email failed: {e}", file=sys.stderr)
+        _insert_email_event(
+            crm_sb,
+            {
+                "workspace_id": workspace_id or None,
+                "lead_id": body.lead_id,
+                "case_id": body.case_id,
+                "recipient_email": recipient,
+                "subject": subject,
+                "body": content,
+                "message_type": message_type,
+                "send_status": "failed",
+                "provider_message_id": provider_message_id,
+                "sent_at": None,
+                "owner_id": user_id,
+            },
+        )
+        raise HTTPException(status_code=500, detail=f"outreach_email_failed: {e}")
+
+
+@app.post("/outreach/template")
+def post_outreach_template(request: Request, body: OutreachTemplateBody):
+    user_id = _get_user_id_from_request(request)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    linked_opportunity_id = (body.linked_opportunity_id or "").strip()
+    workspace_id = (body.workspace_id or "").strip() or _get_workspace_id_from_request(request)
+
+    crm_sb = _create_crm_client()
+    if body.lead_id and not linked_opportunity_id and crm_sb is not None:
+        lead = _crm_fetch_lead(crm_sb, body.lead_id, user_id)
+        if lead:
+            linked_opportunity_id = str(lead.get("linked_opportunity_id") or "").strip()
+            workspace_id = workspace_id or str(lead.get("workspace_id") or "").strip()
+
+    if not linked_opportunity_id:
+        raise HTTPException(
+            status_code=400,
+            detail="linked_opportunity_id (or lead with linked_opportunity_id) is required",
+        )
+
+    print("  loading dossier outreach template")
+    template = _load_outreach_template_for_opportunity(
+        linked_opportunity_id, workspace_id=workspace_id or None
+    )
+    if not template:
+        raise HTTPException(status_code=404, detail="Outreach template not found")
+
+    print("  outreach template loaded")
+    return template
+
+
+@app.post("/outreach/test")
+def post_outreach_test(request: Request, body: OutreachTestBody):
+    user_id = _get_user_id_from_request(request)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    recipient = (body.to or "").strip()
+    if not recipient:
+        raise HTTPException(status_code=400, detail="recipient email is missing")
+
+    subject = (body.subject or "").strip() or "Scout-Brain Email Test"
+    content = (
+        (body.body or "").strip()
+        or "This is a Scout-Brain email smoke test from MixedMakerShop admin."
+    )
+
+    print("  sending test email")
+    try:
+        send_result = _send_resend_email(recipient, subject, content)
+        print("  test email sent")
+        return {
+            "ok": True,
+            "provider_message_id": send_result.get("provider_message_id"),
+        }
+    except Exception as e:
+        print(f"  test email failed: {e}", file=sys.stderr)
+        raise HTTPException(status_code=500, detail=f"test_email_failed: {e}")
+
+
 @app.get("/user-settings")
 def get_user_settings(request: Request):
     user_id = _get_user_id_from_request(request)
@@ -997,6 +2413,191 @@ def get_user_settings(request: Request):
         return settings
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not load settings: {e}")
+
+
+@app.get("/workspace/plan")
+def get_workspace_plan(request: Request):
+    user_id = _get_user_id_from_request(request)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not _supabase_url or not _supabase_service_key:
+        return {
+            "plan": "free",
+            "limits": _plan_limits("free"),
+            "usage": {"monthly_scout_runs": 0, "saved_leads": 0},
+        }
+    try:
+        from supabase import create_client
+        sb = create_client(_supabase_url, _supabase_service_key)
+        requested_workspace = _get_workspace_id_from_request(request)
+        workspace = _get_workspace_for_user(sb, user_id, requested_workspace)
+        plan = _normalize_plan(workspace.get("plan"))
+        usage = _get_workspace_usage(sb, workspace.get("id"))
+        limits = _plan_limits(plan)
+        return {
+            "workspace_id": workspace.get("id"),
+            "workspace_name": workspace.get("name"),
+            "plan": plan,
+            "limits": limits,
+            "usage": usage,
+            "can_run_scout": _check_plan_limits_for_run(plan, usage)[0],
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not load workspace plan: {e}")
+
+
+@app.get("/scout-summary")
+def get_scout_summary(request: Request):
+    user_id = _get_user_id_from_request(request)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not _supabase_url or not _supabase_service_key:
+        return {
+            "last_run_time": None,
+            "leads_found_today": 0,
+            "top_opportunities_count": 0,
+            "followups_due": 0,
+            "today_businesses_discovered": 0,
+            "today_analyzed_total": 0,
+            "today_high_opportunity_total": 0,
+            "dashboard_businesses_discovered": 0,
+            "dashboard_websites_audited": 0,
+            "dashboard_high_opportunities": 0,
+            "dashboard_outreach_sent": 0,
+        }
+    try:
+        from supabase import create_client
+        sb = create_client(_supabase_url, _supabase_service_key)
+        requested_workspace = _get_workspace_id_from_request(request)
+        workspace = _get_workspace_for_user(sb, user_id, requested_workspace)
+        workspace_id = workspace.get("id")
+
+        last_run_time = None
+        if workspace_id:
+            try:
+                runs = (
+                    sb.table("scout_runs")
+                    .select("run_time,created_at")
+                    .eq("workspace_id", workspace_id)
+                    .order("run_time", desc=True)
+                    .limit(1)
+                    .execute()
+                )
+            except Exception:
+                runs = (
+                    sb.table("scout_runs")
+                    .select("created_at")
+                    .eq("workspace_id", workspace_id)
+                    .order("created_at", desc=True)
+                    .limit(1)
+                    .execute()
+                )
+            if runs.data:
+                last_run_time = runs.data[0].get("run_time") or runs.data[0].get("created_at")
+
+        leads_found_today = _count_new_leads_today(sb, workspace_id)
+        top_opportunities_count = len(getTopOpportunities(workspace_id))
+        followups_due = _count_followups_due(sb, workspace_id)
+        today_businesses_discovered = 0
+        today_analyzed_total = 0
+        today_high_opportunity_total = 0
+        if workspace_id:
+            today_key = datetime.now().date().isoformat()
+            try:
+                day_runs = (
+                    sb.table("scout_runs")
+                    .select("run_date,businesses_discovered,analyzed_total,high_opportunity_total,created_at")
+                    .eq("workspace_id", workspace_id)
+                    .order("created_at", desc=True)
+                    .limit(20)
+                    .execute()
+                )
+                for row in day_runs.data or []:
+                    row_date = (row.get("run_date") or "").strip()
+                    if not row_date:
+                        created_at = (row.get("created_at") or "").strip()
+                        if created_at:
+                            try:
+                                row_date = datetime.fromisoformat(created_at.replace("Z", "+00:00")).date().isoformat()
+                            except Exception:
+                                row_date = ""
+                    if row_date != today_key:
+                        continue
+                    today_businesses_discovered += int(row.get("businesses_discovered") or 0)
+                    today_analyzed_total += int(row.get("analyzed_total") or 0)
+                    today_high_opportunity_total += int(row.get("high_opportunity_total") or 0)
+            except Exception:
+                pass
+
+        dashboard_businesses_discovered = 0
+        dashboard_websites_audited = 0
+        dashboard_high_opportunities = 0
+        dashboard_outreach_sent = 0
+        if workspace_id:
+            try:
+                from datetime import timedelta
+                since_iso = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+                recent_runs = (
+                    sb.table("scout_runs")
+                    .select("businesses_discovered,created_at,leads_found")
+                    .eq("workspace_id", workspace_id)
+                    .gte("created_at", since_iso)
+                    .execute()
+                )
+                for row in recent_runs.data or []:
+                    dashboard_businesses_discovered += int(row.get("businesses_discovered") or row.get("leads_found") or 0)
+            except Exception:
+                pass
+            try:
+                audited_rows = (
+                    sb.table("case_files")
+                    .select("id,website_score,audit_issues,status,outreach_notes")
+                    .eq("workspace_id", workspace_id)
+                    .execute()
+                )
+                for row in audited_rows.data or []:
+                    has_audit = row.get("website_score") is not None or bool(row.get("audit_issues"))
+                    if has_audit:
+                        dashboard_websites_audited += 1
+                    status = str(row.get("status") or "").strip().lower()
+                    if status in {"ready to contact", "contacted", "follow up", "queued"} or bool(row.get("outreach_notes")):
+                        dashboard_outreach_sent += 1
+            except Exception:
+                pass
+            try:
+                opp_rows = (
+                    sb.table("opportunities")
+                    .select("opportunity_score,internal_score")
+                    .eq("workspace_id", workspace_id)
+                    .execute()
+                )
+                for row in opp_rows.data or []:
+                    score = row.get("opportunity_score")
+                    if score is None:
+                        score = row.get("internal_score")
+                    try:
+                        if float(score or 0) >= 70:
+                            dashboard_high_opportunities += 1
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+        return {
+            "last_run_time": last_run_time,
+            "leads_found_today": leads_found_today,
+            "top_opportunities_count": top_opportunities_count,
+            "followups_due": followups_due,
+            "today_businesses_discovered": today_businesses_discovered,
+            "today_analyzed_total": today_analyzed_total,
+            "today_high_opportunity_total": today_high_opportunity_total,
+            "dashboard_businesses_discovered": dashboard_businesses_discovered,
+            "dashboard_websites_audited": dashboard_websites_audited,
+            "dashboard_high_opportunities": dashboard_high_opportunities,
+            "dashboard_outreach_sent": dashboard_outreach_sent,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not load scout summary: {e}")
 
 
 @app.post("/user-settings")
@@ -1051,6 +2652,23 @@ class CaseUpdateBody(BaseModel):
     follow_up_note: str | None = None
 
 
+def _screenshot_file_for_case(slug: str, kind: str) -> Path | None:
+    slug_safe = slug.strip()
+    if not slug_safe:
+        return None
+    folder = CASE_FILES_DIR / slug_safe
+    mapping = {
+        "desktop_homepage": "desktop.png",
+        "mobile_homepage": "mobile.png",
+        "key_internal_page": "internal.png",
+    }
+    filename = mapping.get(kind)
+    if not filename:
+        return None
+    path = folder / filename
+    return path if path.exists() else None
+
+
 @app.get("/case/{slug}")
 def get_case_raw(slug: str):
     """Return raw case JSON for a lead. Used for debug / View raw case JSON."""
@@ -1059,6 +2677,14 @@ def get_case_raw(slug: str):
         raise HTTPException(status_code=404, detail=f"Case {slug} not found")
     with open(path, encoding="utf-8") as f:
         return json.load(f)
+
+
+@app.get("/case/{slug}/screenshot/{kind}")
+def get_case_screenshot(slug: str, kind: str):
+    path = _screenshot_file_for_case(slug, kind)
+    if not path:
+        raise HTTPException(status_code=404, detail="Screenshot not found")
+    return FileResponse(path)
 
 
 @app.post("/case/{slug}/update")
@@ -1115,7 +2741,7 @@ def post_case_update(slug: str, body: CaseUpdateBody):
 
 
 @app.post("/case/{slug}/regenerate-outreach")
-def post_case_regenerate_outreach(slug: str):
+def post_case_regenerate_outreach(request: Request, slug: str):
     """Regenerate outreach pack for one case using current dossier data."""
     path = CASES_DIR / f"{slug}.json"
     if not path.exists():
@@ -1129,11 +2755,26 @@ def post_case_regenerate_outreach(slug: str):
     try:
         from scout.outreach_generator import generate_outreach_pack
         city_hint = None
+        workspace_plan = "free"
+        user_id = _get_user_id_from_request(request)
+        requested_workspace_id = _get_workspace_id_from_request(request)
+        if user_id and _supabase_url and _supabase_service_key:
+            try:
+                from supabase import create_client
+                sb = create_client(_supabase_url, _supabase_service_key)
+                ws = _get_workspace_for_user(sb, user_id, requested_workspace_id)
+                workspace_plan = _normalize_plan(ws.get("plan"))
+            except Exception:
+                workspace_plan = "free"
         if CONFIG_PATH.exists():
             with open(CONFIG_PATH, encoding="utf-8") as f:
                 cfg = json.load(f)
                 city_hint = cfg.get("home_city")
         pack = generate_outreach_pack(case, city_hint=city_hint)
+        pack = _apply_outreach_plan_limits(pack, workspace_plan)
+        if not _plan_limits(workspace_plan).get("full_outreach", True):
+            print("  plan limit reached")
+            print("  upgrade prompt shown")
         case["short_email"] = pack.get("short_email")
         case["longer_email"] = pack.get("longer_email")
         case["contact_form_version"] = pack.get("contact_form_version")
@@ -1199,15 +2840,22 @@ def _start_scheduler():
     try:
         from apscheduler.schedulers.background import BackgroundScheduler
         from apscheduler.triggers.cron import CronTrigger
-        _scheduler = BackgroundScheduler(timezone="UTC")
+        if SCHEDULED_SCOUT_TIMEZONE.lower() == "local":
+            _scheduler = BackgroundScheduler()
+            trigger = CronTrigger(hour=SCHEDULED_SCOUT_HOUR, minute=0)
+            tz_label = "local"
+        else:
+            _scheduler = BackgroundScheduler(timezone=SCHEDULED_SCOUT_TIMEZONE)
+            trigger = CronTrigger(hour=SCHEDULED_SCOUT_HOUR, minute=0, timezone=SCHEDULED_SCOUT_TIMEZONE)
+            tz_label = SCHEDULED_SCOUT_TIMEZONE
         _scheduler.add_job(
-            _run_scheduled_scout_job,
-            CronTrigger(hour=SCHEDULED_SCOUT_HOUR, minute=0),
+            daily_scout_job,
+            trigger,
             id="scheduled-scout-daily",
             replace_existing=True,
         )
         _scheduler.start()
-        print(f"  Scheduled scout enabled at {SCHEDULED_SCOUT_HOUR:02d}:00 UTC")
+        print(f"  Scheduled scout enabled at {SCHEDULED_SCOUT_HOUR:02d}:00 {tz_label}")
     except Exception as e:
         print(f"  [Scout] scheduler start failed: {e}", file=sys.stderr)
         _scheduler = None
@@ -1248,7 +2896,11 @@ def main():
     print(f"  App running at:  http://0.0.0.0:{port}")
     print(f"  FRONTEND_SERVING: {'enabled' if SERVE_FRONTEND else 'disabled (api-only)'}")
     print(f"  SCHEDULED_SCOUT: {'enabled' if ENABLE_SCHEDULED_SCOUT else 'disabled'}")
-    print(f"  SCHEDULED_SCOUT_HOUR: {SCHEDULED_SCOUT_HOUR:02d}:00 UTC")
+    print(f"  SCHEDULED_SCOUT_HOUR: {SCHEDULED_SCOUT_HOUR:02d}:00")
+    print(f"  SCHEDULED_SCOUT_TIMEZONE: {SCHEDULED_SCOUT_TIMEZONE}")
+    print(f"  SCHEDULED_SCOUT_SCOPE: {SCHEDULED_SCOUT_SCOPE}")
+    if SCHEDULED_SCOUT_SCOPE == "internal":
+        print(f"  SCHEDULED_SCOUT_WORKSPACE: {SCHEDULED_SCOUT_WORKSPACE_NAME}")
     print()
     if _env_loaded:
         if _maps_key:

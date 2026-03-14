@@ -1,7 +1,7 @@
 /* eslint-disable no-console */
 console.log("app.js loaded");
 
-const STORAGE_KEY = "massive-brain-v0.4";
+const STORAGE_KEY = "scout-brain-v0.4";
 
 const starterData = {
   opportunities: [],
@@ -11,9 +11,9 @@ const starterData = {
 };
 
 function loadState() {
-  const v4 = localStorage.getItem("massive-brain-v0.4");
-  const v3 = localStorage.getItem("massive-brain-v0.3");
-  const v2 = localStorage.getItem("massive-brain-v0.2");
+  const v4 = localStorage.getItem("scout-brain-v0.4");
+  const v3 = localStorage.getItem("scout-brain-v0.3");
+  const v2 = localStorage.getItem("scout-brain-v0.2");
 
   if (v4) return normalizeItemFields(JSON.parse(v4));
   if (v3) {
@@ -67,7 +67,7 @@ function exportBrain() {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = "massive-brain-backup.json";
+  a.download = "scout-brain-backup.json";
   a.click();
   URL.revokeObjectURL(url);
 }
@@ -147,6 +147,7 @@ function openModal(bucket, index) {
 
     saveState();
     renderAll();
+    showToast("Note saved");
     document.getElementById("modal").classList.add("hidden");
     document.getElementById("modal").setAttribute("aria-hidden", "true");
   };
@@ -180,14 +181,28 @@ function showMainTab(tabName) {
   if (tabName === "scout" && !scoutConfig) loadScoutConfig();
 }
 
+function getAdminBasePath() {
+  const raw = String(window.MB_ADMIN_BASE_PATH || "/admin").trim();
+  if (!raw) return "/admin";
+  const withSlash = raw.startsWith("/") ? raw : `/${raw}`;
+  return withSlash.length > 1 && withSlash.endsWith("/") ? withSlash.slice(0, -1) : withSlash;
+}
+
+function adminRouteForModule(module) {
+  const base = getAdminBasePath();
+  if (!module || module === "dashboard") return base;
+  return `${base}/${String(module).replace(/^\//, "")}`;
+}
+
 function currentAdminModule() {
   const path = (window.location.pathname || "").replace(/\/$/, "");
-  if (path === "/admin" || path === "/admin/dashboard") return "dashboard";
-  if (path === "/admin/scout") return "scout";
-  if (path === "/admin/leads") return "leads";
-  if (path === "/admin/cases") return "cases";
-  if (path === "/admin/outreach") return "outreach";
-  if (path === "/admin/notes") return "notes";
+  const base = getAdminBasePath();
+  if (path === base || path === `${base}/dashboard`) return "dashboard";
+  if (path === `${base}/scout`) return "scout";
+  if (path === `${base}/leads`) return "leads";
+  if (path === `${base}/cases`) return "cases";
+  if (path === `${base}/outreach`) return "outreach";
+  if (path === `${base}/notes`) return "notes";
   return "dashboard";
 }
 
@@ -204,7 +219,8 @@ function setVisible(el, show) {
 
 function applyAdminRouteView() {
   const path = (window.location.pathname || "").replace(/\/$/, "");
-  if (!(path === "/admin" || path.startsWith("/admin/"))) return;
+  const base = getAdminBasePath();
+  if (!(path === base || path.startsWith(`${base}/`))) return;
   const module = currentAdminModule();
   if (module === "dashboard") {
     console.log("dashboard route active");
@@ -518,6 +534,7 @@ async function runAnalyzeDraft() {
 
   document.getElementById("analysisProblems").innerHTML = '<div class="tag analysis-bullet-item">Auditing site...</div>';
   document.getElementById("analysisPitch").innerHTML = '<div class="tag analysis-bullet-item">Thinking...</div>';
+  setGlobalLoading(true, "Lead analysis running...");
   const factsEl = document.getElementById("analysisFacts");
   if (factsEl) factsEl.innerHTML = "";
 
@@ -543,6 +560,8 @@ async function runAnalyzeDraft() {
   } catch (err) {
     console.error(err);
     alert("Audit failed. Make sure your backend API is reachable and VITE_API_BASE_URL is set correctly.");
+  } finally {
+    setGlobalLoading(false);
   }
 }
 
@@ -758,6 +777,8 @@ let _runnerStatusFilter = "all";
 let _runnerSort = "priority";
 let _runnerOpportunities = [];
 let _runnerLastPayload = null;
+let _workspacePlanState = null;
+let _scoutSummaryState = null;
 
 const LEAD_STATUSES = ["New", "Ready to contact", "Contacted", "Follow up", "Closed", "Skip"];
 
@@ -774,6 +795,36 @@ function setRunnerLoading(show) {
   if (!el) return;
   el.classList.toggle("hidden", !show);
   el.setAttribute("aria-hidden", show ? "false" : "true");
+}
+
+function setGlobalLoading(show, text = "Loading...") {
+  const bar = document.getElementById("globalLoadingBar");
+  const label = document.getElementById("globalLoadingText");
+  if (!bar) return;
+  if (label) label.textContent = text;
+  bar.classList.toggle("hidden", !show);
+}
+
+function showToast(message) {
+  const container = document.getElementById("toastContainer");
+  if (!container) return;
+  const item = document.createElement("div");
+  item.className = "toast-item";
+  item.textContent = message;
+  container.appendChild(item);
+  setTimeout(() => {
+    item.remove();
+  }, 2600);
+}
+
+function leadTagClass(label) {
+  const v = String(label || "").trim().toLowerCase();
+  if (v === "hot lead") return "status-hot-lead";
+  if (v === "strong lead") return "status-strong-lead";
+  if (v === "possible lead") return "status-possible-lead";
+  if (v === "contacted") return "status-contacted";
+  if (v === "closed") return "status-closed";
+  return "";
 }
 
 function flashRunnerPanel() {
@@ -801,6 +852,8 @@ async function runScoutNow() {
   }
   setRunnerStatus("Running...");
   setRunnerLoading(true);
+  setGlobalLoading(true, "Scout started...");
+  showToast("Scout started");
   const errorBanner = document.getElementById("scoutErrorBanner");
   const errorBody = document.getElementById("scoutErrorBody");
   const errorDetailsPre = document.getElementById("scoutErrorDetailsPre");
@@ -914,7 +967,44 @@ async function runScoutNow() {
       const errMsg = data.error_message || data.stderr || "Unknown error";
       const userMsg = data.user_friendly_message || "Scout run failed. Check the app and try again.";
       console.error("Scout failed:", { error_type: errType, error_message: errMsg, full: data });
+      if (errType === "plan_limit_reached") {
+        console.log("plan limit reached");
+        setPlanLimitMessage(userMsg, true);
+      }
       showScoutError(userMsg, errType, errMsg, data);
+      return;
+    }
+
+    if (data.job_id) {
+      console.log("scout job created");
+      if (summary) summary.textContent = "Scout job queued. Starting background analysis...";
+      const completedJob = await pollScoutJobStatus(apiBase, data.job_id, headers, (job) => {
+        const progress = Number(job?.progress ?? 0);
+        console.log("scout job progress updated");
+        if (summary) summary.textContent = `Scout running in background — ${progress}%`;
+      });
+      console.log("run scout success");
+      setRunnerStatus("Complete");
+      if (summary) summary.textContent = completedJob?.summary || "Scout complete.";
+      showToast("Scout finished");
+
+      flashRunnerPanel();
+      console.log("refreshing dashboard data");
+      const refreshed = await refreshScoutData({
+        reason: "post-run",
+        cacheBust: true,
+        minExpectedCount: 0,
+        retries: window.MB_FETCH_SCOUT_DATA ? 4 : 1,
+        retryDelayMs: 1200,
+      });
+      const refreshedCount = refreshed?.opportunities?.length ?? 0;
+      const refreshedMetrics = summarizeRunMetrics(refreshed?.today, refreshed?.opportunities || []);
+      console.log(`lead count after refresh: ${refreshedCount}`);
+      console.log("leads refreshed");
+      if (summary) {
+        summary.textContent = `Scout complete — ${refreshedCount} leads discovered. Processed ${refreshedMetrics.processed}, saved ${refreshedMetrics.saved}, skipped ${refreshedMetrics.skipped}, location ${refreshedMetrics.location}.`;
+      }
+      _runnerPreviousCount = refreshedCount;
       return;
     }
 
@@ -924,13 +1014,14 @@ async function runScoutNow() {
     renderMorningRunner(data.today, opportunities, data.stdout, data.stderr);
     updateAdminSummary(data.today, opportunities);
     console.log("run scout success");
+    showToast("Scout finished");
 
     setRunnerStatus("Complete");
     if (summary) {
       if (prevCount !== null && prevCount === newCount && newCount > 0) {
         summary.textContent = "Scout complete — no major changes found.";
       } else {
-        summary.textContent = `Scout complete — ${newCount} opportunities refreshed.`;
+        summary.textContent = `Scout complete — ${newCount} leads discovered.`;
       }
     }
     if (generated && data.today?.generated_at) {
@@ -940,7 +1031,7 @@ async function runScoutNow() {
     _runnerPreviousCount = newCount;
     flashRunnerPanel();
 
-    console.log("refreshing leads after scout");
+    console.log("refreshing dashboard data");
     const refreshed = await refreshScoutData({
       reason: "post-run",
       cacheBust: true,
@@ -951,8 +1042,9 @@ async function runScoutNow() {
     const refreshedCount = refreshed?.opportunities?.length ?? newCount;
     const refreshedMetrics = summarizeRunMetrics(refreshed?.today, refreshed?.opportunities || opportunities);
     console.log(`lead count after refresh: ${refreshedCount}`);
+    console.log("leads refreshed");
     if (summary) {
-      summary.textContent = `Scout complete — ${refreshedCount} leads refreshed. Processed ${refreshedMetrics.processed}, saved ${refreshedMetrics.saved}, skipped ${refreshedMetrics.skipped}, location ${refreshedMetrics.location}.`;
+      summary.textContent = `Scout complete — ${refreshedCount} leads discovered. Processed ${refreshedMetrics.processed}, saved ${refreshedMetrics.saved}, skipped ${refreshedMetrics.skipped}, location ${refreshedMetrics.location}.`;
     }
   } catch (err) {
     console.error("Scout run exception:", err);
@@ -963,6 +1055,7 @@ async function runScoutNow() {
     showScoutError(deployMsg, "network_or_exception", errMsg, null);
   } finally {
     setRunnerLoading(false);
+    setGlobalLoading(false);
     if (btn) {
       btn.disabled = false;
       btn.textContent = "Run Scout";
@@ -979,6 +1072,14 @@ function createRunnerTag(text) {
   return el;
 }
 
+function createLeadStatusTag(text) {
+  const el = document.createElement("span");
+  const klass = leadTagClass(text);
+  el.className = `tag ${klass}`.trim();
+  el.textContent = text;
+  return el;
+}
+
 function valOrMissing(v) {
   if (v == null || v === "") return "Missing";
   return String(v);
@@ -991,6 +1092,47 @@ function escapeHtml(s) {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+
+function getOpportunitySignals(opp) {
+  const existing = Array.isArray(opp?.opportunity_signals) ? opp.opportunity_signals.filter(Boolean) : [];
+  if (existing.length) return existing;
+  const signals = [];
+  if (opp?.no_website || opp?.lane === "no_website") signals.push("No website detected");
+  else if (opp?.lane === "weak_website") signals.push("Website needs improvement");
+  if (opp?.outdated_design_clues === true) signals.push("Website appears outdated");
+  if (opp?.viewport_ok === false) signals.push("Website not optimized for mobile");
+  if (opp?.tap_to_call_present === false) signals.push("Missing tap-to-call on mobile");
+  if (opp?.tap_to_call_present === false && opp?.contact_form_present === false) signals.push("Missing clear CTA on homepage");
+  const websiteScore = Number(opp?.website_score ?? opp?.website_audit?.website_score);
+  if (Number.isFinite(websiteScore) && websiteScore <= 60) signals.push("Low website quality score");
+  if (opp?.high_opportunity) signals.push("High opportunity: strong business, weak website");
+  if (opp?.menu_found === false || opp?.menu_visibility === false) signals.push("Key service/menu info is hard to find");
+  const reviewCount = Number(opp?.review_count || 0) || 0;
+  if (reviewCount > 50) signals.push("Active customer reviews");
+  else if (reviewCount > 10) signals.push("Consistent customer review activity");
+  const distance = Number(opp?.distance_miles);
+  if (Number.isFinite(distance)) {
+    if (distance < 5) signals.push("Very close proximity");
+    else if (distance < 12) signals.push("Local business within target distance");
+  }
+  return [...new Set(signals)].slice(0, 6);
+}
+
+function resolveScreenshotUrl(opp, kind) {
+  const apiBase = (window.MB_API_BASE || "").replace(/\/$/, "");
+  const fromCaseField =
+    kind === "desktop_homepage"
+      ? opp.desktop_screenshot_url
+      : kind === "mobile_homepage"
+        ? opp.mobile_screenshot_url
+        : opp.internal_screenshot_url;
+  if (fromCaseField) {
+    if (/^https?:\/\//i.test(fromCaseField)) return fromCaseField;
+    return `${apiBase}${fromCaseField.startsWith("/") ? "" : "/"}${fromCaseField}`;
+  }
+  if (!opp.slug) return null;
+  return `${apiBase}/case/${encodeURIComponent(opp.slug)}/screenshot/${kind}`;
 }
 
 function buildCardDataSection(opp) {
@@ -1133,6 +1275,7 @@ function openCaseDetail(opp) {
   const titleEl = document.getElementById("caseDetailTitle");
   if (!modal || !content || !titleEl) return;
 
+  setGlobalLoading(true, "Case loading...");
   titleEl.textContent = opp.name || "Opportunity";
   const s = (v) => (v ?? "");
   const m = (v) => (v != null && v !== "" ? String(v) : "Missing");
@@ -1145,7 +1288,14 @@ function openCaseDetail(opp) {
   const email = opp.contact?.email || (opp.contact?.emails?.length ? opp.contact.emails[0] : null);
   const phone = opp.phone || opp.contact?.phone_from_site || (opp.contact?.phones?.length ? opp.contact.phones[0] : null);
 
-  let html = `<div class="case-detail-section"><h4>Business Snapshot</h4><div class="case-field-list">`;
+  let html = `<div class="case-detail-section"><h4>Case Health Summary</h4><div class="case-health-summary case-field-list">`;
+  html += `<div class="case-field"><span class="case-field-label">Website Score:</span> ${m(opp.website_score ?? opp.website_audit?.website_score)}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Google Rating:</span> ${m(opp.rating)}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Review Count:</span> ${m(opp.review_count)}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Opportunity Score:</span> ${m(getLeadScore(opp))}</div>`;
+  html += `</div></div>`;
+
+  html += `<div class="case-detail-section"><h4>Business Snapshot</h4><div class="case-field-list">`;
   html += `<div class="case-field"><span class="case-field-label">Name:</span> ${m(opp.name)}</div>`;
   html += `<div class="case-field"><span class="case-field-label">Category:</span> ${m(opp.category)}</div>`;
   html += `<div class="case-field"><span class="case-field-label">Address:</span> ${m(opp.address)}</div>`;
@@ -1166,7 +1316,9 @@ function openCaseDetail(opp) {
   html += `<div class="case-field"><span class="case-field-label">Facebook:</span> ${opp.contact?.facebook ? `<a href="${opp.contact.facebook}">${opp.contact.facebook}</a>` : "Missing"}</div>`;
   html += `<div class="case-field"><span class="case-field-label">Instagram:</span> ${opp.contact?.instagram ? `<a href="${opp.contact.instagram}">${opp.contact.instagram}</a>` : "Missing"}</div>`;
   html += `<div class="case-field"><span class="case-field-label">LinkedIn:</span> ${opp.contact?.linkedin ? `<a href="${opp.contact.linkedin}">${opp.contact.linkedin}</a>` : "Missing"}</div>`;
-  html += `<div class="case-field"><span class="case-field-label">Owner/founder/manager:</span> ${m(opp.owner_manager_name || opp.contact_matrix?.owner_name || (opp.owner_names && opp.owner_names[0]))}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Owner/founder/manager:</span> ${m(opp.owner_name || opp.owner_manager_name || opp.contact_matrix?.owner_name || (opp.owner_names && opp.owner_names[0]))}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Owner title:</span> ${m(opp.owner_title || opp.contact_matrix?.owner_title)}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Owner source page:</span> ${(opp.owner_source_page || opp.contact_matrix?.owner_source_page) ? `<a href="${opp.owner_source_page || opp.contact_matrix?.owner_source_page}">${opp.owner_source_page || opp.contact_matrix?.owner_source_page}</a>` : "Missing"}</div>`;
   const soc = opp.social_links || {};
   Object.entries(soc).filter(([k]) => !["facebook","instagram"].includes(k)).forEach(([k, v]) => {
     if (v) html += `<div class="case-field"><span class="case-field-label">${k}:</span> <a href="${v}">${v}</a></div>`;
@@ -1191,6 +1343,41 @@ function openCaseDetail(opp) {
   html += `<div class="case-field"><span class="case-field-label">Internal pages found:</span> ${disc.length ? disc.length + " pages" : "Missing"}</div>`;
   html += `</div><p><strong>Strongest problems:</strong></p><pre class="case-pre">${escapeHtml(issues.length ? issues.join("\n") : "None identified")}</pre></div>`;
 
+  const auditIssues = Array.isArray(opp.audit_issues) && opp.audit_issues.length
+    ? opp.audit_issues
+    : (Array.isArray(opp.website_audit?.audit_issues) ? opp.website_audit.audit_issues : []);
+  const websiteScore = opp.website_score ?? opp.website_audit?.website_score;
+  const mobileScore = opp.mobile_score ?? opp.website_audit?.mobile_score;
+  const designScore = opp.design_score ?? opp.website_audit?.design_score;
+  const navigationScore = opp.navigation_score ?? opp.website_audit?.navigation_score;
+  const conversionScore = opp.conversion_score ?? opp.website_audit?.conversion_score;
+  html += `<div class="case-detail-section"><h4>Website Audit</h4><div class="case-field-list">`;
+  html += `<div class="case-field"><span class="case-field-label">Overall website score:</span> ${m(websiteScore)}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Mobile usability:</span> ${m(mobileScore)}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Design quality:</span> ${m(designScore)}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Navigation clarity:</span> ${m(navigationScore)}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Conversion readiness:</span> ${m(conversionScore)}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">High opportunity:</span> ${(opp.high_opportunity ? "Yes" : "No")}</div>`;
+  html += `</div><p><strong>Detected issues:</strong></p><pre class="case-pre">${escapeHtml(auditIssues.length ? auditIssues.join("\n") : "None detected")}</pre></div>`;
+
+  const desktopShot = resolveScreenshotUrl(opp, "desktop_homepage");
+  const mobileShot = resolveScreenshotUrl(opp, "mobile_homepage");
+  const internalShot = resolveScreenshotUrl(opp, "key_internal_page");
+  html += `<div class="case-detail-section"><h4>Website Screenshots</h4><div class="case-field-list">`;
+  html += `<div class="case-field"><span class="case-field-label">Desktop:</span></div>`;
+  html += desktopShot
+    ? `<img src="${escapeHtml(desktopShot)}" alt="Desktop homepage screenshot" class="case-screenshot" onerror="this.replaceWith(document.createTextNode('Missing'))" />`
+    : "Missing";
+  html += `<div class="case-field"><span class="case-field-label">Mobile:</span></div>`;
+  html += mobileShot
+    ? `<img src="${escapeHtml(mobileShot)}" alt="Mobile homepage screenshot" class="case-screenshot" onerror="this.replaceWith(document.createTextNode('Missing'))" />`
+    : "Missing";
+  html += `<div class="case-field"><span class="case-field-label">Internal Page:</span></div>`;
+  html += internalShot
+    ? `<img src="${escapeHtml(internalShot)}" alt="Internal page screenshot" class="case-screenshot" onerror="this.replaceWith(document.createTextNode('Missing'))" />`
+    : "Missing";
+  html += `</div></div>`;
+
   const reviewSnippets = Array.isArray(opp.review_snippets) ? opp.review_snippets : [];
   const reviewThemes = Array.isArray(opp.review_themes) ? opp.review_themes : [];
   html += `<div class="case-detail-section"><h4>Review Intelligence</h4><div class="case-field-list">`;
@@ -1203,6 +1390,22 @@ function openCaseDetail(opp) {
   html += `<div class="case-detail-section"><h4>Pitch angle</h4><p>${s(opp.pitch_angle) || "Missing"}</p>`;
   if (opp.demo_to_show) html += `<p><strong>Demo:</strong> ${s(opp.demo_to_show)}</p>`;
   html += `</div>`;
+
+  const caseSignals = getOpportunitySignals(opp);
+  html += `<div class="case-detail-section"><h4>Opportunity Signals</h4>`;
+  html += `<div class="case-field-list">`;
+  html += `<div class="case-field"><span class="case-field-label">Opportunity Score:</span> ${m(getLeadScore(opp))}</div>`;
+  html += `<div class="case-field"><span class="case-field-label">Lead Tier:</span> ${m(getLeadTier(opp))}</div>`;
+  html += `</div>`;
+  html += `<ul class="case-field-list">`;
+  if (caseSignals.length) {
+    caseSignals.forEach((signal) => {
+      html += `<li class="case-field">• ${escapeHtml(signal)}</li>`;
+    });
+  } else {
+    html += `<li class="case-field">• No strong signals detected</li>`;
+  }
+  html += `</ul></div>`;
 
   html += `<div class="case-detail-section"><h4>Outreach Pack</h4>`;
   const shortEmail = opp.email_draft?.body || opp.short_email || opp.longer_email;
@@ -1276,6 +1479,7 @@ function openCaseDetail(opp) {
       opp.outreach_notes = notes;
       opp.follow_up_due = followUpDue;
       opp.outcome = outcome;
+      showToast("Lead updated");
       document.getElementById("caseOutreachSaveBtn").textContent = "Saved";
       setTimeout(() => { document.getElementById("caseOutreachSaveBtn").textContent = "Save outreach"; }, 1200);
     } catch (e) {
@@ -1289,6 +1493,7 @@ function openCaseDetail(opp) {
         await updateCaseStatus(opp.slug, { status: st });
         opp.status = st;
         await refreshScoutData();
+        showToast("Lead updated");
         openCaseDetail(opp);
       } catch (e) {
         console.error(e);
@@ -1345,6 +1550,7 @@ function openCaseDetail(opp) {
   }
   modal.classList.remove("hidden");
   modal.setAttribute("aria-hidden", "false");
+  setGlobalLoading(false);
 }
 
 function closeCaseDetail() {
@@ -1357,6 +1563,7 @@ async function openRawCaseModal(slug) {
   const content = document.getElementById("rawCaseContent");
   if (!modal || !content) return;
   content.textContent = "Loading…";
+  setGlobalLoading(true, "Case loading...");
   modal.classList.remove("hidden");
   modal.setAttribute("aria-hidden", "false");
   try {
@@ -1364,6 +1571,8 @@ async function openRawCaseModal(slug) {
     content.textContent = JSON.stringify(data, null, 2);
   } catch (e) {
     content.textContent = "Error: " + (e.message || "Could not load case");
+  } finally {
+    setGlobalLoading(false);
   }
 }
 
@@ -1479,6 +1688,8 @@ function renderMorningRunner(today, opportunities, stdout, stderr) {
     if (opp.backup_contact_method) right.appendChild(createRunnerTag(`Backup: ${opp.backup_contact_method}`));
     if (!opp.no_website && opp.website_analysis?.platform) right.appendChild(createRunnerTag(opp.website_analysis.platform));
     if (opp.rating != null) right.appendChild(createRunnerTag(`⭐ ${opp.rating} (${opp.review_count ?? "?"} reviews)`));
+    right.appendChild(createLeadStatusTag(getLeadTier(opp)));
+    right.appendChild(createRunnerTag(`Score ${getLeadScore(opp)}`));
     if (opp.priority) right.appendChild(createRunnerTag(opp.priority));
 
     topRow.appendChild(left);
@@ -1526,6 +1737,16 @@ function renderMorningRunner(today, opportunities, stdout, stderr) {
     pitchBox.textContent = opp.pitch_angle || "No pitch angle generated.";
     card.appendChild(pitchBox);
 
+    const signalTitle = document.createElement("div");
+    signalTitle.className = "runner-section-title";
+    signalTitle.textContent = "Opportunity Signals";
+    card.appendChild(signalTitle);
+    const signalBox = document.createElement("div");
+    signalBox.className = "runner-pre";
+    const signals = getOpportunitySignals(opp);
+    signalBox.textContent = signals.length ? signals.map((s) => `• ${s}`).join("\n") : "• No strong signals detected";
+    card.appendChild(signalBox);
+
     const emailTitle = document.createElement("div");
     emailTitle.className = "runner-section-title";
     emailTitle.textContent = "Ready email draft";
@@ -1552,6 +1773,7 @@ function renderMorningRunner(today, opportunities, stdout, stderr) {
       try {
         await updateCaseStatus(opp.slug, { status: newStatus });
         await refreshScoutData();
+        showToast("Lead updated");
       } catch (e) {
         console.error(e);
         statusSelect.value = opp.status || "New";
@@ -1573,6 +1795,7 @@ function renderMorningRunner(today, opportunities, stdout, stderr) {
           statusBadge.className = "tag runner-status-badge status-" + st.toLowerCase().replace(/\s+/g, "-");
           statusSelect.value = st;
           await refreshScoutData();
+          showToast("Lead updated");
         } catch (e) {
           console.error(e);
         }
@@ -1654,7 +1877,7 @@ function renderMorningRunner(today, opportunities, stdout, stderr) {
   if (noWebsite.length === 0 && weakWebsite.length === 0) {
     const emptyMsg = document.createElement("p");
     emptyMsg.className = "runner-empty";
-    emptyMsg.textContent = "No opportunities yet. Run Scout to find local businesses.";
+    emptyMsg.textContent = "No leads discovered yet. Run Scout to discover and audit local businesses.";
     list.appendChild(emptyMsg);
   }
 
@@ -1703,9 +1926,19 @@ function isOverdueFollowUp(opp) {
 }
 
 function getLeadScore(opp) {
-  const raw = opp.internal_score ?? opp.score ?? 0;
+  const raw = opp.opportunity_score ?? opp.internal_score ?? opp.score ?? 0;
   const n = Number(raw);
   return Number.isFinite(n) ? n : 0;
+}
+
+function getLeadTier(opp) {
+  const explicit = String(opp?.lead_tier || "").trim();
+  if (explicit) return explicit;
+  const score = getLeadScore(opp);
+  if (score >= 85) return "Hot Lead";
+  if (score >= 70) return "Strong Lead";
+  if (score >= 50) return "Possible Lead";
+  return "Low Priority";
 }
 
 function hasReachableContact(opp) {
@@ -1750,6 +1983,174 @@ function rankTopOpportunity(opp) {
   return rank;
 }
 
+async function fetchTopOpportunitiesFromApi() {
+  const apiBase = (window.MB_API_BASE || "").replace(/\/$/, "");
+  if (!apiBase) return null;
+  try {
+    const headers = {};
+    if (window.MB_SESSION?.access_token) {
+      headers.Authorization = `Bearer ${window.MB_SESSION.access_token}`;
+    }
+    if (window.MB_WORKSPACE?.workspaceId) {
+      headers["X-Workspace-Id"] = window.MB_WORKSPACE.workspaceId;
+    }
+    const res = await fetch(`${apiBase}/top-opportunities`, { headers });
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data?.plan_notice) {
+      console.log("upgrade prompt shown");
+    }
+    return {
+      leads: Array.isArray(data?.leads) ? data.leads : [],
+      planNotice: data?.plan_notice || null,
+      plan: data?.plan || null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function setPlanLimitMessage(text, show) {
+  const el = document.getElementById("planLimitMessage");
+  if (!el) return;
+  el.textContent = text || "Free plan limit reached. Upgrade to Pro for unlimited scouting.";
+  el.classList.toggle("hidden", !show);
+  if (show) {
+    console.log("upgrade prompt shown");
+  }
+}
+
+function setTextById(id, value) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = value;
+}
+
+async function loadWorkspacePlanState() {
+  const apiBase = (window.MB_API_BASE || "").replace(/\/$/, "");
+  if (!apiBase) return null;
+  const headers = {};
+  if (window.MB_SESSION?.access_token) headers.Authorization = `Bearer ${window.MB_SESSION.access_token}`;
+  if (window.MB_WORKSPACE?.workspaceId) headers["X-Workspace-Id"] = window.MB_WORKSPACE.workspaceId;
+  try {
+    const res = await fetch(`${apiBase}/workspace/plan`, { headers });
+    if (!res.ok) return null;
+    const planData = await res.json();
+    _workspacePlanState = planData;
+    const badge = document.getElementById("workspacePlanBadge");
+    const usage = document.getElementById("workspacePlanUsage");
+    if (badge) badge.textContent = String(planData?.plan || "free");
+    if (usage) {
+      const monthlyRuns = planData?.usage?.monthly_scout_runs ?? 0;
+      const savedLeads = planData?.usage?.saved_leads ?? 0;
+      usage.textContent = `Scout runs this month: ${monthlyRuns} | Saved leads: ${savedLeads}`;
+    }
+    return planData;
+  } catch {
+    return null;
+  }
+}
+
+async function refreshScoutSummary() {
+  const apiBase = (window.MB_API_BASE || "").replace(/\/$/, "");
+  if (!apiBase) return null;
+  const headers = {};
+  if (window.MB_SESSION?.access_token) headers.Authorization = `Bearer ${window.MB_SESSION.access_token}`;
+  if (window.MB_WORKSPACE?.workspaceId) headers["X-Workspace-Id"] = window.MB_WORKSPACE.workspaceId;
+  try {
+    const res = await fetch(`${apiBase}/scout-summary`, { headers });
+    if (!res.ok) return null;
+    const data = await res.json();
+    _scoutSummaryState = data || null;
+    setTextById("scoutSummaryLastRun", data?.last_run_time || "No run yet");
+    setTextById("scoutSummaryLeadsToday", String(data?.leads_found_today ?? 0));
+    setTextById("scoutSummaryTopOpps", String(data?.top_opportunities_count ?? 0));
+    setTextById("scoutSummaryFollowups", String(data?.followups_due ?? 0));
+    setTextById("scoutSummaryBusinessesDiscovered", String(data?.today_businesses_discovered ?? 0));
+    setTextById("scoutSummaryAnalyzedTotal", String(data?.today_analyzed_total ?? 0));
+    setTextById("scoutSummaryHighOppTotal", String(data?.today_high_opportunity_total ?? 0));
+    setTextById("kpiBusinessesDiscovered", String(data?.dashboard_businesses_discovered ?? 0));
+    setTextById("kpiWebsitesAudited", String(data?.dashboard_websites_audited ?? 0));
+    setTextById("kpiHighOpportunities", String(data?.dashboard_high_opportunities ?? 0));
+    setTextById("kpiOutreachSent", String(data?.dashboard_outreach_sent ?? 0));
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+function renderTopContactsRows(topEl, topLeads, opportunities) {
+  topEl.innerHTML = "";
+  if (!topLeads.length) {
+    const empty = document.createElement("div");
+    empty.className = "runner-today-item";
+    empty.textContent = "No leads discovered yet. Run Scout to generate top opportunities.";
+    topEl.appendChild(empty);
+    return;
+  }
+  const bySlug = new Map((opportunities || []).map((o) => [String(o.slug || o.id || ""), o]));
+  const byName = new Map((opportunities || []).map((o) => [String((o.name || "").toLowerCase()), o]));
+
+  topLeads.forEach((lead) => {
+    const slug = lead.slug || lead.id || null;
+    const businessName = lead.business_name || lead.name || "Unknown";
+    const category = lead.category || "Unknown category";
+    const distance = lead.distance ?? lead.distance_miles ?? "?";
+    const score = Number(lead.score ?? lead.opportunity_score ?? lead.internal_score ?? 0) || 0;
+    const lane = String(lead.lane || "").toLowerCase() === "no_website" ? "No Website" : "Weak Website";
+    const contact = lead.best_contact_method || lead.recommended_contact || "Contact unclear";
+    const linkedOpp = (slug && bySlug.get(String(slug))) || byName.get(String(businessName).toLowerCase()) || null;
+    const rating = Number(lead.rating ?? linkedOpp?.rating);
+    const reviewCount = Number(lead.review_count ?? linkedOpp?.review_count ?? 0) || 0;
+    const tier = lead.lead_tier || getLeadTier(linkedOpp || lead);
+    const signals = linkedOpp ? getOpportunitySignals(linkedOpp).slice(0, 3) : [];
+
+    const row = document.createElement("div");
+    row.className = "dashboard-top-opp";
+    row.onclick = () => {
+      if (linkedOpp) openCaseDetail(linkedOpp);
+    };
+    row.innerHTML = `
+      <div class="dashboard-top-opp-head">
+        <strong>${escapeHtml(businessName)}</strong>
+        <span class="tag ${escapeHtml(leadTagClass(tier))}">${escapeHtml(tier)}</span>
+      </div>
+      <div class="dashboard-top-opp-meta">${escapeHtml(`${category} • ${distance} mi • ${lane} • Score ${score}`)}</div>
+      <div class="dashboard-top-opp-meta">${escapeHtml(`Rating ${Number.isFinite(rating) ? rating.toFixed(1) : "?"} • Reviews ${reviewCount}`)}</div>
+      <div class="dashboard-top-opp-meta">Best contact: ${escapeHtml(contact)}</div>
+      <div class="dashboard-top-opp-meta">Opportunity Signals: ${escapeHtml(signals.length ? signals.join(" | ") : "No strong signals detected")}</div>
+    `;
+
+    const openBtn = document.createElement("button");
+    openBtn.type = "button";
+    openBtn.className = "ghost-btn";
+    openBtn.textContent = "Open Case";
+    openBtn.onclick = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (linkedOpp) openCaseDetail(linkedOpp);
+    };
+    row.appendChild(openBtn);
+
+    const copyBtn = document.createElement("button");
+    copyBtn.type = "button";
+    copyBtn.className = "ghost-btn";
+    copyBtn.textContent = "Copy Outreach";
+    copyBtn.onclick = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const text = linkedOpp?.email_draft?.body || linkedOpp?.short_email || linkedOpp?.longer_email || "";
+      if (!text) {
+        copyBtn.textContent = "No outreach";
+        setTimeout(() => { copyBtn.textContent = "Copy Outreach"; }, 1200);
+        return;
+      }
+      copyAndFeedback(copyBtn, text, "Copy Outreach");
+    };
+    row.appendChild(copyBtn);
+    topEl.appendChild(row);
+  });
+}
+
 function inferRunLocation(today) {
   const explicit = today?.location_used || today?.search_location || today?.location || today?.city;
   if (explicit) return String(explicit);
@@ -1787,7 +2188,7 @@ function renderDashboardSimpleList(containerId, items, emptyLabel) {
   if (!items.length) {
     const row = document.createElement("div");
     row.className = "runner-today-item";
-    row.textContent = emptyLabel;
+    row.textContent = `${emptyLabel} Try running Scout or updating lead statuses.`;
     el.appendChild(row);
     return;
   }
@@ -1814,7 +2215,7 @@ function renderDashboardCommandCenter(today, opportunities) {
   const leadsToday = today?.top_opportunities?.length || opportunities.length;
   const topRanked = opportunities
     .filter((o) => !isIgnoredTopContactStatus(o.status))
-    .sort((a, b) => rankTopOpportunity(b) - rankTopOpportunity(a))
+    .sort((a, b) => getLeadScore(b) - getLeadScore(a))
     .slice(0, 5);
   if (topRanked.length) {
     console.log("top opportunities loaded", { count: topRanked.length });
@@ -1827,68 +2228,38 @@ function renderDashboardCommandCenter(today, opportunities) {
     if (el) el.textContent = val;
   };
 
-  setText("kpiLeadsToday", String(leadsToday));
-  setText("kpiReadyToContact", String(ready.length));
-  setText("kpiFollowUpsDue", String(dueCount));
-  setText("kpiActiveCases", String(active.length));
+  setText("kpiBusinessesDiscovered", String(_scoutSummaryState?.dashboard_businesses_discovered ?? leadsToday));
+  const auditedFallback = opportunities.filter((o) => o.website_score != null || o.website_audit?.website_score != null).length;
+  setText("kpiWebsitesAudited", String(_scoutSummaryState?.dashboard_websites_audited ?? auditedFallback));
+  const highFallback = opportunities.filter((o) => getLeadScore(o) >= 70).length;
+  setText("kpiHighOpportunities", String(_scoutSummaryState?.dashboard_high_opportunities ?? highFallback));
+  const outreachFallback = opportunities.filter((o) => {
+    const st = String(o.status || "").toLowerCase();
+    return st === "ready to contact" || st === "contacted" || st === "follow up" || !!o.outreach_notes;
+  }).length;
+  setText("kpiOutreachSent", String(_scoutSummaryState?.dashboard_outreach_sent ?? outreachFallback));
   setText("adminCommandCenterCount", String(opportunities.length));
 
-  renderDashboardSimpleList("dashboardReadyList", ready, "No leads ready to contact.");
-  renderDashboardSimpleList("dashboardFollowUpList", followUp, "No follow-ups queued.");
+  renderDashboardSimpleList("dashboardReadyList", ready, "No leads discovered yet.");
+  renderDashboardSimpleList("dashboardFollowUpList", followUp, "No outreach sent yet.");
   renderDashboardSimpleList("dashboardOverdueList", overdue, "No overdue follow-ups.");
 
   const topEl = document.getElementById("dashboardTopOpps");
   if (topEl) {
-    topEl.innerHTML = "";
-    if (!topRanked.length) {
-      const empty = document.createElement("div");
-      empty.className = "runner-today-item";
-      empty.textContent = "No opportunities yet.";
-      topEl.appendChild(empty);
-    } else {
-      topRanked.forEach((opp) => {
-        const row = document.createElement("div");
-        row.className = "dashboard-top-opp";
-        const noWebsite = opp.no_website || opp.lane === "no_website" ? "No Website" : "Weak Website";
-        const score = getLeadScore(opp);
-        const contact = opp.recommended_contact || opp.backup_contact_method || "Contact unclear";
-        const meta = `${opp.category || "Unknown category"} • ${opp.distance_miles ?? "?"} mi • ${noWebsite} • Score ${score}`;
-        row.innerHTML = `
-          <div class="dashboard-top-opp-head">
-            <strong>${escapeHtml(opp.name || "Unknown")}</strong>
-            <span class="tag">${escapeHtml(opp.status || "New")}</span>
-          </div>
-          <div class="dashboard-top-opp-meta">${escapeHtml(meta)}</div>
-          <div class="dashboard-top-opp-meta">Recommended contact: ${escapeHtml(contact)}</div>
-        `;
-        const openBtn = document.createElement("button");
-        openBtn.type = "button";
-        openBtn.className = "ghost-btn";
-        openBtn.textContent = "Open case";
-        openBtn.onclick = (e) => {
-          e.preventDefault();
-          openCaseDetail(opp);
-        };
-        row.appendChild(openBtn);
-        const copyBtn = document.createElement("button");
-        copyBtn.type = "button";
-        copyBtn.className = "ghost-btn";
-        copyBtn.textContent = "Copy Outreach Message";
-        copyBtn.onclick = () => {
-          const text = opp.email_draft?.body || opp.short_email || opp.longer_email || "";
-          if (!text) {
-            copyBtn.textContent = "No outreach";
-            setTimeout(() => {
-              copyBtn.textContent = "Copy Outreach Message";
-            }, 1200);
-            return;
-          }
-          copyAndFeedback(copyBtn, text, "Copy Outreach Message");
-        };
-        row.appendChild(copyBtn);
-        topEl.appendChild(row);
-      });
-    }
+    renderTopContactsRows(topEl, topRanked, opportunities);
+    void fetchTopOpportunitiesFromApi().then((apiLeads) => {
+      if (apiLeads?.planNotice) {
+        topEl.innerHTML = "";
+        const msg = document.createElement("div");
+        msg.className = "runner-today-item";
+        msg.textContent = apiLeads.planNotice;
+        topEl.appendChild(msg);
+        setPlanLimitMessage(apiLeads.planNotice, true);
+      } else if (Array.isArray(apiLeads?.leads) && apiLeads.leads.length) {
+        renderTopContactsRows(topEl, apiLeads.leads, opportunities);
+        setPlanLimitMessage("", false);
+      }
+    });
   }
 
   const metrics = summarizeRunMetrics(today, opportunities);
@@ -1904,6 +2275,24 @@ function renderDashboardCommandCenter(today, opportunities) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function pollScoutJobStatus(apiBase, jobId, headers, onUpdate) {
+  const maxAttempts = 240;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const res = await fetch(`${apiBase}/job/${encodeURIComponent(jobId)}`, {
+      headers,
+      cache: "no-store",
+    });
+    if (!res.ok) throw new Error(`Job status request failed (${res.status})`);
+    const job = await res.json();
+    if (onUpdate) onUpdate(job);
+    const status = String(job?.status || "").toLowerCase();
+    if (status === "completed") return job;
+    if (status === "failed") throw new Error(job?.error || "Scout job failed");
+    await sleep(1500);
+  }
+  throw new Error("Scout job timed out");
 }
 
 async function refreshScoutData(options = {}) {
@@ -1925,7 +2314,10 @@ async function refreshScoutData(options = {}) {
     renderMorningRunner(data.today, data.opportunities);
     updateAdminSummary(data.today, data.opportunities);
     await loadEmailAlertSettings();
+    await loadWorkspacePlanState();
+    await refreshScoutSummary();
     console.log("dashboard data refreshed");
+    console.log("leads refreshed");
     return data;
   } catch (err) {
     console.error(err);
@@ -1990,6 +2382,8 @@ function bindButtons() {
   });
 
   document.querySelectorAll(".admin-module-link").forEach((link) => {
+    const module = link.getAttribute("data-admin-module") || "dashboard";
+    link.setAttribute("href", adminRouteForModule(module));
     link.addEventListener("click", (e) => {
       e.preventDefault();
       const href = link.getAttribute("href");
@@ -2003,16 +2397,23 @@ function bindButtons() {
   const quickRun = document.getElementById("dashboardQuickRunScout");
   if (quickRun) {
     quickRun.addEventListener("click", () => {
-      navigateAdminRoute("/admin/scout");
+      navigateAdminRoute(adminRouteForModule("scout"));
       runScoutNow();
     });
   }
   const quickLeads = document.getElementById("dashboardQuickLeads");
-  if (quickLeads) quickLeads.addEventListener("click", () => navigateAdminRoute("/admin/leads"));
+  if (quickLeads) quickLeads.addEventListener("click", () => navigateAdminRoute(adminRouteForModule("leads")));
   const quickOutreach = document.getElementById("dashboardQuickOutreach");
-  if (quickOutreach) quickOutreach.addEventListener("click", () => navigateAdminRoute("/admin/outreach"));
+  if (quickOutreach) quickOutreach.addEventListener("click", () => navigateAdminRoute(adminRouteForModule("outreach")));
   const saveEmailAlertsBtn = document.getElementById("saveEmailAlertsBtn");
   if (saveEmailAlertsBtn) saveEmailAlertsBtn.addEventListener("click", saveEmailAlertSettings);
+  const upgradePlanBtn = document.getElementById("upgradePlanBtn");
+  if (upgradePlanBtn) {
+    upgradePlanBtn.addEventListener("click", () => {
+      console.log("upgrade prompt shown");
+      setPlanLimitMessage("Upgrade flow coming soon. Stripe Checkout will be connected here.", true);
+    });
+  }
 
   const runScoutBtn = document.getElementById("runScoutBtn");
   console.log("runScoutBtn element:", runScoutBtn);

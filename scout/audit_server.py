@@ -2,7 +2,7 @@
 Massive Brain — website audit server (scout).
 
 Run from scout folder:
-  cd massive-brain/scout && python3 audit_server.py
+  cd scout-brain/scout && python3 audit_server.py
 
 Used by the Dashboard "Analyze + Draft" flow: the app POSTs a URL here and gets
 back facts, problems, and pitch angles for the email generator.

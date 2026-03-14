@@ -27,6 +27,30 @@ function first(...vals) {
   return null;
 }
 
+function computeOpportunitySignals(source) {
+  const signals = [];
+  const lane = String(source?.lane || "").toLowerCase();
+  if (lane === "no_website" || source?.no_website) signals.push("No website detected");
+  else if (lane === "weak_website") signals.push("Website needs improvement");
+  if (source?.outdated_design_clues === true) signals.push("Website appears outdated");
+  if (source?.viewport_ok === false) signals.push("Website not optimized for mobile");
+  if (source?.tap_to_call_present === false) signals.push("Missing tap-to-call on mobile");
+  if (source?.tap_to_call_present === false && source?.contact_form_present === false) signals.push("Missing clear CTA on homepage");
+  const websiteScore = Number(source?.website_score ?? source?.website_audit?.website_score);
+  if (Number.isFinite(websiteScore) && websiteScore <= 60) signals.push("Low website quality score");
+  if (source?.high_opportunity) signals.push("High opportunity: strong business, weak website");
+  if (source?.menu_found === false || source?.menu_visibility === false) signals.push("Key service/menu info is hard to find");
+  const reviewCount = Number(source?.review_count || 0) || 0;
+  if (reviewCount > 50) signals.push("Active customer reviews");
+  else if (reviewCount > 10) signals.push("Consistent customer review activity");
+  const distance = Number(source?.distance_miles);
+  if (Number.isFinite(distance)) {
+    if (distance < 5) signals.push("Very close proximity");
+    else if (distance < 12) signals.push("Local business within target distance");
+  }
+  return [...new Set(signals)].slice(0, 6);
+}
+
 function formatHours(h) {
   if (h == null) return null;
   if (typeof h === "string") return h;
@@ -36,10 +60,20 @@ function formatHours(h) {
 }
 
 function oppToUI(row) {
+  const opportunitySignals = computeOpportunitySignals({
+    lane: row.lane,
+    no_website: row.no_website,
+    review_count: row.review_count,
+    distance_miles: row.distance_miles,
+  });
   return {
     slug: row.id,
     id: row.id,
     name: row.business_name,
+    place_id: row.place_id || null,
+    city: row.city || null,
+    state: row.state || null,
+    industry: row.industry || row.category || null,
     distance_miles: row.distance_miles,
     category: row.category,
     address: row.address,
@@ -48,7 +82,18 @@ function oppToUI(row) {
     maps_url: row.maps_link,
     recommended_contact: row.recommended_contact_method,
     website_analysis: { platform: null, issues: [], facts: [] },
-    score: row.internal_score,
+    website_audit: {
+      website_score: row.website_score ?? null,
+      mobile_score: row.mobile_score ?? null,
+      design_score: row.design_score ?? null,
+      navigation_score: row.navigation_score ?? null,
+      conversion_score: row.conversion_score ?? null,
+      audit_issues: Array.isArray(row.audit_issues) ? row.audit_issues : [],
+    },
+    score: row.opportunity_score ?? row.internal_score,
+    internal_score: row.internal_score,
+    opportunity_score: row.opportunity_score ?? row.internal_score,
+    lead_tier: row.lead_tier || null,
     pitch_angle: row.strongest_pitch_angle,
     email_draft: { subject: "", body: row.strongest_pitch_angle || "" },
     contact: { email: null, emails: [], phones: [], contact_page: null, phone_from_site: null, facebook: null, instagram: null, linkedin: null },
@@ -58,6 +103,9 @@ function oppToUI(row) {
     review_snippets: [],
     review_themes: [],
     owner_manager_name: null,
+    owner_name: row.owner_name || null,
+    owner_title: row.owner_title || null,
+    owner_source_page: row.owner_source_page || null,
     lane: row.lane || "weak_website",
     no_website: row.no_website || false,
     backup_contact_method: row.backup_contact_method,
@@ -65,6 +113,8 @@ function oppToUI(row) {
     demo_to_show: row.demo_to_show,
     priority: row.priority,
     status: row.status || "New",
+    opportunity_signals: opportunitySignals,
+    high_opportunity: !!row.high_opportunity,
   };
 }
 
@@ -77,6 +127,16 @@ function mergeCaseIntoUI(ui, cf) {
       platform: cf.platform_used,
       issues: problems,
       facts: cf.homepage_title ? [`Title: ${cf.homepage_title.slice(0, 100)}`] : [],
+    },
+    website_audit: {
+      website_score: cf.website_score ?? ui.website_audit?.website_score ?? null,
+      mobile_score: cf.mobile_score ?? ui.website_audit?.mobile_score ?? null,
+      design_score: cf.design_score ?? ui.website_audit?.design_score ?? null,
+      navigation_score: cf.navigation_score ?? ui.website_audit?.navigation_score ?? null,
+      conversion_score: cf.conversion_score ?? ui.website_audit?.conversion_score ?? null,
+      audit_issues: (cf.audit_issues && cf.audit_issues.length)
+        ? cf.audit_issues
+        : (ui.website_audit?.audit_issues || []),
     },
     email_draft: {
       subject: `Quick idea for ${ui.name || "your business"}'s website`,
@@ -92,6 +152,9 @@ function mergeCaseIntoUI(ui, cf) {
       instagram: cf.instagram,
       linkedin: cf.linkedin,
     },
+    owner_name: cf.owner_name || ui.owner_name || null,
+    owner_title: cf.owner_title || ui.owner_title || null,
+    owner_source_page: cf.owner_source_page || ui.owner_source_page || null,
     homepage_title: cf.homepage_title,
     meta_description: cf.meta_description,
     viewport_ok: cf.viewport_ok,
@@ -103,6 +166,13 @@ function mergeCaseIntoUI(ui, cf) {
     hours_visibility: cf.hours_visibility,
     directions_visibility: cf.directions_visibility,
     contact_form_present: cf.contact_form_present,
+    website_score: cf.website_score ?? ui.website_score ?? null,
+    mobile_score: cf.mobile_score ?? ui.mobile_score ?? null,
+    design_score: cf.design_score ?? ui.design_score ?? null,
+    navigation_score: cf.navigation_score ?? ui.navigation_score ?? null,
+    conversion_score: cf.conversion_score ?? ui.conversion_score ?? null,
+    audit_issues: (cf.audit_issues && cf.audit_issues.length) ? cf.audit_issues : (ui.audit_issues || []),
+    high_opportunity: cf.high_opportunity ?? ui.high_opportunity ?? false,
     navigation_items: cf.navigation_items || [],
     important_internal_links: cf.important_internal_links || {},
     outdated_design_clues: cf.outdated_design_clues,
@@ -121,6 +191,22 @@ function mergeCaseIntoUI(ui, cf) {
     follow_up_due: cf.follow_up_due,
     outcome: cf.outcome,
     status: cf.status || "New",
+    opportunity_score: cf.opportunity_score ?? ui.opportunity_score ?? ui.score ?? ui.internal_score ?? null,
+    score: cf.opportunity_score ?? ui.opportunity_score ?? ui.score ?? ui.internal_score ?? null,
+    lead_tier: cf.lead_tier || ui.lead_tier || null,
+    desktop_screenshot_url: cf.desktop_screenshot_url || null,
+    mobile_screenshot_url: cf.mobile_screenshot_url || null,
+    internal_screenshot_url: cf.internal_screenshot_url || null,
+    opportunity_signals: (cf.opportunity_signals && cf.opportunity_signals.length)
+      ? cf.opportunity_signals
+      : computeOpportunitySignals({
+        ...ui,
+        ...cf,
+        distance_miles: ui.distance_miles,
+        review_count: ui.review_count,
+        lane: ui.lane,
+        no_website: ui.no_website,
+      }),
   };
 }
 

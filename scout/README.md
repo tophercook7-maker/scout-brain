@@ -19,7 +19,7 @@
 
 ## Morning Runner (CLI)
 
-From the **massive-brain** folder:
+From the **scout-brain** folder:
 
 ```bash
 cd scout && python3 morning_runner.py
@@ -28,7 +28,7 @@ cd scout && python3 morning_runner.py
 Or from repo root:
 
 ```bash
-python3 massive-brain/scout/morning_runner.py
+python3 scout-brain/scout/morning_runner.py
 ```
 
 Reads `scout/config.json` at runtime and prints a run summary plus JSON (config + leads) for future integration (e.g. real Maps API, import into Brain).

@@ -17,6 +17,34 @@ console.log("frontend loaded");
 const apiBase = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
 window.MB_API_BASE = apiBase;
 
+function normalizeBasePath(path, fallback = "/admin") {
+  const raw = String(path || fallback).trim();
+  if (!raw) return fallback;
+  let normalized = raw.startsWith("/") ? raw : `/${raw}`;
+  normalized = normalized.replace(/\/+/g, "/");
+  if (normalized.length > 1 && normalized.endsWith("/")) normalized = normalized.slice(0, -1);
+  return normalized || fallback;
+}
+
+const ADMIN_BASE_PATH = normalizeBasePath(import.meta.env.VITE_ADMIN_BASE_PATH || "/admin", "/admin");
+const LOGIN_PATH = "/login";
+window.MB_ADMIN_BASE_PATH = ADMIN_BASE_PATH;
+
+function adminRouteForModule(module) {
+  if (!module || module === "dashboard") return ADMIN_BASE_PATH;
+  return `${ADMIN_BASE_PATH}/${String(module).replace(/^\//, "")}`;
+}
+
+function ensureRobotsMeta(noindex) {
+  let meta = document.querySelector('meta[name="robots"]');
+  if (!meta) {
+    meta = document.createElement("meta");
+    meta.setAttribute("name", "robots");
+    document.head.appendChild(meta);
+  }
+  meta.setAttribute("content", noindex ? "noindex,nofollow" : "index,follow");
+}
+
 if (!apiBase && window.location.hostname.includes("vercel.app")) {
   console.warn("VITE_API_BASE_URL is not set. Configure it in Vercel to point at your hosted backend.");
 }
@@ -76,17 +104,33 @@ function normalizedPath() {
 }
 
 function isAdminRoute(path = normalizedPath()) {
-  return path === "/admin" || path.startsWith("/admin/");
+  return path === ADMIN_BASE_PATH || path.startsWith(`${ADMIN_BASE_PATH}/`);
 }
 
 function currentPublicRoute(path = normalizedPath()) {
-  if (path === "/" || path === "/services" || path === "/portfolio" || path === "/contact") return path;
+  if (path === "/" || path === "/services" || path === "/portfolio" || path === "/contact" || path === LOGIN_PATH) return path;
   return "/";
+}
+
+function redirectToLogin() {
+  const current = normalizedPath();
+  if (current === LOGIN_PATH) return;
+  history.replaceState({}, "", LOGIN_PATH);
+  applyRouteShell();
+}
+
+function applyAdminLinkHrefs() {
+  document.querySelectorAll(".admin-module-link").forEach((link) => {
+    const module = link.getAttribute("data-admin-module") || "dashboard";
+    link.setAttribute("href", adminRouteForModule(module));
+  });
 }
 
 function applyRouteShell() {
   const path = normalizedPath();
   const admin = isAdminRoute(path);
+  ensureRobotsMeta(admin);
+  applyAdminLinkHrefs();
   const publicSite = document.getElementById("public-site");
   const adminApp = document.getElementById("admin-app");
   if (publicSite) publicSite.classList.toggle("hidden", admin);
@@ -98,7 +142,7 @@ function applyRouteShell() {
   });
   document.querySelectorAll(".public-nav-link").forEach((el) => {
     const href = el.getAttribute("data-public-route") || "";
-    el.classList.toggle("active", href === (admin ? "/admin" : publicRoute));
+    el.classList.toggle("active", href === publicRoute);
   });
 
   const routeLabel = document.getElementById("adminRouteLabel");
@@ -391,7 +435,8 @@ async function boot() {
   setDebugValue("dbg-init", "booting");
   const cssOk = document.styleSheets.length > 0 && getComputedStyle(document.documentElement).getPropertyValue("--bg").trim();
   console.log("[Massive Brain] Boot | stylesheets:", document.styleSheets.length, "| --bg set:", !!cssOk);
-  if (!isAdminRoute()) {
+  const path = normalizedPath();
+  if (!isAdminRoute(path) && path !== LOGIN_PATH) {
     setDebugValue("dbg-init", "public");
     return;
   }
@@ -401,7 +446,7 @@ async function boot() {
       window.MB_USE_CLOUD = false;
       setDebugValue("dbg-auth", "no user");
       setAdminAccess(false);
-      const container = document.getElementById("auth-container");
+      const container = path === LOGIN_PATH ? document.getElementById("public-auth-container") : document.getElementById("auth-container");
       if (container) {
         container.innerHTML = `<div class="panel" style="max-width:520px;margin:24px auto;">
           <h3>Admin login unavailable</h3>
@@ -429,9 +474,13 @@ async function boot() {
     if (!session?.user) {
       window.MB_USE_CLOUD = false;
       setAdminAccess(false);
-      const container = document.getElementById("auth-container");
-      if (container) {
-        document.querySelector("main.dashboard")?.classList.add("showing-auth");
+      if (isAdminRoute(path)) {
+        redirectToLogin();
+        return;
+      }
+      const container = document.getElementById("public-auth-container");
+      if (container && path === LOGIN_PATH) {
+        container.innerHTML = "";
         renderAuthUI(container, async () => {
           document.querySelector("main.dashboard")?.classList.remove("showing-auth");
           let freshSession = null;
@@ -457,6 +506,8 @@ async function boot() {
             renderLoggedInBar(handleLogout);
             setAuthEmailDisplay(freshSession);
             setDebugValue("dbg-auth", "signed-in");
+            history.replaceState({}, "", ADMIN_BASE_PATH);
+            applyRouteShell();
             await loadAppModules();
             const workspaceMissing = !workspaceCtx?.workspaceId || workspaceCtx?.source === "workspace-missing";
             showWorkspaceFallback(workspaceMissing);
@@ -471,6 +522,10 @@ async function boot() {
       return;
     }
 
+    if (path === LOGIN_PATH) {
+      history.replaceState({}, "", ADMIN_BASE_PATH);
+      applyRouteShell();
+    }
     window.MB_SESSION = session;
     setCloudBridge();
     let workspaceCtx = null;
@@ -528,6 +583,9 @@ initAuth?.((session) => {
     setDebugValue("dbg-auth", "signed-in");
   } else if (!session?.user) {
     setDebugValue("dbg-auth", "no user");
+    if (isAdminRoute()) {
+      redirectToLogin();
+    }
   }
 });
 
@@ -535,6 +593,10 @@ window.addEventListener("error", (e) => {
   console.error("Global JS error:", e.error || e.message);
 });
 window.addEventListener("popstate", () => {
+  if (isAdminRoute() && !window.MB_SESSION?.user) {
+    redirectToLogin();
+    return;
+  }
   applyRouteShell();
   if (isAdminRoute()) {
     window.MB_APPLY_ADMIN_ROUTE_VIEW?.();

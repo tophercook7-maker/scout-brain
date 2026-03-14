@@ -276,9 +276,10 @@ def search_places(
     city: str,
     categories: list[str],
     max_per_category: int = 5,
-    radius_miles: float = 25,
+    radius_miles: float | list[float] = 25,
     current_lat: float | None = None,
     current_lng: float | None = None,
+    max_total_results: int = 120,
     log: Callable[[str], None] | None = None,
 ) -> list[dict]:
     """
@@ -307,40 +308,56 @@ def search_places(
         else:
             print(msg)
 
-    radius_m = radius_miles * 1609.34
+    if isinstance(radius_miles, list):
+        radii = [float(r) for r in radius_miles if float(r) > 0]
+    else:
+        radii = [float(radius_miles)] if float(radius_miles) > 0 else []
+    if not radii:
+        radii = [2.0, 5.0, 10.0, 15.0]
+
     all_places = []
     seen_ids: set[str] = set()
 
     for cat in categories:
-        query = f"{cat} in {city}"
-        _log(f"Searching: {query}")
-        try:
-            results = text_search_new(query, lat, lng, radius_m, max_per_category, log=log)
-        except RuntimeError as e:
-            err_str = str(e).upper()
-            if "REQUEST_DENIED" in err_str or "LEGACY" in err_str:
-                raise RuntimeError(
-                    f"Places API REQUEST_DENIED or legacy API. "
-                    f"Enable 'Places API (New)' and 'Geocoding API' in your Google Cloud project. Original: {e}"
-                ) from e
-            raise
+        _log(f"category search started: {cat}")
+        for radius in radii:
+            if len(all_places) >= max_total_results:
+                break
+            radius_m = radius * 1609.34
+            query = f"{cat} in {city}"
+            _log(f"radius search started: {radius} miles")
+            try:
+                results = text_search_new(query, lat, lng, radius_m, max_per_category, log=log)
+            except RuntimeError as e:
+                err_str = str(e).upper()
+                if "REQUEST_DENIED" in err_str or "LEGACY" in err_str:
+                    raise RuntimeError(
+                        f"Places API REQUEST_DENIED or legacy API. "
+                        f"Enable 'Places API (New)' and 'Geocoding API' in your Google Cloud project. Original: {e}"
+                    ) from e
+                raise
 
-        for r in results:
-            pid = r.get("place_id") or r.get("id")
-            name = r.get("name") or "?"
-            if not pid:
-                continue
-            if pid in seen_ids:
-                continue
-            seen_ids.add(pid)
-            _log(f"Places result found: {name}")
-            _log(f"Website found: {'yes' if r.get('website') else 'no'}")
-            _log(f"Phone found: {'yes' if r.get('phone') else 'no'}")
-            r["category"] = cat
-            details = place_details_new(pid, lat, lng, log=log)
-            if details:
-                # Prefer richer details payload when available.
-                r.update({k: v for k, v in details.items() if v is not None})
-            all_places.append(r)
+            for r in results:
+                if len(all_places) >= max_total_results:
+                    break
+                pid = r.get("place_id") or r.get("id")
+                name = r.get("name") or "?"
+                if not pid:
+                    continue
+                if pid in seen_ids:
+                    _log(f"duplicate business skipped: {name}")
+                    continue
+                seen_ids.add(pid)
+                _log(f"Places result found: {name}")
+                _log(f"Website found: {'yes' if r.get('website') else 'no'}")
+                _log(f"Phone found: {'yes' if r.get('phone') else 'no'}")
+                r["category"] = cat
+                details = place_details_new(pid, lat, lng, log=log)
+                if details:
+                    # Prefer richer details payload when available.
+                    r.update({k: v for k, v in details.items() if v is not None})
+                all_places.append(r)
+
+    _log(f"total businesses discovered: {len(all_places)}")
 
     return all_places
