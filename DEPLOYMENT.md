@@ -8,6 +8,14 @@ Use this checklist to deploy Massive Brain so it runs from any device without yo
 - MixedMakerShop admin is currently separate from Scout-Brain.
 - This deployment guide targets improving and operating the standalone Scout-Brain app first.
 
+## Dual-mode product direction
+
+- One Scout-Brain core app supports both:
+  - internal MixedMakerShop usage
+  - standalone SaaS usage for external users
+- Keep one codebase and one data model; do not fork into separate apps.
+- Billing/subscriptions are intentionally out of scope for now.
+
 ## Architecture
 
 - **Frontend**: Vercel (standalone Scout-Brain frontend)
@@ -140,3 +148,4 @@ The backend runs the scout using config from the **repo** (e.g. `scout/config.js
 ### Phase 2 - MixedMakerShop integration (later)
 
 - Integrate or link Scout-Brain into MixedMakerShop admin once standalone polish targets are met.
+- Surface lightweight integration widgets first (dashboard card, top leads, quick Run Scout, top opportunities, deep link to full app).

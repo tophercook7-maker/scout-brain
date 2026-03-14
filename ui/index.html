@@ -11,9 +11,9 @@
   <section id="public-site" class="public-site">
     <header class="topbar public-topbar">
       <div>
-        <p class="eyebrow">MixedMakerShop</p>
-        <h1>Scout-Brain</h1>
-        <p class="subtext">Web design and growth systems for local businesses.</p>
+        <p class="eyebrow" id="publicBrandEyebrow">MixedMakerShop</p>
+        <h1 id="publicBrandTitle">Scout-Brain</h1>
+        <p class="subtext" id="publicBrandSubtext">Web design and growth systems for local businesses.</p>
       </div>
       <nav class="public-nav">
         <a href="/" class="ghost-btn public-nav-link" data-public-route="/">Home</a>
@@ -55,9 +55,10 @@
     <header class="topbar">
       <div>
         <p class="eyebrow">Private Admin / CRM</p>
-        <h1>Scout-Brain Admin</h1>
+        <h1 id="adminBrandTitle">Scout-Brain Admin</h1>
         <p class="subtext" id="adminRouteLabel">/admin</p>
         <p class="subtext" id="adminModuleDescription">Dashboard</p>
+        <p class="subtext" id="workspaceBadge">Workspace: Personal</p>
       </div>
       <div class="topbar-actions">
         <button id="exportBrain" class="ghost-btn" type="button">Backup Brain</button>
@@ -128,8 +129,8 @@
 
           <div class="dashboard-command-grid">
             <article class="item-card">
-              <h4>Top Opportunities</h4>
-              <p class="runner-today-hint">Top 5 by website gap, score, reachability, and status.</p>
+              <h4>Top 5 Contacts Today</h4>
+              <p class="runner-today-hint">Best leads to contact now based on score and outreach readiness.</p>
               <div id="dashboardTopOpps" class="dashboard-top-opps"></div>
             </article>
 

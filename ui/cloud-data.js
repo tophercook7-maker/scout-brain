@@ -5,6 +5,27 @@
 import { supabase } from "../src/lib/supabaseClient.js";
 import { loadOpportunities } from "../src/lib/opportunities.js";
 import { loadCaseFile, saveCaseFile } from "../src/lib/caseFiles.js";
+import {
+  isMissingWorkspaceSchemaError,
+  resolveWorkspaceContext,
+  withWorkspaceId,
+} from "../src/lib/workspace.js";
+
+function asList(v) {
+  if (!v) return [];
+  if (Array.isArray(v)) return v.map((x) => String(x).trim()).filter(Boolean);
+  const text = String(v).trim();
+  return text ? [text] : [];
+}
+
+function first(...vals) {
+  for (const v of vals) {
+    if (v === null || v === undefined) continue;
+    const text = String(v).trim();
+    if (text) return text;
+  }
+  return null;
+}
 
 function formatHours(h) {
   if (h == null) return null;
@@ -103,8 +124,102 @@ function mergeCaseIntoUI(ui, cf) {
   };
 }
 
+function generateOutreachPackFromOpportunity(opp) {
+  console.log("generating outreach pack");
+  const businessName = first(opp?.name, "your business");
+  const lane = (first(opp?.lane) || (opp?.no_website ? "no_website" : "weak_website")).toLowerCase();
+  const ownerName = first(opp?.owner_manager_name, (opp?.owner_names || [])[0]);
+  const category = first(opp?.category);
+  const strongestPitch = first(opp?.pitch_angle, opp?.strongest_pitch_angle);
+  const bestService = first(opp?.best_service_to_offer);
+  const demo = first(opp?.best_demo_to_show, opp?.demo_to_show);
+  const recommendedContact = first(opp?.recommended_contact, opp?.backup_contact_method);
+  const strongestProblems = asList(opp?.website_analysis?.issues || opp?.strongest_problems);
+  const reviewThemes = asList(opp?.review_themes);
+
+  const greeting = ownerName ? `Hi ${ownerName},` : "Hi there,";
+  const categoryLine = category ? ` (${category})` : "";
+  const observation = lane === "no_website"
+    ? `I noticed ${businessName}${categoryLine} does not seem to have a website yet.`
+    : (strongestProblems[0] || `I noticed a few easy website improvements for ${businessName}${categoryLine}.`);
+  const valueAngle = strongestPitch || (
+    lane === "no_website"
+      ? "A simple, professional site can help local customers find your hours and contact info."
+      : "A cleaner mobile experience and clearer calls to action can make outreach and bookings easier."
+  );
+  const proof = [];
+  if (strongestProblems.length) proof.push(...strongestProblems.slice(0, 2));
+  if (reviewThemes.length) proof.push(`Customers often mention: ${reviewThemes.slice(0, 2).join(", ")}.`);
+  if (!proof.length && opp?.address) proof.push(`I was reviewing businesses around ${opp.address}.`);
+
+  const offerLine = bestService || "I can share one quick, practical improvement idea.";
+  const demoLine = demo ? `I can also show a quick demo: ${demo}.` : "";
+  const contactLine = recommendedContact
+    ? `Best way to reach you seems to be ${recommendedContact}.`
+    : "Happy to use whichever contact method works best for your team.";
+
+  const shortEmail = [
+    greeting,
+    "",
+    observation,
+    valueAngle,
+    "",
+    "If helpful, I can send one quick idea you can review in a few minutes.",
+    "",
+    "Thanks,",
+    "Topher",
+    "topher@mixedmakershop.com",
+  ].join("\n");
+
+  const longerEmail = [
+    greeting,
+    "",
+    `I took a quick look at ${businessName}${categoryLine}.`,
+    observation,
+    valueAngle,
+    "",
+    ...(proof.length ? ["What stood out:", ...proof.map((p) => `- ${p}`), ""] : []),
+    `Offer: ${offerLine}`,
+    demoLine,
+    contactLine,
+    "",
+    "If you're open to it, I can send a short walkthrough and keep it low-pressure.",
+    "",
+    "Thanks,",
+    "Topher",
+    "topher@mixedmakershop.com",
+  ].filter(Boolean).join("\n");
+
+  const contactFormVersion = `${observation} ${valueAngle} Offer: ${offerLine}. If helpful, I can send one quick idea today. Topher — topher@mixedmakershop.com`;
+  const socialDmVersion = `Hey — quick note about ${businessName}. ${observation} ${valueAngle} Happy to send one simple idea if useful.`;
+  const followUpNote = `Quick follow-up on my note about ${businessName}. If you'd like, I can send that one-page idea and keep it brief.`;
+
+  const missing = [];
+  if (!ownerName) missing.push("owner_manager_name");
+  if (!strongestProblems.length) missing.push("strongest_problems");
+  if (!strongestPitch) missing.push("strongest_pitch_angle");
+  if (!bestService) missing.push("best_service_to_offer");
+  if (missing.length) console.log("missing dossier fields handled", missing);
+
+  console.log("outreach pack generated");
+  return {
+    short_email: shortEmail,
+    longer_email: longerEmail,
+    contact_form_version: contactFormVersion,
+    social_dm_version: socialDmVersion,
+    follow_up_note: followUpNote,
+    follow_up_line: followUpNote,
+  };
+}
+
 export async function fetchScoutDataFromSupabase() {
   if (!supabase) return null;
+  let workspaceCtx = null;
+  try {
+    workspaceCtx = await resolveWorkspaceContext();
+  } catch (err) {
+    console.warn("workspace context fallback for cloud scout data:", err?.message || err);
+  }
 
   const opps = await loadOpportunities();
   const opportunities = [];
@@ -121,6 +236,8 @@ export async function fetchScoutDataFromSupabase() {
       summary: `From cloud: ${opportunities.length} opportunities`,
       top_opportunities: opportunities,
       case_slugs: opps?.map((o) => o.id) || [],
+      workspace_id: workspaceCtx?.workspaceId || null,
+      workspace_name: workspaceCtx?.workspaceName || null,
     },
     opportunities,
   };
@@ -167,6 +284,36 @@ export async function updateCaseInSupabase(slugOrId, updates) {
   await saveCaseFile(opp.id, caseUpdates);
 }
 
+export async function regenerateOutreachForCaseInSupabase(slugOrId, existingOpp = null) {
+  if (!supabase) throw new Error("Not authenticated");
+  const opps = await loadOpportunities();
+  const oppRow = opps?.find((o) => o.id === slugOrId);
+  if (!oppRow) throw new Error("Case not found");
+
+  let ui = existingOpp || oppToUI(oppRow);
+  if (!existingOpp) {
+    const cf = await loadCaseFile(oppRow.id);
+    ui = mergeCaseIntoUI(ui, cf);
+  }
+
+  const pack = generateOutreachPackFromOpportunity(ui);
+  try {
+    await saveCaseFile(oppRow.id, { ...pack, updated_at: new Date().toISOString() });
+  } catch (err) {
+    const msg = String(err?.message || err || "").toLowerCase();
+    if (msg.includes("social_dm_version")) {
+      const legacyPack = { ...pack };
+      delete legacyPack.social_dm_version;
+      delete legacyPack.follow_up_line;
+      await saveCaseFile(oppRow.id, { ...legacyPack, updated_at: new Date().toISOString() });
+    } else {
+      throw err;
+    }
+  }
+  console.log("outreach pack regenerated");
+  return mergeCaseIntoUI(ui, pack);
+}
+
 export { loadNotes as fetchNotesFromSupabase } from "../src/lib/notes.js";
 import { addNote } from "../src/lib/notes.js";
 
@@ -184,11 +331,31 @@ export async function saveScoutRunToSupabase({ summary, processed_count, saved_c
   const user = authData?.user || null;
   if (!user) return;
 
-  await supabase.from("scout_runs").insert({
+  let workspaceId = null;
+  try {
+    const ctx = await resolveWorkspaceContext();
+    workspaceId = ctx?.workspaceId || null;
+  } catch {
+    workspaceId = null;
+  }
+
+  let { error } = await supabase.from("scout_runs").insert(withWorkspaceId({
     user_id: user.id,
     summary: summary || "",
     processed_count: processed_count ?? 0,
     saved_count: saved_count ?? 0,
     skipped_count: skipped_count ?? 0,
-  });
+  }, workspaceId));
+
+  if (error && workspaceId && isMissingWorkspaceSchemaError(error)) {
+    const retry = await supabase.from("scout_runs").insert({
+      user_id: user.id,
+      summary: summary || "",
+      processed_count: processed_count ?? 0,
+      saved_count: saved_count ?? 0,
+      skipped_count: skipped_count ?? 0,
+    });
+    error = retry.error;
+  }
+  if (error) throw error;
 }

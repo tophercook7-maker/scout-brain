@@ -14,10 +14,12 @@ from pathlib import Path
 try:
     from .case_schema import empty_case, slug_from_name, save_case
     from .investigator import investigate
+    from .outreach_generator import generate_outreach_pack
     from .errors import ScoutRunError
 except ImportError:
     from case_schema import empty_case, slug_from_name, save_case
     from investigator import investigate
+    from outreach_generator import generate_outreach_pack
     from errors import ScoutRunError
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -136,101 +138,31 @@ def _score_weak_website(case: dict) -> float:
 
 
 def _outreach_no_website(name: str, city: str) -> dict:
-    """Outreach drafts for businesses with no website."""
-    short = f"""Hi there,
-
-My name is Topher and I run MixedMakerShop.
-
-I noticed {name} in {city} doesn't have a website yet — a simple site can help local customers find you, your hours, and how to reach you.
-
-I build straightforward websites for small businesses. Happy to send a quick example if you're interested.
-
-Thanks,
-Topher
-topher@mixedmakershop.com
-MixedMakerShop.com"""
-
-    long_body = f"""Hi there,
-
-My name is Topher and I run MixedMakerShop.
-
-I noticed {name} in {city} doesn't have a website yet. A simple site can make it easier for customers to:
-- Find your hours and location
-- Call or contact you
-- See what you offer
-
-I build straightforward websites for local businesses — nothing fancy, just clear and useful. Would love to send a quick example if you're open to it.
-
-No pressure — just wanted to reach out.
-
-Thanks,
-Topher
-topher@mixedmakershop.com
-MixedMakerShop.com"""
-
-    follow_up = f"Following up — still happy to send that quick website example for {name} whenever works for you."
-
-    return {
-        "short_email": short,
-        "longer_email": long_body,
-        "contact_form_version": f"Quick note — I help local businesses get their first website. {name} could benefit from a simple site. Happy to share an example. Topher — topher@mixedmakershop.com",
-        "social_dm_version": f"Hey! I noticed {name} doesn't have a website yet. I help local businesses get simple sites — would love to send a quick example if you're interested.",
-        "follow_up_note": follow_up,
-        "follow_up_line": f"Quick follow-up — still happy to send that website example for {name}.",
-    }
+    """Backward-compatible wrapper; prefer generate_outreach_pack."""
+    return generate_outreach_pack(
+        {
+            "business_name": name,
+            "lane": "no_website",
+            "no_website": True,
+            "strongest_pitch_angle": "Get your first simple website so customers can find you online",
+            "best_service_to_offer": "First website — simple, mobile-friendly, with hours and contact",
+        },
+        city_hint=city,
+    )
 
 
 def _outreach_weak_website(name: str, city: str, problems: list, pitch_lines: list) -> dict:
-    """Outreach drafts from website investigation."""
-    bullets = "\n".join(f"- {p}" for p in (problems or [])[:4])
-    pitch_bullets = "\n".join(f"- {p}" for p in (pitch_lines or [])[:4])
-
-    short = f"""Hi there,
-
-My name is Topher and I run MixedMakerShop.
-
-I came across {name} in {city} and had a quick idea for your website.
-
-{problems[0] if problems else "Your site could be clearer on phones."}
-
-I build simple modern websites for small businesses. Happy to send a quick example if you're interested.
-
-Thanks,
-Topher
-topher@mixedmakershop.com
-MixedMakerShop.com"""
-
-    long_body = f"""Hi there,
-
-My name is Topher and I run MixedMakerShop.
-
-I came across {name} in {city} and had a quick idea that might help your website feel cleaner and easier to use on phones.
-"""
-    if bullets:
-        long_body += f"\nA few things stood out:\n{bullets}\n\n"
-    long_body += "I build simple modern websites, and I think a better version could:\n"
-    long_body += pitch_bullets or "- create a cleaner mobile-friendly layout"
-    long_body += """
-
-Happy to send over a quick example. No pressure — just wanted to reach out.
-
-Thanks,
-Topher
-topher@mixedmakershop.com
-MixedMakerShop.com"""
-
-    contact_form = f"Quick idea for {name}'s website — I help local businesses get cleaner, mobile-friendly sites. Would love to share an example if you're open to it. Topher — topher@mixedmakershop.com"
-    social_dm = f"Hey! I run MixedMakerShop and help local businesses with websites. Came across {name} — would love to send a quick example of a cleaner mobile-friendly version if you're interested."
-    follow_up = f"Following up — still happy to send that quick website example for {name} whenever works for you."
-
-    return {
-        "short_email": short,
-        "longer_email": long_body,
-        "contact_form_version": contact_form,
-        "social_dm_version": social_dm,
-        "follow_up_note": follow_up,
-        "follow_up_line": follow_up,
-    }
+    """Backward-compatible wrapper; prefer generate_outreach_pack."""
+    return generate_outreach_pack(
+        {
+            "business_name": name,
+            "lane": "weak_website",
+            "strongest_problems": problems or [],
+            "strongest_pitch_angle": (pitch_lines or [None])[0],
+            "best_service_to_offer": "Modern mobile-friendly website with clear menu, hours, and contact",
+        },
+        city_hint=city,
+    )
 
 
 def _build_no_website_case(place: dict, home_city: str, categories: list, index: int, log: list, category: str = "") -> dict | None:
@@ -287,14 +219,6 @@ def _build_no_website_case(place: dict, home_city: str, categories: list, index:
         case["recommended_contact_method"] = "Maps / visit in person"
         case["backup_contact_method"] = None
 
-    pack = _outreach_no_website(name, home_city)
-    case["short_email"] = pack["short_email"]
-    case["longer_email"] = pack["longer_email"]
-    case["contact_form_version"] = pack["contact_form_version"]
-    case["social_dm_version"] = pack["social_dm_version"]
-    case["follow_up_note"] = pack["follow_up_note"]
-    case["follow_up_line"] = pack["follow_up_line"]
-
     case["strongest_problems"] = ["No website — missing online presence"]
     case["strongest_pitch_angle"] = "Get your first simple website so customers can find you online"
     case["best_service_to_offer"] = "First website — simple, mobile-friendly, with hours and contact"
@@ -324,6 +248,14 @@ def _build_no_website_case(place: dict, home_city: str, categories: list, index:
         "social_available": False,
         "email_available": False,
     }
+
+    pack = generate_outreach_pack(case, city_hint=home_city, logger=log.append)
+    case["short_email"] = pack["short_email"]
+    case["longer_email"] = pack["longer_email"]
+    case["contact_form_version"] = pack["contact_form_version"]
+    case["social_dm_version"] = pack["social_dm_version"]
+    case["follow_up_note"] = pack["follow_up_note"]
+    case["follow_up_line"] = pack["follow_up_line"]
 
     valid, reason = _validate_case(case)
     if not valid:
@@ -444,7 +376,7 @@ def _build_weak_website_case(place: dict, home_city: str, categories: list, inde
         case["recommended_contact_method"] = "Website or phone"
     case["backup_contact_method"] = "Phone" if case["email"] else "Email" if (case["phone"] or case["phone_from_site"]) else None
 
-    pack = _outreach_weak_website(name, home_city, problems, pitch_lines)
+    pack = generate_outreach_pack(case, city_hint=home_city, logger=log.append)
     case["short_email"] = pack["short_email"]
     case["longer_email"] = pack["longer_email"]
     case["contact_form_version"] = pack["contact_form_version"]

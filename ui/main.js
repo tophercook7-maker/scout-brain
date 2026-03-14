@@ -5,6 +5,11 @@
  */
 import "./styles.css";
 import { initDebugOverlay, setDebugValue } from "../src/debug-overlay.js";
+import {
+  clearWorkspaceContext,
+  getPresentationMode,
+  resolveWorkspaceContext,
+} from "../src/lib/workspace.js";
 console.log("frontend loaded");
 
 // API base URL for standalone Railway-hosted Scout-Brain backend.
@@ -21,10 +26,46 @@ import { initAuth, signIn, signUp, signOut, requestPasswordReset } from "../src/
 import {
   fetchScoutDataFromSupabase,
   getCaseFromSupabase,
+  regenerateOutreachForCaseInSupabase,
   updateCaseInSupabase,
 } from "./cloud-data.js";
 
 let modulesLoaded = false;
+
+function setText(id, value) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = value;
+}
+
+function applyPresentationBranding(session, workspaceCtx = null) {
+  const mode = getPresentationMode();
+  const isOwnerInternal = !!workspaceCtx?.isOwnerInternal;
+  const effectiveMode = isOwnerInternal ? "internal" : mode;
+  document.body.setAttribute("data-presentation-mode", effectiveMode);
+
+  if (effectiveMode === "internal") {
+    setText("publicBrandEyebrow", "MixedMakerShop Internal");
+    setText("publicBrandTitle", "Scout-Brain");
+    setText("publicBrandSubtext", "Internal sales workspace powered by Scout-Brain.");
+    setText("adminBrandTitle", "Scout-Brain Internal CRM");
+  } else {
+    setText("publicBrandEyebrow", "Scout-Brain");
+    setText("publicBrandTitle", "Scout-Brain");
+    setText("publicBrandSubtext", "Standalone lead intelligence and outreach workspace.");
+    setText("adminBrandTitle", "Scout-Brain Workspace");
+  }
+
+  const workspaceName = workspaceCtx?.workspaceName || "Personal";
+  setText("workspaceBadge", `Workspace: ${workspaceName}`);
+  window.MB_WORKSPACE = {
+    workspaceId: workspaceCtx?.workspaceId || null,
+    workspaceName,
+    role: workspaceCtx?.role || "member",
+    isOwnerInternal,
+    presentationMode: effectiveMode,
+    email: session?.user?.email || "",
+  };
+}
 
 function normalizedPath() {
   const p = window.location.pathname || "/";
@@ -104,6 +145,7 @@ function renderAuthUI(container, onLoggedIn) {
       <h2 style="margin:0 0 8px;">Massive Brain</h2>
       <p style="color:var(--muted,#999);margin:0 0 20px;">Sign in to sync across devices</p>
       <form id="auth-form">
+        <input type="text" id="auth-display-name" placeholder="Display name" style="display:none;width:100%;padding:12px;margin-bottom:10px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--text);">
         <input type="email" id="auth-email" placeholder="Email" required style="width:100%;padding:12px;margin-bottom:10px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--text);">
         <input type="password" id="auth-password" placeholder="Password" required style="width:100%;padding:12px;margin-bottom:10px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--text);">
         <button type="submit" class="primary-btn" style="width:100%;padding:12px;">Sign In</button>
@@ -121,6 +163,7 @@ function renderAuthUI(container, onLoggedIn) {
 
   let isSignUp = false;
   const form = root.querySelector("#auth-form");
+  const displayNameEl = root.querySelector("#auth-display-name");
   const emailEl = root.querySelector("#auth-email");
   const passwordEl = root.querySelector("#auth-password");
   const errorEl = root.querySelector("#auth-error");
@@ -134,12 +177,26 @@ function renderAuthUI(container, onLoggedIn) {
     console.log("sign in clicked");
     try {
       if (isSignUp) {
-        const { error } = await signUp(emailEl.value, passwordEl.value);
-        if (error) {
-          console.error("sign in failed", error);
-          errorEl.textContent = error.message || "Login failed. Check email and password.";
+        console.log("sign up clicked");
+        const displayName = (displayNameEl?.value || "").trim();
+        if (!displayName) {
+          console.error("sign up failed", { message: "Display name is required." });
+          errorEl.textContent = "Display name is required for sign up.";
           return;
         }
+        const metadata = {
+          display_name: displayName,
+          workspace_name: `${displayName}'s Workspace`,
+        };
+        console.log("sign up metadata sent", metadata);
+        const { error } = await signUp(emailEl.value, passwordEl.value, metadata);
+        if (error) {
+          console.error("sign up failed", error);
+          errorEl.textContent = error.message || "Sign up failed. Please check your details and try again.";
+          return;
+        }
+        console.log("sign up success");
+        errorEl.style.color = "#7ef5b7";
         errorEl.textContent = "Check your email to confirm.";
       } else {
         const { data, error } = await signIn(emailEl.value, passwordEl.value);
@@ -159,16 +216,30 @@ function renderAuthUI(container, onLoggedIn) {
         onLoggedIn();
       }
     } catch (err) {
-      console.error("sign in failed", err);
-      errorEl.textContent = err.message || "Login failed. Check email and password.";
+      if (isSignUp) {
+        console.error("sign up failed", err);
+        errorEl.textContent = err.message || "Sign up failed. Please check your details and try again.";
+      } else {
+        console.error("sign in failed", err);
+        errorEl.textContent = err.message || "Login failed. Check email and password.";
+      }
     }
   };
 
   toggleEl.onclick = (e) => {
     e.preventDefault();
     isSignUp = !isSignUp;
+    if (displayNameEl) {
+      displayNameEl.style.display = isSignUp ? "block" : "none";
+      displayNameEl.required = isSignUp;
+      if (!isSignUp) displayNameEl.value = "";
+    }
     form.querySelector('button[type="submit"]').textContent = isSignUp ? "Sign Up" : "Sign In";
     toggleEl.textContent = isSignUp ? "Sign in instead" : "Sign up";
+    if (!isSignUp) {
+      errorEl.style.color = "#e08080";
+      errorEl.textContent = "";
+    }
   };
 
   forgotEl.onclick = async (e) => {
@@ -251,6 +322,7 @@ async function boot() {
           <p>Supabase auth is not configured. Set Vercel env vars and reload.</p>
         </div>`;
       }
+      applyPresentationBranding(null, null);
       return;
     }
 
@@ -288,6 +360,8 @@ async function boot() {
           if (freshSession?.user) {
             window.MB_SESSION = freshSession;
             setCloudBridge();
+            const workspaceCtx = await resolveWorkspaceContext();
+            applyPresentationBranding(freshSession, workspaceCtx);
             setAdminAccess(true);
             renderLoggedInBar(handleLogout);
             setAuthEmailDisplay(freshSession);
@@ -306,6 +380,8 @@ async function boot() {
 
     window.MB_SESSION = session;
     setCloudBridge();
+    const workspaceCtx = await resolveWorkspaceContext();
+    applyPresentationBranding(session, workspaceCtx);
     setAdminAccess(true);
     renderLoggedInBar(handleLogout);
     setAuthEmailDisplay(session);
@@ -315,6 +391,7 @@ async function boot() {
     console.error("auth bootstrap failed:", err);
     window.MB_USE_CLOUD = false;
     setAdminAccess(false);
+    applyPresentationBranding(null, null);
     setDebugValue("dbg-auth", "no user");
     setDebugValue("dbg-init", "error");
   }
@@ -325,14 +402,17 @@ function setCloudBridge() {
   window.MB_FETCH_SCOUT_DATA = fetchScoutDataFromSupabase;
   window.MB_GET_CASE = getCaseFromSupabase;
   window.MB_UPDATE_CASE = updateCaseInSupabase;
+  window.MB_REGENERATE_OUTREACH = regenerateOutreachForCaseInSupabase;
 }
 
 function handleLogout() {
+  clearWorkspaceContext();
   window.MB_USE_CLOUD = false;
   window.MB_SESSION = null;
   window.MB_FETCH_SCOUT_DATA = null;
   window.MB_GET_CASE = null;
   window.MB_UPDATE_CASE = null;
+  window.MB_REGENERATE_OUTREACH = null;
   setAdminAccess(false);
   document.getElementById("auth-bar")?.remove();
   location.reload();
@@ -366,10 +446,12 @@ setDebugValue("dbg-backend", "checking");
 
 if (document.readyState === "loading") {
   document.addEventListener("DOMContentLoaded", () => {
+    applyPresentationBranding(null, null);
     applyRouteShell();
     boot();
   });
 } else {
+  applyPresentationBranding(null, null);
   applyRouteShell();
   boot();
 }

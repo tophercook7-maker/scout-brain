@@ -35,10 +35,11 @@ export async function signIn(email, password) {
   }
 }
 
-export async function signUp(email, password) {
+export async function signUp(email, password, metadata = null) {
   if (!supabase) return { data: null, error: new Error("Supabase not configured") };
   try {
-    return await supabase.auth.signUp({ email, password });
+    const options = metadata ? { data: metadata } : undefined;
+    return await supabase.auth.signUp({ email, password, options });
   } catch (err) {
     return { data: null, error: err };
   }

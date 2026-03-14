@@ -751,6 +751,9 @@ async function runScoutNow() {
     if (window.MB_SESSION?.access_token) {
       headers["Authorization"] = `Bearer ${window.MB_SESSION.access_token}`;
     }
+    if (window.MB_WORKSPACE?.workspaceId) {
+      headers["X-Workspace-Id"] = window.MB_WORKSPACE.workspaceId;
+    }
     const payload = deviceLocation || {};
     if (deviceLocation) {
       console.log("run scout using current location");
@@ -990,6 +993,18 @@ function copyAndFeedback(btn, text, label) {
   });
 }
 
+function applyCaseUpdateToOpportunity(target, updated) {
+  if (!target || !updated) return target;
+  Object.assign(target, updated);
+  if (!target.contact) target.contact = {};
+  if (updated.contact) Object.assign(target.contact, updated.contact);
+  if (!target.website_analysis) target.website_analysis = {};
+  if (updated.website_analysis) Object.assign(target.website_analysis, updated.website_analysis);
+  if (!target.email_draft) target.email_draft = {};
+  if (updated.email_draft) Object.assign(target.email_draft, updated.email_draft);
+  return target;
+}
+
 function openCaseDetail(opp) {
   const modal = document.getElementById("caseDetailModal");
   const content = document.getElementById("caseDetailContent");
@@ -1080,6 +1095,7 @@ function openCaseDetail(opp) {
   if (opp.follow_up_note || opp.follow_up_line) html += `<button type="button" class="ghost-btn case-copy-btn" data-copy="followup">Copy follow-up</button>`;
   if (opp.contact_form_version) html += `<button type="button" class="ghost-btn case-copy-btn" data-copy="form">Copy form msg</button>`;
   if (opp.social_dm_version) html += `<button type="button" class="ghost-btn case-copy-btn" data-copy="social">Copy social DM</button>`;
+  html += `<button type="button" class="primary-btn" id="caseRegenerateOutreachBtn">Regenerate Outreach</button>`;
   html += `</div></div>`;
   if (opp.why_worth_pursuing || opp.next_action) {
     html += `<div class="case-detail-section"><h4>${opp.no_website ? "Why this is a strong lead" : "Internal notes"}</h4>`;
@@ -1170,6 +1186,41 @@ function openCaseDetail(opp) {
       copyAndFeedback(btn, text, btn.textContent);
     };
   });
+  const regenBtn = document.getElementById("caseRegenerateOutreachBtn");
+  if (regenBtn) {
+    regenBtn.onclick = async () => {
+      const original = regenBtn.textContent;
+      regenBtn.disabled = true;
+      regenBtn.textContent = "Regenerating...";
+      try {
+        let updatedCase = null;
+        if (window.MB_REGENERATE_OUTREACH) {
+          updatedCase = await window.MB_REGENERATE_OUTREACH(opp.slug, opp);
+        } else {
+          const apiBase = (window.MB_API_BASE || "").replace(/\/$/, "");
+          const res = await fetch(`${apiBase}/case/${encodeURIComponent(opp.slug)}/regenerate-outreach`, {
+            method: "POST",
+          });
+          if (!res.ok) throw new Error("Could not regenerate outreach");
+          const data = await res.json();
+          updatedCase = data?.case || null;
+        }
+        if (updatedCase) {
+          applyCaseUpdateToOpportunity(opp, updatedCase);
+          await refreshScoutData({ reason: "outreach-regenerate", cacheBust: true });
+          openCaseDetail(opp);
+        }
+      } catch (e) {
+        console.error("outreach regeneration failed", e);
+        regenBtn.disabled = false;
+        regenBtn.textContent = "Regenerate failed";
+        setTimeout(() => {
+          regenBtn.disabled = false;
+          regenBtn.textContent = original;
+        }, 1500);
+      }
+    };
+  }
   modal.classList.remove("hidden");
   modal.setAttribute("aria-hidden", "false");
 }
@@ -1550,11 +1601,29 @@ function statusPriority(status) {
   return 0;
 }
 
+function isIgnoredTopContactStatus(status) {
+  const normalized = String(status || "").trim().toLowerCase();
+  return normalized === "closed" || normalized === "not interested" || normalized === "do not contact" || normalized === "skip";
+}
+
 function rankTopOpportunity(opp) {
   let rank = 0;
-  if (opp.no_website || opp.lane === "no_website") rank += 500;
+  const isNoWebsite = opp.no_website || opp.lane === "no_website";
+  const issues = opp.website_analysis?.issues || opp.strongest_problems || [];
+  const reviewCount = Number(opp.review_count || 0) || 0;
+  const rating = Number(opp.rating || 0) || 0;
+  const distance = Number(opp.distance_miles ?? 9999);
+  const contacted = (opp.status || "New") === "Contacted";
+
+  if (isNoWebsite) rank += 600;
+  else if (opp.lane === "weak_website") rank += 420;
+  if (issues.length) rank += 140;
+  if (hasReachableContact(opp)) rank += 120;
+  if (!contacted) rank += 110;
   rank += Math.max(0, getLeadScore(opp)) * 10;
-  if (hasReachableContact(opp)) rank += 200;
+  rank += Math.min(reviewCount, 200) * 0.4;
+  rank += rating * 3;
+  rank -= Math.min(Number.isFinite(distance) ? distance : 9999, 200) * 1.5;
   rank += statusPriority(opp.status || "New") * 25;
   return rank;
 }
@@ -1614,16 +1683,22 @@ function renderDashboardSimpleList(containerId, items, emptyLabel) {
 }
 
 function renderDashboardCommandCenter(today, opportunities) {
+  console.log("computing top opportunities");
   const active = opportunities.filter((o) => !["Closed", "Skip"].includes(o.status || ""));
   const ready = opportunities.filter((o) => (o.status || "New") === "Ready to contact");
   const followUp = opportunities.filter((o) => (o.status || "New") === "Follow up");
   const overdue = opportunities.filter((o) => isOverdueFollowUp(o));
   const dueCount = opportunities.filter((o) => (o.status || "New") === "Follow up" || isOverdueFollowUp(o)).length;
   const leadsToday = today?.top_opportunities?.length || opportunities.length;
-  const topRanked = [...opportunities]
+  const topRanked = opportunities
+    .filter((o) => !isIgnoredTopContactStatus(o.status))
     .sort((a, b) => rankTopOpportunity(b) - rankTopOpportunity(a))
     .slice(0, 5);
-  console.log("top opportunities computed", { count: topRanked.length });
+  if (topRanked.length) {
+    console.log("top opportunities loaded", { count: topRanked.length });
+  } else {
+    console.log("top opportunities empty");
+  }
 
   const setText = (id, val) => {
     const el = document.getElementById(id);
@@ -1652,7 +1727,7 @@ function renderDashboardCommandCenter(today, opportunities) {
       topRanked.forEach((opp) => {
         const row = document.createElement("div");
         row.className = "dashboard-top-opp";
-        const noWebsite = opp.no_website || opp.lane === "no_website" ? "No website" : "Has website";
+        const noWebsite = opp.no_website || opp.lane === "no_website" ? "No Website" : "Weak Website";
         const score = getLeadScore(opp);
         const contact = opp.recommended_contact || opp.backup_contact_method || "Contact unclear";
         const meta = `${opp.category || "Unknown category"} • ${opp.distance_miles ?? "?"} mi • ${noWebsite} • Score ${score}`;
@@ -1673,6 +1748,22 @@ function renderDashboardCommandCenter(today, opportunities) {
           openCaseDetail(opp);
         };
         row.appendChild(openBtn);
+        const copyBtn = document.createElement("button");
+        copyBtn.type = "button";
+        copyBtn.className = "ghost-btn";
+        copyBtn.textContent = "Copy Outreach Message";
+        copyBtn.onclick = () => {
+          const text = opp.email_draft?.body || opp.short_email || opp.longer_email || "";
+          if (!text) {
+            copyBtn.textContent = "No outreach";
+            setTimeout(() => {
+              copyBtn.textContent = "Copy Outreach Message";
+            }, 1200);
+            return;
+          }
+          copyAndFeedback(copyBtn, text, "Copy Outreach Message");
+        };
+        row.appendChild(copyBtn);
         topEl.appendChild(row);
       });
     }

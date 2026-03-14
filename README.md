@@ -24,6 +24,52 @@ Current work should prioritize polishing the live Railway-hosted Scout-Brain app
 - cleaner route naming and admin feel
 - improved scoring and prioritization
 
+## Core product architecture (single codebase)
+
+Scout-Brain is one core product that supports two presentations:
+
+- **Standalone SaaS mode** (primary): external users sign up and run Scout-Brain in private workspaces.
+- **Internal mode** (owner): MixedMakerShop can surface Scout-Brain workflows for internal sales operations.
+
+This repo keeps one shared codebase, one data model, and one API surface (no app fork).
+
+## Multi-tenant foundation
+
+Workspace-aware foundation is introduced for:
+
+- users belong to a workspace (`workspace_users`)
+- opportunities belong to a workspace
+- case files belong to a workspace
+- notes belong to a workspace
+- scout runs belong to a workspace
+
+Migration:
+
+- `supabase/migrations/002_workspace_foundation.sql`
+- `supabase/migrations/003_workspace_users_alignment.sql`
+
+Notes:
+
+- Workspace-aware client reads/writes are added with backward-compatible fallback for existing schema.
+- Existing user-scoped access still works while workspace migration rolls out.
+
+## Internal + standalone presentation modes
+
+- `VITE_APP_PRESENTATION=standalone|internal`
+- `VITE_OWNER_EMAILS` allows owner/internal UX treatment for specific accounts.
+
+Default mode remains standalone Scout-Brain product behavior.
+
+## MixedMakerShop integration pattern (lightweight, not full embed yet)
+
+Phase-appropriate integration strategy:
+
+1. Show a Scout-Brain card inside MixedMakerShop admin (summary KPIs + top leads).
+2. Add quick actions (Run Scout, View top opportunities, open outreach queue).
+3. Deep-link into full Scout-Brain routes (`/admin/scout`, `/admin/leads`, `/admin/cases`, `/admin/outreach`) when deeper workflow is needed.
+
+This keeps Scout-Brain as the core engine while allowing lightweight internal surfacing.
+
 ## Project structure (current)
 
 This repo is intentionally a single-root project (no file moves required).

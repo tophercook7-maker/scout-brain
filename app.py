@@ -167,7 +167,88 @@ def _get_user_id_from_request(request: Request) -> str | None:
         return None
 
 
-def _sync_scout_to_supabase(user_id: str) -> None:
+def _get_workspace_id_from_request(request: Request) -> str | None:
+    """Optional workspace hint for multi-tenant routing."""
+    ws = (request.headers.get("X-Workspace-Id") or "").strip()
+    return ws or None
+
+
+def _is_missing_workspace_schema_error(err: Exception) -> bool:
+    msg = str(err).lower()
+    return (
+        "workspace_id" in msg
+        or "workspace_users" in msg
+        or "workspace_memberships" in msg
+        or "workspaces" in msg
+    )
+
+
+def _resolve_workspace_id_for_user(sb, user_id: str, requested_workspace_id: str | None = None) -> str | None:
+    """
+    Determine workspace from authenticated user (preferred), with optional requested workspace hint.
+    """
+    if not user_id:
+        return None
+    try:
+        # Prefer explicitly requested workspace if the user belongs to it.
+        if requested_workspace_id:
+            candidate = (
+                sb.table("workspace_users")
+                .select("workspace_id")
+                .eq("user_id", user_id)
+                .eq("workspace_id", requested_workspace_id)
+                .limit(1)
+                .execute()
+            )
+            if candidate.data:
+                return requested_workspace_id
+
+        # Default workspace from workspace_users membership.
+        rows = (
+            sb.table("workspace_users")
+            .select("workspace_id")
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+        if rows.data:
+            return rows.data[0].get("workspace_id")
+    except Exception as e:
+        # Legacy fallback path if schema still on workspace_memberships or no workspace tables.
+        if not _is_missing_workspace_schema_error(e):
+            raise
+
+    try:
+        legacy = (
+            sb.table("workspace_memberships")
+            .select("workspace_id")
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+        if legacy.data:
+            return legacy.data[0].get("workspace_id")
+    except Exception:
+        pass
+
+    return requested_workspace_id
+
+
+def _insert_with_workspace_fallback(sb, table_name: str, row: dict):
+    """
+    Insert row and gracefully retry without workspace_id for legacy schemas.
+    """
+    try:
+        return sb.table(table_name).insert(row).execute()
+    except Exception as e:
+        if "workspace_id" in str(e).lower() and "workspace_id" in row:
+            legacy = dict(row)
+            legacy.pop("workspace_id", None)
+            return sb.table(table_name).insert(legacy).execute()
+        raise
+
+
+def _sync_scout_to_supabase(user_id: str, workspace_id: str | None = None) -> None:
     """Load scout results from local files and upsert into Supabase (opportunities + case_files)."""
     if not _supabase_url or not _supabase_service_key:
         return
@@ -178,6 +259,7 @@ def _sync_scout_to_supabase(user_id: str) -> None:
         if not opportunities_ui:
             return
         sb = create_client(_supabase_url, _supabase_service_key)
+        effective_workspace_id = _resolve_workspace_id_for_user(sb, user_id, requested_workspace_id=workspace_id)
         for opp_ui in opportunities_ui:
             slug = opp_ui.get("slug") or opp_ui.get("id")
             name = (opp_ui.get("name") or opp_ui.get("business_name") or "").strip()
@@ -185,6 +267,7 @@ def _sync_scout_to_supabase(user_id: str) -> None:
                 continue
             opp_row = {
                 "user_id": user_id,
+                "workspace_id": effective_workspace_id,
                 "business_name": name,
                 "category": opp_ui.get("category"),
                 "lane": opp_ui.get("lane"),
@@ -206,7 +289,7 @@ def _sync_scout_to_supabase(user_id: str) -> None:
                 "priority": opp_ui.get("priority"),
                 "status": opp_ui.get("status") or "New",
             }
-            ins = sb.table("opportunities").insert(opp_row).execute()
+            ins = _insert_with_workspace_fallback(sb, "opportunities", opp_row)
             if not ins.data or len(ins.data) == 0:
                 continue
             opp_id = ins.data[0]["id"]
@@ -216,6 +299,7 @@ def _sync_scout_to_supabase(user_id: str) -> None:
                     case = json.load(f)
                 cf_row = {
                     "opportunity_id": opp_id,
+                    "workspace_id": effective_workspace_id,
                     "email": case.get("email"),
                     "contact_page": case.get("contact_page"),
                     "phone_from_site": case.get("phone_from_site"),
@@ -241,10 +325,122 @@ def _sync_scout_to_supabase(user_id: str) -> None:
                     "outcome": case.get("outcome"),
                     "status": case.get("status") or "New",
                 }
-                sb.table("case_files").insert(cf_row).execute()
+                _insert_with_workspace_fallback(sb, "case_files", cf_row)
     except Exception as e:
         print(f"  [Scout] Supabase sync error: {e}", file=sys.stderr)
         raise
+
+
+def _is_ignored_lead_status(status: str | None) -> bool:
+    raw = (status or "").strip().lower()
+    ignored = {
+        "closed",
+        "contacted",
+        "not interested",
+        "do not contact",
+        "skip",
+    }
+    return raw in ignored
+
+
+def _lead_rank(row: dict) -> float:
+    lane = (row.get("lane") or "").strip().lower()
+    score = float(row.get("internal_score") or 0)
+    review_count = int(row.get("review_count") or 0)
+    rating = float(row.get("rating") or 0) if row.get("rating") is not None else 0.0
+    distance = row.get("distance_miles")
+    try:
+        distance_val = float(distance) if distance is not None else 9999.0
+    except Exception:
+        distance_val = 9999.0
+    has_contact = bool(
+        (row.get("recommended_contact_method") or "").strip()
+        or (row.get("phone") or "").strip()
+        or (row.get("website") or "").strip()
+    )
+    contacted = bool((row.get("first_contacted_at") or "").strip() or (row.get("last_contacted_at") or "").strip())
+    problems = row.get("strongest_problems")
+    has_issues = bool(problems) if isinstance(problems, list) else bool(str(problems or "").strip())
+
+    rank = 0.0
+    if lane == "no_website" or bool(row.get("no_website")):
+        rank += 600.0
+    elif lane == "weak_website":
+        rank += 420.0
+    if has_issues:
+        rank += 140.0
+    if has_contact:
+        rank += 120.0
+    if not contacted:
+        rank += 110.0
+    rank += min(max(score, 0.0), 1000.0) * 10.0
+    rank += min(review_count, 200) * 0.4
+    rank += rating * 3.0
+    rank -= min(distance_val, 200.0) * 1.5
+    return rank
+
+
+def getTopOpportunities(workspace_id: str | None):
+    """
+    Return top 5 leads for outreach from workspace-filtered opportunities.
+    Uses Supabase when configured; falls back to local case files.
+    """
+    leads: list[dict] = []
+
+    if _supabase_url and _supabase_service_key:
+        try:
+            from supabase import create_client
+            sb = create_client(_supabase_url, _supabase_service_key)
+            query = sb.table("opportunities").select("*")
+            if workspace_id:
+                query = query.eq("workspace_id", workspace_id)
+            res = query.execute()
+            rows = res.data or []
+
+            filtered = [r for r in rows if not _is_ignored_lead_status(r.get("status"))]
+            ranked = sorted(filtered, key=_lead_rank, reverse=True)[:5]
+            leads = [
+                {
+                    "business_name": r.get("business_name"),
+                    "category": r.get("category"),
+                    "distance": r.get("distance_miles"),
+                    "score": r.get("internal_score"),
+                    "lane": "no_website" if r.get("no_website") else (r.get("lane") or "weak_website"),
+                    "best_contact_method": r.get("recommended_contact_method") or r.get("backup_contact_method"),
+                    "slug": r.get("id"),
+                }
+                for r in ranked
+            ]
+            return leads
+        except Exception as e:
+            print(f"  [Scout] top opportunities supabase fallback: {e}", file=sys.stderr)
+
+    # Local file fallback.
+    if CASES_DIR.is_dir():
+        rows = []
+        for path in CASES_DIR.glob("*.json"):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    row = json.load(f)
+                row["id"] = row.get("slug") or path.stem
+                rows.append(row)
+            except Exception:
+                continue
+        filtered = [r for r in rows if not _is_ignored_lead_status(r.get("status"))]
+        ranked = sorted(filtered, key=_lead_rank, reverse=True)[:5]
+        leads = [
+            {
+                "business_name": r.get("business_name"),
+                "category": r.get("category"),
+                "distance": r.get("distance_miles"),
+                "score": r.get("internal_score"),
+                "lane": "no_website" if r.get("no_website") else (r.get("lane") or "weak_website"),
+                "best_contact_method": r.get("recommended_contact_method") or r.get("backup_contact_method"),
+                "slug": r.get("id"),
+            }
+            for r in ranked
+        ]
+    return leads
 
 
 def _append_history(count: int, summary: str):
@@ -310,6 +506,13 @@ def get_scout_data():
         )
 
 
+@app.get("/top-opportunities")
+def get_top_opportunities(request: Request):
+    workspace_id = _get_workspace_id_from_request(request)
+    leads = getTopOpportunities(workspace_id)
+    return {"leads": leads}
+
+
 def _scout_error_response(error_type: str, error_message: str, user_friendly_message: str):
     payload = {
         "success": False,
@@ -344,8 +547,9 @@ def post_run_scout(request: Request, body: RunScoutBody | None = None):
         opportunities = data["opportunities"]
         _append_history(len(opportunities), today.get("summary", ""))
         user_id = _get_user_id_from_request(request)
+        workspace_id = _get_workspace_id_from_request(request)
         if user_id and _supabase_url and _supabase_service_key:
-            _sync_scout_to_supabase(user_id)
+            _sync_scout_to_supabase(user_id, workspace_id=workspace_id)
         return {"ok": True, "success": True, "stdout": "", "stderr": "", "today": today, "opportunities": opportunities}
     except Exception as e:
         err_str = str(e).upper()
@@ -412,6 +616,11 @@ class CaseUpdateBody(BaseModel):
     follow_up_due: str | None = None
     outcome: str | None = None
     outreach_notes: str | None = None
+    short_email: str | None = None
+    longer_email: str | None = None
+    contact_form_version: str | None = None
+    social_dm_version: str | None = None
+    follow_up_note: str | None = None
 
 
 @app.get("/case/{slug}")
@@ -455,6 +664,57 @@ def post_case_update(slug: str, body: CaseUpdateBody):
         case["outcome"] = body.outcome
     if body.outreach_notes is not None:
         case["outreach_notes"] = body.outreach_notes
+    if body.short_email is not None:
+        case["short_email"] = body.short_email
+    if body.longer_email is not None:
+        case["longer_email"] = body.longer_email
+    if body.contact_form_version is not None:
+        case["contact_form_version"] = body.contact_form_version
+    if body.social_dm_version is not None:
+        case["social_dm_version"] = body.social_dm_version
+    if body.follow_up_note is not None:
+        case["follow_up_note"] = body.follow_up_note
+        case["follow_up_line"] = body.follow_up_note
+
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(case, f, indent=2)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not save case: {e}")
+
+    from scout.case_schema import case_to_ui
+    return {"ok": True, "case": case_to_ui(case)}
+
+
+@app.post("/case/{slug}/regenerate-outreach")
+def post_case_regenerate_outreach(slug: str):
+    """Regenerate outreach pack for one case using current dossier data."""
+    path = CASES_DIR / f"{slug}.json"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"Case {slug} not found")
+    try:
+        with open(path, encoding="utf-8") as f:
+            case = json.load(f)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not read case: {e}")
+
+    try:
+        from scout.outreach_generator import generate_outreach_pack
+        city_hint = None
+        if CONFIG_PATH.exists():
+            with open(CONFIG_PATH, encoding="utf-8") as f:
+                cfg = json.load(f)
+                city_hint = cfg.get("home_city")
+        pack = generate_outreach_pack(case, city_hint=city_hint)
+        case["short_email"] = pack.get("short_email")
+        case["longer_email"] = pack.get("longer_email")
+        case["contact_form_version"] = pack.get("contact_form_version")
+        case["social_dm_version"] = pack.get("social_dm_version")
+        case["follow_up_note"] = pack.get("follow_up_note")
+        case["follow_up_line"] = pack.get("follow_up_line")
+        print(f"  [Scout] outreach pack regenerated: {slug}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not regenerate outreach: {e}")
 
     try:
         with open(path, "w", encoding="utf-8") as f:
