@@ -35,6 +35,7 @@ export async function resolveWorkspaceContext() {
   if (_workspaceCtx) return _workspaceCtx;
   if (!supabase) return null;
 
+  console.log("workspace lookup start");
   const { data, error } = await supabase.auth.getUser();
   if (error) throw error;
   const user = data?.user || null;
@@ -44,12 +45,12 @@ export async function resolveWorkspaceContext() {
   const isOwnerInternal = ownerEmails.includes(String(user.email || "").toLowerCase());
 
   const fallback = {
-    workspaceId: user.id,
+    workspaceId: null,
     workspaceSlug: null,
-    workspaceName: "Personal Workspace",
+    workspaceName: "No Workspace",
     role: isOwnerInternal ? "owner" : "member",
     isOwnerInternal,
-    source: "fallback-user",
+    source: "workspace-missing",
   };
 
   try {
@@ -59,7 +60,7 @@ export async function resolveWorkspaceContext() {
       .eq("user_id", user.id)
       .order("created_at", { ascending: true })
       .limit(1)
-      .single();
+      .maybeSingle();
 
     if (membership.error && isMissingWorkspaceSchemaError(membership.error)) {
       membership = await supabase
@@ -68,18 +69,26 @@ export async function resolveWorkspaceContext() {
         .eq("user_id", user.id)
         .order("created_at", { ascending: true })
         .limit(1)
-        .single();
+        .maybeSingle();
     }
 
     if (membership.error) {
       if (isMissingWorkspaceSchemaError(membership.error)) {
-        _workspaceCtx = fallback;
+        _workspaceCtx = { ...fallback, source: "schema-fallback" };
+        console.log("workspace missing");
+        console.log("workspace missing for user", { user_id: user.id, reason: "schema-fallback" });
         return _workspaceCtx;
       }
       throw membership.error;
     }
 
-    const row = membership.data || {};
+    const row = membership.data || null;
+    if (!row) {
+      _workspaceCtx = fallback;
+      console.log("workspace missing");
+      console.log("workspace missing for user", { user_id: user.id, reason: "no-membership-row" });
+      return _workspaceCtx;
+    }
     const ws = row.workspaces || {};
     _workspaceCtx = {
       workspaceId: row.workspace_id || fallback.workspaceId,
@@ -89,10 +98,17 @@ export async function resolveWorkspaceContext() {
       isOwnerInternal,
       source: "workspace-membership",
     };
+    console.log("workspace found", {
+      user_id: user.id,
+      workspace_id: _workspaceCtx.workspaceId,
+      source: _workspaceCtx.source,
+    });
     return _workspaceCtx;
   } catch (err) {
     if (isMissingWorkspaceSchemaError(err)) {
-      _workspaceCtx = fallback;
+      _workspaceCtx = { ...fallback, source: "schema-fallback" };
+      console.log("workspace missing");
+      console.log("workspace missing for user", { user_id: user.id, reason: "schema-fallback-exception" });
       return _workspaceCtx;
     }
     throw err;

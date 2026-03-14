@@ -746,6 +746,71 @@ def _run_scheduled_scout_job():
         print(f"  [Scout] scheduled scout error: {e}", file=sys.stderr)
 
 
+def _bootstrap_workspace_for_user(sb, user_id: str) -> dict:
+    membership = (
+        sb.table("workspace_users")
+        .select("workspace_id, role, workspaces:workspace_id(id,name)")
+        .eq("user_id", user_id)
+        .order("created_at", desc=False)
+        .limit(1)
+        .execute()
+    )
+    if membership.data:
+        row = membership.data[0]
+        ws = row.get("workspaces") or {}
+        return {
+            "workspace_id": row.get("workspace_id"),
+            "workspace_name": ws.get("name") or "Workspace",
+            "role": row.get("role") or "member",
+            "created": False,
+        }
+
+    profile = (
+        sb.table("profiles")
+        .select("display_name,email")
+        .eq("id", user_id)
+        .limit(1)
+        .execute()
+    )
+    p = (profile.data or [{}])[0]
+    display_name = (p.get("display_name") or "").strip()
+    email = (p.get("email") or "").strip()
+    base_name = display_name or (email.split("@")[0].strip() if "@" in email else "")
+    workspace_name = f"{base_name}'s Workspace" if base_name else "Personal Workspace"
+
+    created_ws = (
+        sb.table("workspaces")
+        .insert({"name": workspace_name, "owner_user_id": user_id, "plan": None})
+        .execute()
+    )
+    if not created_ws.data:
+        raise RuntimeError("workspace_create_failed")
+    workspace_id = created_ws.data[0]["id"]
+
+    sb.table("workspace_users").insert(
+        {"workspace_id": workspace_id, "user_id": user_id, "role": "owner"}
+    ).execute()
+
+    try:
+        sb.table("user_settings").upsert(
+            {
+                "user_id": user_id,
+                "workspace_id": workspace_id,
+                **_default_user_settings(),
+            },
+            on_conflict="user_id,workspace_id",
+        ).execute()
+    except Exception:
+        pass
+
+    return {
+        "workspace_id": workspace_id,
+        "workspace_name": workspace_name,
+        "role": "owner",
+        "created": True,
+    }
+
+
 def _append_history(count: int, summary: str):
     history = []
     if HISTORY_PATH.exists():
@@ -950,6 +1015,22 @@ def post_user_settings(request: Request, body: UserSettingsBody):
         return settings
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not save settings: {e}")
+
+
+@app.post("/workspace/bootstrap")
+def post_workspace_bootstrap(request: Request):
+    user_id = _get_user_id_from_request(request)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not _supabase_url or not _supabase_service_key:
+        raise HTTPException(status_code=500, detail="Supabase is not configured")
+    try:
+        from supabase import create_client
+        sb = create_client(_supabase_url, _supabase_service_key)
+        result = _bootstrap_workspace_for_user(sb, user_id)
+        return {"ok": True, **result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not bootstrap workspace: {e}")
 
 
 class AuditBody(BaseModel):

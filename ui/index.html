@@ -83,6 +83,15 @@
     <div id="auth-container"></div>
 
     <div id="admin-protected" hidden>
+      <section class="panel hidden" id="workspaceFallbackPanel">
+        <h3>No workspace found for this account yet.</h3>
+        <p>You can create a workspace now and continue using Scout-Brain.</p>
+        <div class="runner-copy-row">
+          <button type="button" class="primary-btn" id="workspaceCreateBtn">Create my workspace</button>
+          <button type="button" class="ghost-btn" id="workspaceRetryBtn">Retry workspace setup</button>
+          <span class="tag" id="workspaceFallbackStatus">Awaiting action</span>
+        </div>
+      </section>
       <main class="dashboard" id="adminMainContent">
         <section class="hero-card" id="adminDashboardSummary">
           <div>

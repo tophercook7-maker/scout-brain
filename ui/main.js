@@ -110,6 +110,89 @@ function setAdminAccess(authed) {
   if (protectedEl) protectedEl.hidden = !authed;
 }
 
+function setWorkspaceFallbackStatus(text, isError = false) {
+  const el = document.getElementById("workspaceFallbackStatus");
+  if (!el) return;
+  el.textContent = text;
+  el.classList.toggle("status-failed", !!isError);
+}
+
+function showWorkspaceFallback(show) {
+  const panel = document.getElementById("workspaceFallbackPanel");
+  if (!panel) return;
+  panel.classList.toggle("hidden", !show);
+  if (show) {
+    console.log("workspace fallback shown");
+  }
+}
+
+async function callWorkspaceBootstrap() {
+  const apiBase = (window.MB_API_BASE || "").replace(/\/$/, "");
+  const headers = { "Content-Type": "application/json" };
+  if (window.MB_SESSION?.access_token) {
+    headers.Authorization = `Bearer ${window.MB_SESSION.access_token}`;
+  }
+  const res = await fetch(`${apiBase}/workspace/bootstrap`, {
+    method: "POST",
+    headers,
+  });
+  if (!res.ok) {
+    let msg = `Workspace bootstrap failed (${res.status})`;
+    try {
+      const data = await res.json();
+      msg = data?.detail || msg;
+    } catch {
+      // ignore json parse
+    }
+    throw new Error(msg);
+  }
+  return res.json();
+}
+
+function bindWorkspaceFallbackActions() {
+  const createBtn = document.getElementById("workspaceCreateBtn");
+  const retryBtn = document.getElementById("workspaceRetryBtn");
+  if (createBtn) {
+    createBtn.onclick = async () => {
+      const original = createBtn.textContent;
+      createBtn.disabled = true;
+      createBtn.textContent = "Creating...";
+      setWorkspaceFallbackStatus("Creating workspace...");
+      try {
+        await callWorkspaceBootstrap();
+        clearWorkspaceContext();
+        const refreshedCtx = await resolveWorkspaceContext();
+        applyPresentationBranding(window.MB_SESSION || null, refreshedCtx);
+        showWorkspaceFallback(false);
+        setWorkspaceFallbackStatus("Workspace created");
+        await window.refreshScoutData?.({ reason: "workspace-created", cacheBust: true });
+      } catch (err) {
+        console.error("workspace bootstrap failed", err);
+        setWorkspaceFallbackStatus(err.message || "Failed", true);
+      } finally {
+        createBtn.disabled = false;
+        createBtn.textContent = original;
+      }
+    };
+  }
+  if (retryBtn) {
+    retryBtn.onclick = async () => {
+      setWorkspaceFallbackStatus("Retrying...");
+      try {
+        clearWorkspaceContext();
+        const refreshedCtx = await resolveWorkspaceContext();
+        applyPresentationBranding(window.MB_SESSION || null, refreshedCtx);
+        const missing = !refreshedCtx?.workspaceId || refreshedCtx?.source === "workspace-missing";
+        showWorkspaceFallback(missing);
+        setWorkspaceFallbackStatus(missing ? "Still missing workspace" : "Workspace found", !!missing);
+      } catch (err) {
+        console.error("workspace retry failed", err);
+        setWorkspaceFallbackStatus("Retry failed", true);
+      }
+    };
+  }
+}
+
 async function loadAppModules() {
   if (modulesLoaded) return;
   await import("./analyzer.js");
@@ -117,6 +200,7 @@ async function loadAppModules() {
   modulesLoaded = true;
   setDebugValue("dbg-init", "complete");
   window.MB_APPLY_ADMIN_ROUTE_VIEW?.();
+  bindWorkspaceFallbackActions();
 }
 
 function setAuthEmailDisplay(session) {
@@ -362,13 +446,20 @@ async function boot() {
           if (freshSession?.user) {
             window.MB_SESSION = freshSession;
             setCloudBridge();
-            const workspaceCtx = await resolveWorkspaceContext();
+            let workspaceCtx = null;
+            try {
+              workspaceCtx = await resolveWorkspaceContext();
+            } catch (workspaceErr) {
+              console.error("workspace lookup failed:", workspaceErr);
+            }
             applyPresentationBranding(freshSession, workspaceCtx);
             setAdminAccess(true);
             renderLoggedInBar(handleLogout);
             setAuthEmailDisplay(freshSession);
             setDebugValue("dbg-auth", "signed-in");
             await loadAppModules();
+            const workspaceMissing = !workspaceCtx?.workspaceId || workspaceCtx?.source === "workspace-missing";
+            showWorkspaceFallback(workspaceMissing);
             await window.refreshScoutData?.();
           } else {
             window.MB_USE_CLOUD = false;
@@ -382,13 +473,20 @@ async function boot() {
 
     window.MB_SESSION = session;
     setCloudBridge();
-    const workspaceCtx = await resolveWorkspaceContext();
+    let workspaceCtx = null;
+    try {
+      workspaceCtx = await resolveWorkspaceContext();
+    } catch (workspaceErr) {
+      console.error("workspace lookup failed:", workspaceErr);
+    }
     applyPresentationBranding(session, workspaceCtx);
     setAdminAccess(true);
     renderLoggedInBar(handleLogout);
     setAuthEmailDisplay(session);
     setDebugValue("dbg-auth", "signed-in");
     await loadAppModules();
+    const workspaceMissing = !workspaceCtx?.workspaceId || workspaceCtx?.source === "workspace-missing";
+    showWorkspaceFallback(workspaceMissing);
   } catch (err) {
     console.error("auth bootstrap failed:", err);
     window.MB_USE_CLOUD = false;
