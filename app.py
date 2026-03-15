@@ -2782,11 +2782,11 @@ def _opportunity_has_contact_path(opp: dict, case: dict | None) -> bool:
 def _insert_crm_lead(crm_sb, row: dict) -> bool:
     try:
         crm_sb.table(CRM_LEADS_TABLE).insert(row).execute()
-        return True
+        return {"ok": True, "mode": "full", "error": None}
     except Exception as e:
         # Schema fallback for older CRM deployments that have fewer intake columns.
         if "column" not in str(e).lower():
-            raise
+            return {"ok": False, "mode": "full", "error": str(e)}
         minimal = {
             "owner_id": row.get("owner_id"),
             "business_name": row.get("business_name"),
@@ -2799,8 +2799,11 @@ def _insert_crm_lead(crm_sb, row: dict) -> bool:
             "status": row.get("status"),
             "notes": row.get("notes"),
         }
-        crm_sb.table(CRM_LEADS_TABLE).insert(minimal).execute()
-        return True
+        try:
+            crm_sb.table(CRM_LEADS_TABLE).insert(minimal).execute()
+            return {"ok": True, "mode": "minimal", "error": None}
+        except Exception as retry_e:
+            return {"ok": False, "mode": "minimal", "error": str(retry_e)}
 
 
 def _refresh_workspace_followups(crm_sb, workspace_id: str, owner_id: str) -> None:
@@ -2823,19 +2826,52 @@ def _refresh_workspace_followups(crm_sb, workspace_id: str, owner_id: str) -> No
 def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str) -> dict:
     stats = {
         "evaluated": 0,
+        "eligible": 0,
         "created": 0,
-        "duplicate": 0,
-        "filtered": 0,
+        "duplicate_skipped": 0,
+        "filtered_low_score": 0,
+        "filtered_missing_workspace": 0,
+        "filtered_closed_or_dnc": 0,
+        "filtered_missing_contact_path": 0,
+        "filtered_missing_business_name": 0,
+        "filtered_other": 0,
+        "insert_attempted": 0,
+        "insert_succeeded": 0,
+        "insert_failed": 0,
         "top_contacts": [],
+        "insert_errors": 0,
+        "insert_error_samples": [],
+        "query_error": None,
+        "workspace_id_used": None,
+        "opportunities_loaded": 0,
+        "owner_profile_exists": None,
     }
     workspace_id = str(workspace.get("id") or "").strip()
+    stats["workspace_id_used"] = workspace_id or None
     if not CRM_AUTO_INTAKE_ENABLED or not workspace_id or not owner_id:
+        if not workspace_id:
+            stats["filtered_missing_workspace"] = 1
+            print("  [Intake] filtered: missing workspace_id")
         return stats
 
     crm_sb = _create_crm_client()
     if crm_sb is None:
         print("  [Scout] crm intake skipped: CRM Supabase not configured")
         return stats
+
+    try:
+        owner_profile_rows = (
+            crm_sb.table("profiles")
+            .select("id")
+            .eq("id", owner_id)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        stats["owner_profile_exists"] = bool(owner_profile_rows)
+    except Exception:
+        stats["owner_profile_exists"] = None
 
     _refresh_workspace_followups(crm_sb, workspace_id, owner_id)
     print("  evaluating opportunities for CRM intake")
@@ -2883,8 +2919,10 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str) -> dict:
             continue
     if not opportunities and query_error is not None:
         print(f"  [Scout] crm intake query failed: {query_error}", file=sys.stderr)
+        stats["query_error"] = str(query_error)
         return stats
 
+    stats["opportunities_loaded"] = len(opportunities)
     if not opportunities:
         print("  crm intake complete (no qualifying opportunities)")
         return stats
@@ -2918,9 +2956,16 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str) -> dict:
         stats["evaluated"] += 1
         case = case_by_opp.get(str(opp.get("id"))) or {}
         score = float(opp.get("opportunity_score") or opp.get("score") or 0)
+        opp_id = str(opp.get("id") or "").strip()
+        business_name = str(opp.get("business_name") or "").strip() or "(missing)"
+        print(
+            f"  [Intake] candidate opp_id={opp_id or '(missing)'} "
+            f"name={business_name} score={score:.2f} workspace_id={workspace_id}"
+        )
 
         if score < intake_min_score:
-            stats["filtered"] += 1
+            stats["filtered_low_score"] += 1
+            print(f"  [Intake] filtered: low_score opp_id={opp_id or '(missing)'} score={score:.2f}")
             continue
 
         status_tokens = " ".join(
@@ -2931,11 +2976,13 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str) -> dict:
             ]
         )
         if _is_closed_or_dnc(status_tokens):
-            stats["filtered"] += 1
+            stats["filtered_closed_or_dnc"] += 1
+            print(f"  [Intake] filtered: closed_or_dnc opp_id={opp_id or '(missing)'}")
             continue
 
         if not _opportunity_has_contact_path(opp, case):
-            stats["filtered"] += 1
+            stats["filtered_missing_contact_path"] += 1
+            print(f"  [Intake] filtered: missing_contact_path opp_id={opp_id or '(missing)'}")
             continue
 
         candidates.append({"opp": opp, "case": case})
@@ -2951,10 +2998,15 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str) -> dict:
         opp = item["opp"]
         case = item["case"] or {}
         opp_id = str(opp.get("id") or "").strip()
+        score = float(opp.get("opportunity_score") or opp.get("score") or 0)
+        business_name = str(opp.get("business_name") or "").strip() or "(missing)"
+        stats["eligible"] += 1
 
+        duplicate_reason = None
         if opp_id and opp_id in existing_linked_opps:
-            stats["duplicate"] += 1
-            print("  duplicate crm lead skipped")
+            duplicate_reason = "linked_opportunity_id"
+            stats["duplicate_skipped"] += 1
+            print(f"  [Intake] duplicate crm lead skipped opp_id={opp_id} reason={duplicate_reason}")
             continue
 
         place_key = _normalize_text(opp.get("place_id"))
@@ -2962,15 +3014,20 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str) -> dict:
         phone_key = _normalize_phone(opp.get("phone") or case.get("phone_from_site"))
         name_city_key = _build_name_city_key(opp.get("business_name"), opp.get("city") or opp.get("address"))
 
-        is_duplicate = (
-            (place_key and place_key in existing_place_ids)
-            or (site_key and site_key in existing_websites)
-            or (phone_key and phone_key in existing_phones)
-            or (name_city_key and name_city_key in existing_name_city)
-        )
-        if is_duplicate:
-            stats["duplicate"] += 1
-            print("  duplicate crm lead skipped")
+        if place_key and place_key in existing_place_ids:
+            duplicate_reason = "place_id"
+        elif site_key and site_key in existing_websites:
+            duplicate_reason = "website"
+        elif phone_key and phone_key in existing_phones:
+            duplicate_reason = "phone"
+        elif name_city_key and name_city_key in existing_name_city:
+            duplicate_reason = "business_name+city"
+        if duplicate_reason:
+            stats["duplicate_skipped"] += 1
+            print(
+                f"  [Intake] duplicate crm lead skipped opp_id={opp_id or '(missing)'} "
+                f"reason={duplicate_reason}"
+            )
             continue
 
         best_contact = (
@@ -2983,9 +3040,9 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str) -> dict:
         if not issue_list:
             issue_list = case.get("strongest_problems") if isinstance(case.get("strongest_problems"), list) else []
         issues_summary = ", ".join([str(i).strip() for i in issue_list if str(i).strip()][:3]) or "Website pain signals detected"
-        business_name = str(opp.get("business_name") or "").strip()
         if not business_name:
-            stats["filtered"] += 1
+            stats["filtered_missing_business_name"] += 1
+            print(f"  [Intake] filtered: missing_business_name opp_id={opp_id or '(missing)'}")
             continue
 
         row = {
@@ -3010,10 +3067,20 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str) -> dict:
                 f"Issues: {issues_summary}."
             ),
         }
-        try:
-            _insert_crm_lead(crm_sb, row)
+        stats["insert_attempted"] += 1
+        print(
+            f"  [Intake] insert_attempted opp_id={opp_id or '(missing)'} "
+            f"name={business_name} score={score:.2f} workspace_id={workspace_id} "
+            f"payload_keys={','.join(sorted(row.keys()))}"
+        )
+        insert_result = _insert_crm_lead(crm_sb, row)
+        if bool(insert_result.get("ok")):
+            stats["insert_succeeded"] += 1
             stats["created"] += 1
-            print("  crm lead created from scout opportunity")
+            print(
+                f"  crm lead created from scout opportunity "
+                f"(opp_id={opp_id or '(missing)'}, mode={insert_result.get('mode')})"
+            )
             if len(stats["top_contacts"]) < 5:
                 stats["top_contacts"].append(
                     {
@@ -3032,13 +3099,25 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str) -> dict:
                 existing_name_city.add(name_city_key)
             if opp_id:
                 existing_linked_opps.add(opp_id)
-        except Exception as e:
-            print(f"  [Scout] crm intake insert failed: {e}", file=sys.stderr)
+        else:
+            stats["insert_failed"] += 1
+            stats["insert_errors"] += 1
+            insert_error = str(insert_result.get("error") or "unknown insert error")
+            print(
+                f"  [Scout] crm intake insert failed opp_id={opp_id or '(missing)'} "
+                f"name={business_name} reason={insert_error}",
+                file=sys.stderr,
+            )
+            if len(stats["insert_error_samples"]) < 5:
+                stats["insert_error_samples"].append(insert_error)
 
     print(
         "  crm intake complete "
-        f"(evaluated={stats['evaluated']}, created={stats['created']}, "
-        f"duplicate={stats['duplicate']}, filtered={stats['filtered']})"
+        f"(evaluated={stats['evaluated']}, eligible={stats['eligible']}, created={stats['created']}, "
+        f"duplicate_skipped={stats['duplicate_skipped']}, insert_attempted={stats['insert_attempted']}, "
+        f"insert_succeeded={stats['insert_succeeded']}, insert_failed={stats['insert_failed']}, "
+        f"filtered_low_score={stats['filtered_low_score']}, filtered_missing_contact_path={stats['filtered_missing_contact_path']}, "
+        f"filtered_closed_or_dnc={stats['filtered_closed_or_dnc']})"
     )
     return stats
 
@@ -3585,10 +3664,14 @@ def post_crm_intake_backfill(request: Request, body: IntakeBackfillBody | None =
         print("  evaluating opportunities for CRM intake")
         stats = _run_workspace_crm_intake(sb, workspace, user_id)
         print("  crm intake complete")
+        crm_host = urlparse(CRM_SUPABASE_URL or "").netloc or None
+        scout_host = urlparse(_supabase_url or "").netloc or None
         return {
             "ok": True,
             "workspace_id": workspace_id,
             "stats": stats,
+            "crm_supabase_host": crm_host,
+            "scout_supabase_host": scout_host,
             "message": (
                 f"Backfill complete: created {int(stats.get('created') or 0)} "
                 f"from {int(stats.get('evaluated') or 0)} evaluated opportunities."
