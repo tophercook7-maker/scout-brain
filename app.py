@@ -57,6 +57,8 @@ _resend_api_key = None
 _resend_from_email = None
 _dashboard_url = None
 _last_email_provider_diag: dict = {}
+_supabase_jwks_cache: dict | None = None
+_supabase_jwks_cache_expires_at: float = 0.0
 try:
     from dotenv import load_dotenv
     load_dotenv(SCOUT_DIR / ".env")
@@ -248,6 +250,77 @@ def _job_is_cancelled(job_id: str) -> bool:
     return str(job.get("status") or "").strip().lower() == "cancelled"
 
 
+def _fetch_supabase_jwks(force_refresh: bool = False) -> dict | None:
+    global _supabase_jwks_cache, _supabase_jwks_cache_expires_at
+    if not _supabase_url:
+        return None
+    now_ts = time.time()
+    if (
+        not force_refresh
+        and _supabase_jwks_cache is not None
+        and now_ts < _supabase_jwks_cache_expires_at
+    ):
+        return _supabase_jwks_cache
+    jwks_url = f"{_supabase_url.rstrip('/')}/auth/v1/.well-known/jwks.json"
+    req = urllib_request.Request(
+        jwks_url,
+        headers={
+            "Accept": "application/json",
+        },
+        method="GET",
+    )
+    with urllib_request.urlopen(req, timeout=8) as resp:
+        raw = resp.read().decode("utf-8", errors="ignore")
+        payload = json.loads(raw) if raw else {}
+    keys = payload.get("keys") if isinstance(payload, dict) else None
+    if not isinstance(keys, list):
+        raise RuntimeError("jwks_payload_missing_keys")
+    _supabase_jwks_cache = payload
+    _supabase_jwks_cache_expires_at = now_ts + 3600
+    return payload
+
+
+def _decode_rs_token_via_jwks(token: str, alg: str, kid: str | None) -> dict:
+    import jwt
+
+    def _attempt_decode(jwks_payload: dict) -> dict:
+        keys = jwks_payload.get("keys") if isinstance(jwks_payload, dict) else []
+        if not isinstance(keys, list) or not keys:
+            raise RuntimeError("jwks_keys_empty")
+        candidates = keys
+        if kid:
+            keyed = [k for k in keys if str(k.get("kid") or "").strip() == kid]
+            if keyed:
+                candidates = keyed
+        last_error: Exception | None = None
+        for jwk in candidates:
+            try:
+                public_key = jwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(jwk))
+                return jwt.decode(
+                    token,
+                    public_key,
+                    algorithms=[alg],
+                    options={"verify_aud": False},
+                )
+            except Exception as decode_error:
+                last_error = decode_error
+                continue
+        if last_error:
+            raise last_error
+        raise RuntimeError("jwks_key_decode_failed")
+
+    jwks_payload = _fetch_supabase_jwks(force_refresh=False)
+    if jwks_payload:
+        try:
+            return _attempt_decode(jwks_payload)
+        except Exception:
+            pass
+    jwks_payload = _fetch_supabase_jwks(force_refresh=True)
+    if not jwks_payload:
+        raise RuntimeError("jwks_unavailable")
+    return _attempt_decode(jwks_payload)
+
+
 def _get_user_id_from_request(request: Request) -> str | None:
     """Verify Bearer JWT and return user_id (uuid). Returns None if no/invalid auth."""
     auth = request.headers.get("Authorization")
@@ -262,27 +335,48 @@ def _get_user_id_from_request(request: Request) -> str | None:
 
     print("  [Auth] token decode starting")
     token_issuer_host = None
+    token_alg = None
+    token_kid = None
+    token_role = None
+    token_has_sub = False
     try:
         import jwt
+        header = jwt.get_unverified_header(token)
+        token_alg = str(header.get("alg") or "").strip() or None
+        token_kid = str(header.get("kid") or "").strip() or None
         unverified = jwt.decode(
             token,
             options={"verify_signature": False, "verify_aud": False},
         )
         token_issuer = str(unverified.get("iss") or "").strip()
         token_issuer_host = urlparse(token_issuer).netloc or None
+        token_role = str(unverified.get("role") or "").strip() or None
+        token_has_sub = bool(str(unverified.get("sub") or "").strip())
     except Exception:
         token_issuer_host = None
 
     configured_supabase_host = urlparse(_supabase_url or "").netloc or None
+    print(
+        f"  [Auth] token shape clues: len={len(token)} segments={len(token.split('.'))} "
+        f"alg={token_alg or 'unknown'} kid={'present' if token_kid else 'missing'} "
+        f"role={token_role or 'unknown'} has_sub={token_has_sub}"
+    )
     if token_issuer_host:
         print(f"  [Auth] token issuer host: {token_issuer_host}")
     if configured_supabase_host:
         print(f"  [Auth] backend SUPABASE_URL host: {configured_supabase_host}")
+    if token_issuer_host and configured_supabase_host:
+        print(
+            f"  [Auth] token issuer host matches backend SUPABASE_URL host: "
+            f"{token_issuer_host == configured_supabase_host}"
+        )
 
     # Preferred verification path: ask Supabase Auth to validate the access token.
     # This supports both HS256 and RS256 projects.
+    supabase_verify_error_type = None
     if _supabase_url and _supabase_service_key:
         try:
+            print("  [Auth] verification method attempted: supabase-auth-user")
             req = urllib_request.Request(
                 f"{_supabase_url.rstrip('/')}/auth/v1/user",
                 headers={
@@ -304,24 +398,46 @@ def _get_user_id_from_request(request: Request) -> str | None:
                     print("  [Auth] token verification failed: user id not resolved", file=sys.stderr)
                 else:
                     print(f"  [Auth] token verification failed: upstream {code}", file=sys.stderr)
+                    supabase_verify_error_type = f"upstream_{code}"
         except Exception as e:
+            supabase_verify_error_type = type(e).__name__
             print(
                 f"  [Auth] token verification via Supabase failed: {type(e).__name__}",
                 file=sys.stderr,
             )
+            if isinstance(e, urllib_error.URLError):
+                print("  [Auth] supabase verification network failure; trying local fallback", file=sys.stderr)
 
+    # Fallback path for RS*/ES* tokens via Supabase JWKS (works without JWT secret).
+    if token_alg and token_alg.upper().startswith("RS"):
+        try:
+            print("  [Auth] verification method attempted: local-jwks")
+            payload = _decode_rs_token_via_jwks(token, token_alg, token_kid)
+            user_id = str(payload.get("sub") or payload.get("id") or "").strip()
+            if user_id:
+                print("  [Auth] token verification succeeded")
+                print("  [Auth] user id resolved")
+                return user_id
+            print("  [Auth] token verification failed: user id not resolved", file=sys.stderr)
+        except Exception as e:
+            print(f"  [Auth] token verification failed: {type(e).__name__}", file=sys.stderr)
+
+    # Fallback for legacy HS* setups.
     if not _supabase_jwt_secret:
-        print("  [Auth] SUPABASE_JWT_SECRET is missing")
+        print("  [Auth] SUPABASE_JWT_SECRET is missing (HS* local fallback unavailable)")
         print("  [Auth] user id not resolved")
         return None
 
-    # Fallback for legacy HS256 setups.
     try:
         import jwt
+        allowed_algs = ["HS256", "HS384", "HS512"]
+        if token_alg and token_alg.upper().startswith("HS"):
+            allowed_algs = [token_alg.upper()]
+        print("  [Auth] verification method attempted: local-hs")
         payload = jwt.decode(
             token,
             _supabase_jwt_secret,
-            algorithms=["HS256"],
+            algorithms=allowed_algs,
             options={"verify_aud": False},
         )
         user_id = str(payload.get("sub") or "").strip()
@@ -338,8 +454,15 @@ def _get_user_id_from_request(request: Request) -> str | None:
                 "  [Auth] token verification failed: InvalidSignatureError (likely Supabase project mismatch or wrong JWT secret)",
                 file=sys.stderr,
             )
+        elif reason == "InvalidAlgorithmError":
+            print(
+                "  [Auth] token verification failed: InvalidAlgorithmError (token/signing algorithm mismatch for local HS fallback)",
+                file=sys.stderr,
+            )
         else:
             print(f"  [Auth] token verification failed: {reason}", file=sys.stderr)
+        if supabase_verify_error_type:
+            print(f"  [Auth] prior supabase verify failure: {supabase_verify_error_type}", file=sys.stderr)
         print("  [Auth] user id not resolved")
         return None
 
@@ -1743,7 +1866,8 @@ def _send_resend_email(to_email: str, subject: str, body: str):
     )
     try:
         print("  [Email] sending resend request with user-agent")
-        with urllib_request.urlopen(req, timeout=20) as resp:
+        print("  [Email] resend request started")
+        with urllib_request.urlopen(req, timeout=35) as resp:
             status_code = getattr(resp, "status", 200)
             raw = resp.read().decode("utf-8", errors="ignore")
             parsed = {}
@@ -1771,6 +1895,7 @@ def _send_resend_email(to_email: str, subject: str, body: str):
                         f"email_provider_forbidden: {provider_message}"
                     )
                 raise RuntimeError(f"email_send_failed_http_{status_code}: {provider_message}")
+            print("  [Email] resend request completed")
             provider_thread_id = (
                 parsed.get("thread_id")
                 or parsed.get("threadId")
@@ -4095,6 +4220,7 @@ def get_outreach_email_diagnostics(request: Request):
 
 @app.post("/outreach/test")
 def post_outreach_test(request: Request, body: OutreachTestBody):
+    print("  backend /outreach/test entered")
     user_id = _get_user_id_from_request(request)
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
