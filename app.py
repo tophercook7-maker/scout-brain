@@ -1681,15 +1681,27 @@ def sendLeadBriefingEmail(user: dict, summary: dict):
         headers={
             "Content-Type": "application/json",
             "Authorization": f"Bearer {_resend_api_key}",
+            "User-Agent": "scout-brain/1.0",
         },
         method="POST",
     )
     try:
+        print("  [Email] sending resend request with user-agent")
         with urllib_request.urlopen(req, timeout=20) as resp:
             code = getattr(resp, "status", 200)
             if 200 <= code < 300:
                 print("  email alert sent")
                 return True
+    except urllib_error.HTTPError as e:
+        status_code = int(getattr(e, "code", 0) or 0)
+        raw = ""
+        try:
+            raw = e.read().decode("utf-8", errors="ignore")
+        except Exception:
+            raw = str(e)
+        print(f"  [Email] provider response status: {status_code}", file=sys.stderr)
+        print(f"  [Email] provider response body: {raw}", file=sys.stderr)
+        print(f"  [Scout] email alert error: {e}", file=sys.stderr)
     except Exception as e:
         print(f"  [Scout] email alert error: {e}", file=sys.stderr)
     return False
@@ -1725,10 +1737,12 @@ def _send_resend_email(to_email: str, subject: str, body: str):
         headers={
             "Authorization": f"Bearer {_resend_api_key}",
             "Content-Type": "application/json",
+            "User-Agent": "scout-brain/1.0",
         },
         method="POST",
     )
     try:
+        print("  [Email] sending resend request with user-agent")
         with urllib_request.urlopen(req, timeout=20) as resp:
             status_code = getattr(resp, "status", 200)
             raw = resp.read().decode("utf-8", errors="ignore")
