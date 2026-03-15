@@ -56,6 +56,7 @@ _supabase_jwt_secret = None
 _resend_api_key = None
 _resend_from_email = None
 _dashboard_url = None
+_last_email_provider_diag: dict = {}
 try:
     from dotenv import load_dotenv
     load_dotenv(SCOUT_DIR / ".env")
@@ -70,6 +71,29 @@ try:
     _env_loaded = True
 except ImportError:
     pass
+
+
+def _email_sender_config() -> dict:
+    outreach_from_email = (os.environ.get("OUTREACH_FROM_EMAIL") or "").strip()
+    resend_from_email = (_resend_from_email or "").strip()
+    from_name = (os.environ.get("OUTREACH_FROM_NAME") or "Scout-Brain").strip()
+    if outreach_from_email:
+        sender_source = "OUTREACH_FROM_EMAIL"
+        from_email = outreach_from_email
+    elif resend_from_email:
+        sender_source = "RESEND_FROM_EMAIL"
+        from_email = resend_from_email
+    else:
+        sender_source = "missing"
+        from_email = ""
+    return {
+        "from_email": from_email,
+        "from_name": from_name,
+        "sender_source": sender_source,
+        "has_resend_api_key": bool(_resend_api_key),
+        "has_outreach_from_email": bool(outreach_from_email),
+        "has_resend_from_email": bool(resend_from_email),
+    }
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -566,6 +590,39 @@ def _sync_scout_to_supabase(
         sb = create_client(_supabase_url, _supabase_service_key)
         effective_workspace_id = _resolve_workspace_id_for_user(sb, user_id, requested_workspace_id=workspace_id)
         effective_workspace_plan = _normalize_plan(workspace_plan)
+        existing_by_place_id: dict[str, str] = {}
+        existing_by_website: dict[str, str] = {}
+        existing_by_phone: dict[str, str] = {}
+        existing_by_name_city: dict[str, str] = {}
+        try:
+            if effective_workspace_id:
+                existing_rows = (
+                    sb.table("opportunities")
+                    .select("id,place_id,website,phone,business_name,city")
+                    .eq("workspace_id", effective_workspace_id)
+                    .limit(5000)
+                    .execute()
+                    .data
+                    or []
+                )
+                for row in existing_rows:
+                    row_id = str(row.get("id") or "").strip()
+                    if not row_id:
+                        continue
+                    place_id_key = _normalize_text(row.get("place_id"))
+                    website_key = _normalize_website(row.get("website"))
+                    phone_key = _normalize_phone(row.get("phone"))
+                    name_city_key = _build_name_city_key(row.get("business_name"), row.get("city"))
+                    if place_id_key and place_id_key not in existing_by_place_id:
+                        existing_by_place_id[place_id_key] = row_id
+                    if website_key and website_key not in existing_by_website:
+                        existing_by_website[website_key] = row_id
+                    if phone_key and phone_key not in existing_by_phone:
+                        existing_by_phone[phone_key] = row_id
+                    if name_city_key and name_city_key not in existing_by_name_city:
+                        existing_by_name_city[name_city_key] = row_id
+        except Exception:
+            pass
         for opp_ui in opportunities_ui:
             slug = opp_ui.get("slug") or opp_ui.get("id")
             name = (opp_ui.get("name") or opp_ui.get("business_name") or "").strip()
@@ -604,25 +661,25 @@ def _sync_scout_to_supabase(
                 "opportunity_score": opp_ui.get("opportunity_score") if opp_ui.get("opportunity_score") is not None else opp_ui.get("score") or opp_ui.get("internal_score"),
                 "internal_score": opp_ui.get("score") or opp_ui.get("internal_score"),
                 "lead_tier": opp_ui.get("lead_tier"),
+                "tier": opp_ui.get("tier") or opp_ui.get("lead_tier"),
+                "opportunity_signals": opp_ui.get("opportunity_signals") or [],
                 "priority": opp_ui.get("priority"),
                 "status": opp_ui.get("status") or "New",
             }
             try:
                 existing_id = None
-                if opp_row.get("place_id") and effective_workspace_id:
-                    try:
-                        existing = (
-                            sb.table("opportunities")
-                            .select("id")
-                            .eq("workspace_id", effective_workspace_id)
-                            .eq("place_id", opp_row.get("place_id"))
-                            .limit(1)
-                            .execute()
-                        )
-                        if existing.data:
-                            existing_id = existing.data[0].get("id")
-                    except Exception:
-                        existing_id = None
+                place_id_key = _normalize_text(opp_row.get("place_id"))
+                website_key = _normalize_website(opp_row.get("website"))
+                phone_key = _normalize_phone(opp_row.get("phone"))
+                name_city_key = _build_name_city_key(opp_row.get("business_name"), opp_row.get("city"))
+                if place_id_key and place_id_key in existing_by_place_id:
+                    existing_id = existing_by_place_id.get(place_id_key)
+                elif website_key and website_key in existing_by_website:
+                    existing_id = existing_by_website.get(website_key)
+                elif phone_key and phone_key in existing_by_phone:
+                    existing_id = existing_by_phone.get(phone_key)
+                elif name_city_key and name_city_key in existing_by_name_city:
+                    existing_id = existing_by_name_city.get(name_city_key)
                 if existing_id:
                     ins = sb.table("opportunities").update(opp_row).eq("id", existing_id).execute()
                     if not ins.data:
@@ -636,6 +693,8 @@ def _sync_scout_to_supabase(
                     for k in [
                         "opportunity_score",
                         "lead_tier",
+                        "tier",
+                        "opportunity_signals",
                         "place_id",
                         "city",
                         "state",
@@ -651,6 +710,8 @@ def _sync_scout_to_supabase(
                     legacy_opp = dict(opp_row)
                     legacy_opp.pop("opportunity_score", None)
                     legacy_opp.pop("lead_tier", None)
+                    legacy_opp.pop("tier", None)
+                    legacy_opp.pop("opportunity_signals", None)
                     legacy_opp.pop("place_id", None)
                     legacy_opp.pop("city", None)
                     legacy_opp.pop("state", None)
@@ -673,6 +734,14 @@ def _sync_scout_to_supabase(
             if not ins_data or len(ins_data) == 0:
                 continue
             opp_id = ins_data[0]["id"]
+            if place_id_key:
+                existing_by_place_id[place_id_key] = opp_id
+            if website_key:
+                existing_by_website[website_key] = opp_id
+            if phone_key:
+                existing_by_phone[phone_key] = opp_id
+            if name_city_key:
+                existing_by_name_city[name_city_key] = opp_id
             case_path = CASES_DIR / f"{slug}.json"
             if case_path.exists():
                 with open(case_path, encoding="utf-8") as f:
@@ -1120,7 +1189,7 @@ def _execute_scout_job(
             return
         _job_progress(
             job_id,
-            20,
+            10,
             status="running",
             result_summary="Discovery started",
             stage="discovering_businesses",
@@ -1174,6 +1243,17 @@ def _execute_scout_job(
                 workspace_plan=workspace_plan,
             ) or sync_stats
             _record_scout_run_supabase(user_id, workspace_id, today, opportunities)
+            try:
+                from supabase import create_client
+
+                sb = create_client(_supabase_url, _supabase_service_key)
+                _run_workspace_crm_intake(
+                    sb,
+                    {"id": workspace_id or ""},
+                    user_id,
+                )
+            except Exception as intake_error:
+                print(f"  [Scout] crm intake after run failed: {intake_error}", file=sys.stderr)
 
         processed = int((today or {}).get("processed_count") or len(opportunities))
         saved = int((today or {}).get("saved_count") or len(opportunities))
@@ -1331,7 +1411,7 @@ def getTopOpportunities(workspace_id: str | None):
                     "score": r.get("opportunity_score") if r.get("opportunity_score") is not None else r.get("internal_score"),
                     "rating": r.get("rating"),
                     "review_count": r.get("review_count"),
-                    "lead_tier": r.get("lead_tier"),
+                    "lead_tier": r.get("tier") or r.get("lead_tier"),
                     "city": r.get("city") or r.get("address"),
                     "lane": "no_website" if r.get("no_website") else (r.get("lane") or "weak_website"),
                     "best_contact_method": r.get("recommended_contact_method") or r.get("backup_contact_method"),
@@ -1369,7 +1449,7 @@ def getTopOpportunities(workspace_id: str | None):
                 "score": r.get("opportunity_score") if r.get("opportunity_score") is not None else r.get("internal_score"),
                 "rating": r.get("rating"),
                 "review_count": r.get("review_count"),
-                "lead_tier": r.get("lead_tier"),
+                "lead_tier": r.get("tier") or r.get("lead_tier"),
                 "city": r.get("city") or r.get("address"),
                 "lane": "no_website" if r.get("no_website") else (r.get("lane") or "weak_website"),
                 "best_contact_method": r.get("recommended_contact_method") or r.get("backup_contact_method"),
@@ -1616,15 +1696,19 @@ def sendLeadBriefingEmail(user: dict, summary: dict):
 
 
 def _send_resend_email(to_email: str, subject: str, body: str):
-    has_resend_key = bool(_resend_api_key)
+    global _last_email_provider_diag
+    sender_cfg = _email_sender_config()
+    has_resend_key = bool(sender_cfg.get("has_resend_api_key"))
     if not has_resend_key:
         print("  [Email] RESEND_API_KEY exists: False", file=sys.stderr)
         raise RuntimeError("RESEND_API_KEY is not configured")
-    from_email = (os.environ.get("OUTREACH_FROM_EMAIL") or _resend_from_email or "").strip()
-    from_name = (os.environ.get("OUTREACH_FROM_NAME") or "Scout-Brain").strip()
+    from_email = str(sender_cfg.get("from_email") or "").strip()
+    from_name = str(sender_cfg.get("from_name") or "Scout-Brain").strip()
+    sender_source = str(sender_cfg.get("sender_source") or "missing")
     print("  [Email] RESEND_API_KEY exists: True")
     print(f"  [Email] OUTREACH_FROM_EMAIL in use: {from_email or '(missing)'}")
     print(f"  [Email] OUTREACH_FROM_NAME in use: {from_name}")
+    print(f"  [Email] sender source in use: {sender_source}")
     if not from_email:
         raise RuntimeError("OUTREACH_FROM_EMAIL is not configured")
     html_body = "<br/>".join((body or "").splitlines())
@@ -1657,10 +1741,20 @@ def _send_resend_email(to_email: str, subject: str, body: str):
             if not (200 <= status_code < 300):
                 provider_message = parsed.get("message") or parsed.get("error") or raw or "Unknown provider error"
                 print(f"  [Email] provider error message: {provider_message}", file=sys.stderr)
+                print(f"  [Email] provider response body: {raw}", file=sys.stderr)
+                _last_email_provider_diag = {
+                    "status_code": int(status_code),
+                    "provider_message": str(provider_message),
+                    "provider_body": raw,
+                    "from_email": from_email,
+                    "from_name": from_name,
+                    "sender_source": sender_source,
+                    "has_resend_api_key": True,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
                 if int(status_code) == 403:
                     raise RuntimeError(
-                        "email_provider_forbidden: Email provider rejected the send. "
-                        "Check API key, verified domain, and sender address."
+                        f"email_provider_forbidden: {provider_message}"
                     )
                 raise RuntimeError(f"email_send_failed_http_{status_code}: {provider_message}")
             provider_thread_id = (
@@ -1669,6 +1763,17 @@ def _send_resend_email(to_email: str, subject: str, body: str):
                 or parsed.get("conversation_id")
                 or parsed.get("conversationId")
             )
+            _last_email_provider_diag = {
+                "status_code": int(status_code),
+                "provider_message": "ok",
+                "provider_body": raw,
+                "provider_message_id": parsed.get("id"),
+                "from_email": from_email,
+                "from_name": from_name,
+                "sender_source": sender_source,
+                "has_resend_api_key": True,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
             return {
                 "provider_message_id": parsed.get("id"),
                 "provider_thread_id": provider_thread_id,
@@ -1689,10 +1794,20 @@ def _send_resend_email(to_email: str, subject: str, body: str):
         provider_message = parsed.get("message") or parsed.get("error") or raw or str(e)
         print(f"  [Email] provider response status: {status_code}", file=sys.stderr)
         print(f"  [Email] provider error message: {provider_message}", file=sys.stderr)
+        print(f"  [Email] provider response body: {raw}", file=sys.stderr)
+        _last_email_provider_diag = {
+            "status_code": int(status_code),
+            "provider_message": str(provider_message),
+            "provider_body": raw,
+            "from_email": from_email,
+            "from_name": from_name,
+            "sender_source": sender_source,
+            "has_resend_api_key": True,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
         if status_code == 403:
             raise RuntimeError(
-                "email_provider_forbidden: Email provider rejected the send. "
-                "Check API key, verified domain, and sender address."
+                f"email_provider_forbidden: {provider_message}"
             )
         raise RuntimeError(f"email_send_failed_http_{status_code}: {provider_message}")
 
@@ -1703,6 +1818,14 @@ def _insert_email_event(crm_sb, row: dict):
     except Exception as e:
         # Keep sends resilient if table is not migrated yet.
         print(f"  [Scout] email_events insert skipped: {e}", file=sys.stderr)
+
+
+def _provider_reason_from_error(err: Exception | str) -> str:
+    msg = str(err or "").strip()
+    prefix = "email_provider_forbidden:"
+    if msg.lower().startswith(prefix):
+        return msg[len(prefix):].strip() or "Provider rejected the send."
+    return msg or "Provider rejected the send."
 
 
 def _normalize_email_subject(subject: str | None) -> str:
@@ -1807,10 +1930,25 @@ def _upsert_email_thread(
 
 
 def _insert_email_message(crm_sb, row: dict):
+    payload = dict(row or {})
     try:
-        crm_sb.table("email_messages").insert(row).execute()
+        res = crm_sb.table("email_messages").insert(payload).execute()
+        data = res.data or []
+        return data[0] if data else None
     except Exception as e:
+        msg = str(e).lower()
+        if "column" in msg and ("status" in msg or "generated_by" in msg):
+            payload.pop("status", None)
+            payload.pop("generated_by", None)
+            try:
+                res = crm_sb.table("email_messages").insert(payload).execute()
+                data = res.data or []
+                return data[0] if data else None
+            except Exception as retry_e:
+                print(f"  [Scout] email_messages insert skipped: {retry_e}", file=sys.stderr)
+                return None
         print(f"  [Scout] email_messages insert skipped: {e}", file=sys.stderr)
+    return None
 
 
 def _resolve_thread_from_references(
@@ -2111,8 +2249,12 @@ def _load_outreach_template_for_opportunity(
         return {}
 
 
-def generate_outreach_email(opportunity: dict, case_file: dict) -> dict:
+def generate_outreach_email(lead: dict) -> dict:
+    opportunity = lead.get("opportunity") if isinstance(lead.get("opportunity"), dict) else lead
+    case_file = lead.get("case_file") if isinstance(lead.get("case_file"), dict) else lead
     business_name = str(opportunity.get("business_name") or "there").strip() or "there"
+    contact_name = str(lead.get("contact_name") or "").strip()
+    greeting_name = contact_name or business_name
     category = str(opportunity.get("category") or opportunity.get("industry") or "local business").strip() or "local business"
     city = str(opportunity.get("city") or opportunity.get("address") or "your area").strip() or "your area"
     screenshot_url = (
@@ -2171,12 +2313,24 @@ def generate_outreach_email(opportunity: dict, case_file: dict) -> dict:
     if outdated_design:
         issue_candidates.append("The design feels outdated compared to nearby competitors")
 
+    if case_file.get("contact_form_present") is False and not str(case_file.get("phone_from_site") or "").strip():
+        issue_candidates.append("Customers may have trouble finding a clear contact path")
+
     audit_issues = case_file.get("audit_issues")
     if isinstance(audit_issues, list):
         for item in audit_issues:
             text = str(item or "").strip()
             if text:
                 issue_candidates.append(text)
+    audit_results = case_file.get("audit_results")
+    if isinstance(audit_results, dict):
+        for key in ["issues", "problems", "findings"]:
+            values = audit_results.get(key)
+            if isinstance(values, list):
+                for item in values:
+                    text = str(item or "").strip()
+                    if text:
+                        issue_candidates.append(text)
 
     issues: list[str] = []
     for candidate in issue_candidates:
@@ -2200,18 +2354,17 @@ def generate_outreach_email(opportunity: dict, case_file: dict) -> dict:
         if screenshot_url
         else ""
     )
-    subject = f"Quick website question for {business_name}"
+    subject = "Quick idea for improving your website"
     body = (
-        f"Hi {business_name},\n\n"
-        f"I was reviewing local {category} businesses in {city} and came across your website.\n\n"
-        "I noticed a few things that may be affecting how customers experience the site:\n\n"
+        f"Hi {greeting_name},\n\n"
+        f"I came across {business_name} while reviewing local {category} businesses in {city}.\n\n"
+        "I noticed a couple things that might be affecting how customers interact with your site:\n\n"
         f"{issue_lines}\n\n"
         f"{screenshot_line}"
-        "I run MixedMakerShop and help local businesses improve their websites so they load faster "
-        "and convert more visitors into customers.\n\n"
-        "If you'd like, I can send a quick written audit showing what I found and how it could be improved.\n\n"
-        "No pressure at all.\n\n"
-        "– Topher\n"
+        "I help businesses improve website performance and customer conversion.\n\n"
+        "If you'd like, I can send a quick breakdown of what I found and how it could be improved.\n\n"
+        "Best,\n"
+        "Topher\n"
         "MixedMakerShop"
     )
     return {
@@ -2309,6 +2462,10 @@ def _build_name_address_key(business_name: str, address: str) -> str:
     return f"{_normalize_text(business_name)}|{_normalize_text(address)}"
 
 
+def _build_name_city_key(business_name: str, city_or_address: str) -> str:
+    return f"{_normalize_text(business_name)}|{_normalize_text(city_or_address)}"
+
+
 def _crm_worked_statuses() -> set[str]:
     return {
         "contacted",
@@ -2401,7 +2558,7 @@ def _create_crm_client():
 
 def _load_existing_crm_leads_for_owner(crm_sb, owner_id: str) -> list[dict]:
     select_sets = [
-        "id,business_name,address,phone,website,place_id,status,linked_opportunity_id",
+        "id,business_name,city,address,phone,website,place_id,status,linked_opportunity_id",
         "id,business_name,phone,website,status,linked_opportunity_id",
     ]
     for cols in select_sets:
@@ -2532,27 +2689,54 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str) -> dict:
 
     _refresh_workspace_followups(crm_sb, workspace_id, owner_id)
     print("  evaluating opportunities for CRM intake")
-    try:
-        opportunities = (
+    intake_min_score = max(float(CRM_INTAKE_MIN_SCORE), 80.0)
+    opportunities = []
+    intake_queries = [
+        lambda: (
             sb.table("opportunities")
             .select(
-                "id,workspace_id,business_name,category,lane,address,phone,website,place_id,"
-                "recommended_contact_method,backup_contact_method,opportunity_score,status"
+                "id,workspace_id,business_name,category,city,lane,address,phone,website,place_id,"
+                "recommended_contact_method,backup_contact_method,opportunity_score,score,tier,lead_tier,"
+                "opportunity_signals,status"
             )
             .eq("workspace_id", workspace_id)
-            .gte("opportunity_score", CRM_INTAKE_MIN_SCORE)
+            .gte("opportunity_score", intake_min_score)
             .order("opportunity_score", desc=True)
             .limit(CRM_INTAKE_MAX_CANDIDATES)
             .execute()
             .data
             or []
-        )
-    except Exception as e:
-        print(f"  [Scout] crm intake query failed: {e}", file=sys.stderr)
+        ),
+        lambda: (
+            sb.table("opportunities")
+            .select(
+                "id,workspace_id,business_name,category,city,lane,address,phone,website,place_id,"
+                "recommended_contact_method,backup_contact_method,opportunity_score,score,tier,lead_tier,"
+                "opportunity_signals,status"
+            )
+            .eq("workspace_id", workspace_id)
+            .gte("score", intake_min_score)
+            .order("score", desc=True)
+            .limit(CRM_INTAKE_MAX_CANDIDATES)
+            .execute()
+            .data
+            or []
+        ),
+    ]
+    query_error = None
+    for q in intake_queries:
+        try:
+            opportunities = q()
+            break
+        except Exception as e:
+            query_error = e
+            continue
+    if not opportunities and query_error is not None:
+        print(f"  [Scout] crm intake query failed: {query_error}", file=sys.stderr)
         return stats
 
     if not opportunities:
-        print("  morning intake complete (no qualifying opportunities)")
+        print("  crm intake complete (no qualifying opportunities)")
         return stats
 
     opp_ids = [str(opp.get("id")) for opp in opportunities if opp.get("id")]
@@ -2568,8 +2752,8 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str) -> dict:
     existing_phones = {
         _normalize_phone(row.get("phone")) for row in existing if _normalize_phone(row.get("phone"))
     }
-    existing_name_addr = {
-        _build_name_address_key(row.get("business_name"), row.get("address"))
+    existing_name_city = {
+        _build_name_city_key(row.get("business_name"), row.get("city") or row.get("address"))
         for row in existing
         if _normalize_text(row.get("business_name"))
     }
@@ -2621,13 +2805,13 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str) -> dict:
         place_key = _normalize_text(opp.get("place_id"))
         site_key = _normalize_website(opp.get("website"))
         phone_key = _normalize_phone(opp.get("phone") or case.get("phone_from_site"))
-        name_addr_key = _build_name_address_key(opp.get("business_name"), opp.get("address"))
+        name_city_key = _build_name_city_key(opp.get("business_name"), opp.get("city") or opp.get("address"))
 
         is_duplicate = (
             (place_key and place_key in existing_place_ids)
             or (site_key and site_key in existing_websites)
             or (phone_key and phone_key in existing_phones)
-            or (name_addr_key and name_addr_key in existing_name_addr)
+            or (name_city_key and name_city_key in existing_name_city)
         )
         if is_duplicate:
             stats["duplicate"] += 1
@@ -2639,7 +2823,12 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str) -> dict:
             or str(opp.get("backup_contact_method") or "").strip()
             or "website"
         )
-        score = float(opp.get("opportunity_score") or 0)
+        score = float(opp.get("opportunity_score") or opp.get("score") or 0)
+        tier = str(opp.get("tier") or opp.get("lead_tier") or "").strip() or "low_priority"
+        issue_list = opp.get("opportunity_signals") if isinstance(opp.get("opportunity_signals"), list) else []
+        if not issue_list:
+            issue_list = case.get("strongest_problems") if isinstance(case.get("strongest_problems"), list) else []
+        issues_summary = ", ".join([str(i).strip() for i in issue_list if str(i).strip()][:3]) or "Website pain signals detected"
         business_name = str(opp.get("business_name") or "").strip()
         if not business_name:
             stats["filtered"] += 1
@@ -2662,7 +2851,10 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str) -> dict:
             "opportunity_score": score,
             "auto_intake": True,
             "status": "new",
-            "notes": f"Auto-added from Scout-Brain (lane: {opp.get('lane') or 'unknown'}).",
+            "notes": (
+                f"Auto-added from Scout-Brain (lane: {opp.get('lane') or 'unknown'}, tier: {tier}). "
+                f"Issues: {issues_summary}."
+            ),
         }
         try:
             _insert_crm_lead(crm_sb, row)
@@ -2682,15 +2874,15 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str) -> dict:
                 existing_websites.add(site_key)
             if phone_key:
                 existing_phones.add(phone_key)
-            if name_addr_key:
-                existing_name_addr.add(name_addr_key)
+            if name_city_key:
+                existing_name_city.add(name_city_key)
             if opp_id:
                 existing_linked_opps.add(opp_id)
         except Exception as e:
             print(f"  [Scout] crm intake insert failed: {e}", file=sys.stderr)
 
     print(
-        "  morning intake complete "
+        "  crm intake complete "
         f"(evaluated={stats['evaluated']}, created={stats['created']}, "
         f"duplicate={stats['duplicate']}, filtered={stats['filtered']})"
     )
@@ -3481,9 +3673,10 @@ def post_outreach_send(request: Request, body: OutreachSendBody):
             },
         )
         if "email_provider_forbidden" in str(e):
+            provider_reason = _provider_reason_from_error(e)
             raise HTTPException(
                 status_code=403,
-                detail="Email provider rejected the send. Check API key, verified domain, and sender address.",
+                detail=f"Email provider rejected the send: {provider_reason}",
             )
         raise HTTPException(status_code=500, detail=f"outreach_email_failed: {e}")
 
@@ -3685,11 +3878,23 @@ def post_outreach_generate_email(request: Request, body: OutreachGenerateEmailBo
                 .select(
                     "opportunity_id,mobile_score,performance_score,seo_score,missing_ssl,slow_load,mobile_layout_issue,"
                     "website_speed,homepage_load_seconds,mobile_ready,ssl_ok,missing_meta_title,missing_meta_description,"
-                    "audit_issues,outdated_design_clues,desktop_screenshot_url,mobile_screenshot_url,internal_screenshot_url,"
+                    "audit_issues,audit_results,contact_form_present,phone_from_site,outdated_design_clues,desktop_screenshot_url,mobile_screenshot_url,internal_screenshot_url,"
                     "screenshot_url"
                 )
                 .eq("opportunity_id", linked_opportunity_id)
                 .eq("workspace_id", workspace_id)
+                .limit(1)
+                .execute()
+            ),
+            lambda: (
+                sb.table("case_files")
+                .select(
+                    "opportunity_id,mobile_score,performance_score,seo_score,missing_ssl,slow_load,mobile_layout_issue,"
+                    "website_speed,homepage_load_seconds,mobile_ready,ssl_ok,missing_meta_title,missing_meta_description,"
+                    "audit_issues,audit_results,contact_form_present,phone_from_site,outdated_design_clues,desktop_screenshot_url,mobile_screenshot_url,internal_screenshot_url,"
+                    "screenshot_url"
+                )
+                .eq("opportunity_id", linked_opportunity_id)
                 .limit(1)
                 .execute()
             ),
@@ -3716,7 +3921,52 @@ def post_outreach_generate_email(request: Request, body: OutreachGenerateEmailBo
             except Exception:
                 continue
 
-        generated = generate_outreach_email(opportunity or {}, case_file or {})
+        lead_row = None
+        if body.lead_id and crm_sb is not None:
+            lead_row = _crm_fetch_lead(crm_sb, body.lead_id, user_id)
+        generated = generate_outreach_email(
+            {
+                "opportunity": opportunity or {},
+                "case_file": case_file or {},
+                "contact_name": (lead_row or {}).get("contact_name"),
+            }
+        )
+        draft_message_id = None
+        draft_thread_id = None
+        if body.lead_id and crm_sb is not None and lead_row:
+            contact_email = str(lead_row.get("email") or "").strip().lower()
+            if contact_email:
+                thread = _upsert_email_thread(
+                    crm_sb,
+                    workspace_id=workspace_id or str(lead_row.get("workspace_id") or "").strip() or None,
+                    lead_id=body.lead_id,
+                    contact_email=contact_email,
+                    subject=generated.get("subject"),
+                    provider_thread_id=None,
+                    owner_id=user_id,
+                )
+                draft_thread_id = str(thread.get("id") or "").strip() if thread else ""
+                if not draft_thread_id:
+                    draft_thread_id = None
+            draft_row = _insert_email_message(
+                crm_sb,
+                {
+                    "thread_id": draft_thread_id,
+                    "lead_id": body.lead_id,
+                    "direction": "outbound",
+                    "provider_message_id": None,
+                    "subject": generated.get("subject"),
+                    "body": generated.get("body"),
+                    "delivery_status": "queued",
+                    "status": "draft",
+                    "generated_by": "scout-brain",
+                    "sent_at": None,
+                    "received_at": None,
+                    "owner_id": user_id,
+                },
+            )
+            if draft_row:
+                draft_message_id = draft_row.get("id")
         print("  outreach template loaded")
         return {
             "linked_opportunity_id": linked_opportunity_id,
@@ -3724,6 +3974,8 @@ def post_outreach_generate_email(request: Request, body: OutreachGenerateEmailBo
             "body": generated.get("body"),
             "issues": generated.get("issues") or [],
             "screenshot_url": generated.get("screenshot_url"),
+            "draft_message_id": draft_message_id,
+            "draft_thread_id": draft_thread_id,
             "metadata": {
                 "business_name": (opportunity or {}).get("business_name"),
                 "category": (opportunity or {}).get("category"),
@@ -3802,6 +4054,31 @@ def post_outreach_regenerate(request: Request, body: OutreachRegenerateBody):
     return template
 
 
+@app.get("/outreach/email-diagnostics")
+def get_outreach_email_diagnostics(request: Request):
+    user_id = _get_user_id_from_request(request)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    sender_cfg = _email_sender_config()
+    return {
+        "ok": True,
+        "sender_email": sender_cfg.get("from_email") or None,
+        "sender_name": sender_cfg.get("from_name") or None,
+        "sender_source": sender_cfg.get("sender_source"),
+        "has_resend_api_key": bool(sender_cfg.get("has_resend_api_key")),
+        "has_outreach_from_email": bool(sender_cfg.get("has_outreach_from_email")),
+        "has_resend_from_email": bool(sender_cfg.get("has_resend_from_email")),
+        "priority_rule": "OUTREACH_FROM_EMAIL overrides RESEND_FROM_EMAIL when both are set",
+        "routes_using_sender": [
+            "/outreach/send",
+            "/outreach/test",
+        ],
+        "shared_sender_helper": "_send_resend_email",
+        "last_provider_diagnostic": _last_email_provider_diag or None,
+    }
+
+
 @app.post("/outreach/test")
 def post_outreach_test(request: Request, body: OutreachTestBody):
     user_id = _get_user_id_from_request(request)
@@ -3830,9 +4107,10 @@ def post_outreach_test(request: Request, body: OutreachTestBody):
         print(f"  test email failed: {e}", file=sys.stderr)
         msg = str(e)
         if "email_provider_forbidden" in msg:
+            provider_reason = _provider_reason_from_error(e)
             raise HTTPException(
                 status_code=403,
-                detail="Email provider rejected the send. Check API key, verified domain, and sender address.",
+                detail=f"Email provider rejected the send: {provider_reason}",
             )
         raise HTTPException(status_code=500, detail=f"test_email_failed: {e}")
 
