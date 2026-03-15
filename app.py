@@ -17,6 +17,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 from urllib import request as urllib_request
+from urllib import error as urllib_error
 from urllib.parse import urlparse
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -139,12 +140,14 @@ def _run_morning_runner(
     current_lat: float | None = None,
     current_lng: float | None = None,
     progress_callback=None,
+    cancel_callback=None,
 ):
     from scout.morning_runner import run
     run(
         current_lat=current_lat,
         current_lng=current_lng,
         progress_callback=progress_callback,
+        cancel_callback=cancel_callback,
     )
 
 
@@ -210,6 +213,15 @@ def _job_update(job_id: str, **updates) -> dict | None:
         job.update(updates)
         _scout_jobs[job_id] = job
         return dict(job)
+
+
+def _job_is_cancelled(job_id: str) -> bool:
+    job = _job_get(job_id)
+    if not job:
+        job = _load_job_from_supabase(job_id)
+    if not job:
+        return False
+    return str(job.get("status") or "").strip().lower() == "cancelled"
 
 
 def _get_user_id_from_request(request: Request) -> str | None:
@@ -499,38 +511,14 @@ def _apply_outreach_plan_limits(case_row: dict, plan: str) -> dict:
 
 def _upsert_case_file_row(sb, cf_row: dict) -> str:
     """
-    Upsert case_files by opportunity_id.
-    Returns one of: inserted, updated, duplicate_skipped.
+    Write case_files by opportunity_id with duplicate-safe skip behavior.
+    Returns one of: inserted, duplicate_skipped.
     """
     opportunity_id = cf_row.get("opportunity_id")
     if not opportunity_id:
         return "duplicate_skipped"
 
-    existed_before = False
-    try:
-        pre = (
-            sb.table("case_files")
-            .select("id")
-            .eq("opportunity_id", opportunity_id)
-            .limit(1)
-            .execute()
-        )
-        existed_before = bool(pre.data)
-    except Exception:
-        existed_before = False
-
-    # Preferred path: direct upsert on unique opportunity_id.
-    try:
-        sb.table("case_files").upsert(cf_row, on_conflict="opportunity_id").execute()
-        if existed_before:
-            print("  case file exists, updating")
-            return "updated"
-        print("  case file inserted")
-        return "inserted"
-    except Exception:
-        pass
-
-    # Fallback path for environments where upsert or schema differs.
+    # Requested behavior: if a case file already exists, skip insert.
     try:
         existing = (
             sb.table("case_files")
@@ -539,33 +527,21 @@ def _upsert_case_file_row(sb, cf_row: dict) -> str:
             .limit(1)
             .execute()
         )
-        rows = existing.data or []
-        if rows:
-            sb.table("case_files").update(cf_row).eq("id", rows[0].get("id")).execute()
-            print("  case file exists, updating")
-            return "updated"
+        if existing.data:
+            print("  case file duplicate skipped")
+            print("  scout run continuing after case file conflict")
+            return "duplicate_skipped"
+    except Exception:
+        # Continue to insert attempt; duplicate guard below still protects the run.
+        pass
+
+    try:
         _insert_with_workspace_fallback(sb, "case_files", cf_row)
         print("  case file inserted")
         return "inserted"
     except Exception as e:
         message = str(e).lower()
         if "duplicate key value violates unique constraint" in message and "case_files_opportunity_id_key" in message:
-            try:
-                existing_retry = (
-                    sb.table("case_files")
-                    .select("id")
-                    .eq("opportunity_id", opportunity_id)
-                    .limit(1)
-                    .execute()
-                )
-                retry_rows = existing_retry.data or []
-                if retry_rows:
-                    sb.table("case_files").update(cf_row).eq("id", retry_rows[0].get("id")).execute()
-                    print("  case file exists, updating")
-                    print("  scout run continuing after case file conflict")
-                    return "updated"
-            except Exception:
-                pass
             print("  case file duplicate skipped")
             print("  scout run continuing after case file conflict")
             return "duplicate_skipped"
@@ -1099,6 +1075,8 @@ def _execute_scout_job(
 
     def _runner_progress_update(payload: dict) -> None:
         nonlocal current_stage
+        if _job_is_cancelled(job_id):
+            return
         stage = str(payload.get("stage") or "").strip() or None
         progress = int(payload.get("progress") or 0)
         message = str(payload.get("message") or "").strip() or "Scout running..."
@@ -1126,6 +1104,20 @@ def _execute_scout_job(
         print("  scout job started")
         _upsert_job_supabase(job)
     try:
+        if _job_is_cancelled(job_id):
+            cancelled = _job_update(
+                job_id,
+                status="cancelled",
+                progress=100,
+                message="Scout cancelled",
+                result_summary="Scout cancelled",
+                stage="cancelled",
+                finished_at=_job_now_iso(),
+                error=None,
+            )
+            if cancelled:
+                _upsert_job_supabase(cancelled)
+            return
         _job_progress(
             job_id,
             20,
@@ -1137,7 +1129,23 @@ def _execute_scout_job(
             current_lat=current_lat,
             current_lng=current_lng,
             progress_callback=_runner_progress_update,
+            cancel_callback=lambda: _job_is_cancelled(job_id),
         )
+        if _job_is_cancelled(job_id):
+            cancelled = _job_update(
+                job_id,
+                status="cancelled",
+                progress=100,
+                message="Scout cancelled",
+                result_summary="Scout cancelled",
+                stage="cancelled",
+                finished_at=_job_now_iso(),
+                error=None,
+            )
+            if cancelled:
+                print("  scout job cancelled")
+                _upsert_job_supabase(cancelled)
+            return
         _job_progress(
             job_id,
             90,
@@ -1191,6 +1199,21 @@ def _execute_scout_job(
             print("  scout job finished")
             _upsert_job_supabase(finished)
     except Exception as e:
+        if ScoutRunError and isinstance(e, ScoutRunError) and e.error_type == "cancelled":
+            cancelled = _job_update(
+                job_id,
+                status="cancelled",
+                progress=100,
+                message="Scout cancelled",
+                result_summary="Scout cancelled",
+                finished_at=_job_now_iso(),
+                error=None,
+                stage="cancelled",
+            )
+            if cancelled:
+                print("  scout job cancelled")
+                _upsert_job_supabase(cancelled)
+            return
         failed = _job_update(
             job_id,
             status="failed",
@@ -1593,10 +1616,15 @@ def sendLeadBriefingEmail(user: dict, summary: dict):
 
 
 def _send_resend_email(to_email: str, subject: str, body: str):
-    if not _resend_api_key:
+    has_resend_key = bool(_resend_api_key)
+    if not has_resend_key:
+        print("  [Email] RESEND_API_KEY exists: False", file=sys.stderr)
         raise RuntimeError("RESEND_API_KEY is not configured")
     from_email = (os.environ.get("OUTREACH_FROM_EMAIL") or _resend_from_email or "").strip()
     from_name = (os.environ.get("OUTREACH_FROM_NAME") or "Scout-Brain").strip()
+    print("  [Email] RESEND_API_KEY exists: True")
+    print(f"  [Email] OUTREACH_FROM_EMAIL in use: {from_email or '(missing)'}")
+    print(f"  [Email] OUTREACH_FROM_NAME in use: {from_name}")
     if not from_email:
         raise RuntimeError("OUTREACH_FROM_EMAIL is not configured")
     html_body = "<br/>".join((body or "").splitlines())
@@ -1616,17 +1644,57 @@ def _send_resend_email(to_email: str, subject: str, body: str):
         },
         method="POST",
     )
-    with urllib_request.urlopen(req, timeout=20) as resp:
-        status_code = getattr(resp, "status", 200)
-        raw = resp.read().decode("utf-8", errors="ignore")
+    try:
+        with urllib_request.urlopen(req, timeout=20) as resp:
+            status_code = getattr(resp, "status", 200)
+            raw = resp.read().decode("utf-8", errors="ignore")
+            parsed = {}
+            try:
+                parsed = json.loads(raw) if raw else {}
+            except Exception:
+                parsed = {}
+            print(f"  [Email] provider response status: {status_code}")
+            if not (200 <= status_code < 300):
+                provider_message = parsed.get("message") or parsed.get("error") or raw or "Unknown provider error"
+                print(f"  [Email] provider error message: {provider_message}", file=sys.stderr)
+                if int(status_code) == 403:
+                    raise RuntimeError(
+                        "email_provider_forbidden: Email provider rejected the send. "
+                        "Check API key, verified domain, and sender address."
+                    )
+                raise RuntimeError(f"email_send_failed_http_{status_code}: {provider_message}")
+            provider_thread_id = (
+                parsed.get("thread_id")
+                or parsed.get("threadId")
+                or parsed.get("conversation_id")
+                or parsed.get("conversationId")
+            )
+            return {
+                "provider_message_id": parsed.get("id"),
+                "provider_thread_id": provider_thread_id,
+                "provider_raw": parsed,
+            }
+    except urllib_error.HTTPError as e:
+        status_code = int(getattr(e, "code", 0) or 0)
+        raw = ""
+        try:
+            raw = e.read().decode("utf-8", errors="ignore")
+        except Exception:
+            raw = str(e)
         parsed = {}
         try:
             parsed = json.loads(raw) if raw else {}
         except Exception:
             parsed = {}
-        if not (200 <= status_code < 300):
-            raise RuntimeError(f"email_send_failed_http_{status_code}")
-        return {"provider_message_id": parsed.get("id"), "provider_raw": parsed}
+        provider_message = parsed.get("message") or parsed.get("error") or raw or str(e)
+        print(f"  [Email] provider response status: {status_code}", file=sys.stderr)
+        print(f"  [Email] provider error message: {provider_message}", file=sys.stderr)
+        if status_code == 403:
+            raise RuntimeError(
+                "email_provider_forbidden: Email provider rejected the send. "
+                "Check API key, verified domain, and sender address."
+            )
+        raise RuntimeError(f"email_send_failed_http_{status_code}: {provider_message}")
 
 
 def _insert_email_event(crm_sb, row: dict):
@@ -1831,12 +1899,28 @@ def _match_inbound_thread(
 
 def _mark_lead_replied_after_inbound(crm_sb, lead_id: str):
     now_iso = datetime.now(timezone.utc).isoformat()
-    updates = {
-        "status": "replied",
-        "last_contacted_at": now_iso,
-        "next_follow_up_at": None,
-    }
     try:
+        lead_rows = (
+            crm_sb.table(CRM_LEADS_TABLE)
+            .select("id,status")
+            .eq("id", lead_id)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if not lead_rows:
+            return
+        current_status = str(lead_rows[0].get("status") or "").strip().lower()
+        allowed = {"new", "contacted", "follow_up_due", "replied"}
+        if current_status not in allowed:
+            return
+        updates = {
+            "last_contacted_at": now_iso,
+            "next_follow_up_at": None,
+        }
+        if current_status in {"new", "contacted", "follow_up_due"}:
+            updates["status"] = "replied"
         crm_sb.table(CRM_LEADS_TABLE).update(updates).eq("id", lead_id).execute()
         print("  lead marked replied")
     except Exception as e:
@@ -2025,6 +2109,117 @@ def _load_outreach_template_for_opportunity(
     except Exception as e:
         print(f"  [Scout] outreach template load failed: {e}", file=sys.stderr)
         return {}
+
+
+def generate_outreach_email(opportunity: dict, case_file: dict) -> dict:
+    business_name = str(opportunity.get("business_name") or "there").strip() or "there"
+    category = str(opportunity.get("category") or opportunity.get("industry") or "local business").strip() or "local business"
+    city = str(opportunity.get("city") or opportunity.get("address") or "your area").strip() or "your area"
+    screenshot_url = (
+        case_file.get("desktop_screenshot_url")
+        or case_file.get("mobile_screenshot_url")
+        or case_file.get("internal_screenshot_url")
+        or case_file.get("screenshot_url")
+    )
+    screenshot_url = str(screenshot_url).strip() if screenshot_url else None
+
+    issue_candidates: list[str] = []
+    mobile_score = case_file.get("mobile_score")
+    seo_score = case_file.get("seo_score")
+    performance_score = case_file.get("performance_score")
+    website_speed = case_file.get("website_speed") or case_file.get("homepage_load_seconds")
+    missing_ssl = case_file.get("missing_ssl")
+    ssl_ok = case_file.get("ssl_ok")
+    slow_load = case_file.get("slow_load")
+    mobile_layout_issue = case_file.get("mobile_layout_issue")
+    outdated_design = bool(case_file.get("outdated_design_clues"))
+    missing_meta_title = bool(case_file.get("missing_meta_title"))
+    missing_meta_description = bool(case_file.get("missing_meta_description"))
+
+    try:
+        if mobile_score is not None and float(mobile_score) < 70:
+            issue_candidates.append("The site layout shifts on mobile devices")
+    except Exception:
+        pass
+    if mobile_layout_issue is True or case_file.get("mobile_ready") is False:
+        issue_candidates.append("The site layout shifts on mobile devices")
+
+    try:
+        if performance_score is not None and float(performance_score) < 70:
+            issue_candidates.append("Page load speed is slower than average")
+    except Exception:
+        pass
+    try:
+        if website_speed is not None and float(website_speed) > 3:
+            issue_candidates.append("Page load speed is slower than average")
+    except Exception:
+        pass
+    if slow_load is True:
+        issue_candidates.append("Page load speed is slower than average")
+
+    try:
+        if seo_score is not None and float(seo_score) < 70:
+            issue_candidates.append("The site may not be optimized for Google search visibility")
+    except Exception:
+        pass
+    if missing_meta_title or missing_meta_description:
+        issue_candidates.append("The site may not be optimized for Google search visibility")
+
+    if missing_ssl is True or ssl_ok is False:
+        issue_candidates.append("The website does not appear to be fully secured with HTTPS")
+
+    if outdated_design:
+        issue_candidates.append("The design feels outdated compared to nearby competitors")
+
+    audit_issues = case_file.get("audit_issues")
+    if isinstance(audit_issues, list):
+        for item in audit_issues:
+            text = str(item or "").strip()
+            if text:
+                issue_candidates.append(text)
+
+    issues: list[str] = []
+    for candidate in issue_candidates:
+        normalized = candidate.strip()
+        if not normalized:
+            continue
+        if normalized not in issues:
+            issues.append(normalized)
+        if len(issues) >= 3:
+            break
+    if not issues:
+        issues = [
+            "The mobile experience could be improved for local customers",
+            "Page speed appears slower than ideal on first load",
+            "The site likely has opportunities to improve local search visibility",
+        ]
+
+    issue_lines = "\n".join([f"• {issue}" for issue in issues[:3]])
+    screenshot_line = (
+        f"I grabbed a quick screenshot while reviewing the site:\n{screenshot_url}\n\n"
+        if screenshot_url
+        else ""
+    )
+    subject = f"Quick website question for {business_name}"
+    body = (
+        f"Hi {business_name},\n\n"
+        f"I was reviewing local {category} businesses in {city} and came across your website.\n\n"
+        "I noticed a few things that may be affecting how customers experience the site:\n\n"
+        f"{issue_lines}\n\n"
+        f"{screenshot_line}"
+        "I run MixedMakerShop and help local businesses improve their websites so they load faster "
+        "and convert more visitors into customers.\n\n"
+        "If you'd like, I can send a quick written audit showing what I found and how it could be improved.\n\n"
+        "No pressure at all.\n\n"
+        "– Topher\n"
+        "MixedMakerShop"
+    )
+    return {
+        "subject": subject,
+        "body": body,
+        "issues": issues[:3],
+        "screenshot_url": screenshot_url,
+    }
 
 
 def _frequency_allows_send(settings: dict) -> bool:
@@ -2856,6 +3051,12 @@ class OutreachRegenerateBody(BaseModel):
     linked_opportunity_id: str | None = None
 
 
+class OutreachGenerateEmailBody(BaseModel):
+    workspace_id: str | None = None
+    lead_id: str | None = None
+    linked_opportunity_id: str | None = None
+
+
 class OutreachTestBody(BaseModel):
     to: str
     subject: str | None = None
@@ -2895,6 +3096,48 @@ def get_job_status(request: Request, job_id: str):
         "created_at": job.get("created_at"),
         "started_at": job.get("started_at"),
         "finished_at": job.get("finished_at"),
+    }
+
+
+@app.post("/job/{job_id}/cancel")
+def cancel_job(request: Request, job_id: str):
+    user_id = _get_user_id_from_request(request)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    workspace_id = _get_workspace_id_from_request(request)
+    job = _job_get(job_id)
+    if not job:
+        job = _load_job_from_supabase(job_id, workspace_id=workspace_id)
+        if job:
+            _job_store(job)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if workspace_id and job.get("workspace_id") and job.get("workspace_id") != workspace_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    status = str(job.get("status") or "").strip().lower()
+    if status in {"finished", "completed", "failed", "cancelled"}:
+        return {
+            "ok": True,
+            "job_id": job_id,
+            "status": status,
+            "message": job.get("message") or "Job already finished",
+        }
+    updated = _job_update(
+        job_id,
+        status="cancelled",
+        message="Stopping scout...",
+        result_summary="Stopping scout...",
+        stage="cancelled",
+        finished_at=_job_now_iso(),
+        error=None,
+    )
+    if updated:
+        _upsert_job_supabase(updated)
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "status": "cancelled",
+        "message": "Stopping scout...",
     }
 
 
@@ -3199,6 +3442,7 @@ def post_outreach_send(request: Request, body: OutreachSendBody):
         return {
             "ok": True,
             "provider_message_id": provider_message_id,
+            "email_thread_id": thread_id,
             "lead_id": body.lead_id,
             "lead_updates": updates,
         }
@@ -3236,6 +3480,11 @@ def post_outreach_send(request: Request, body: OutreachSendBody):
                 "owner_id": user_id,
             },
         )
+        if "email_provider_forbidden" in str(e):
+            raise HTTPException(
+                status_code=403,
+                detail="Email provider rejected the send. Check API key, verified domain, and sender address.",
+            )
         raise HTTPException(status_code=500, detail=f"outreach_email_failed: {e}")
 
 
@@ -3368,6 +3617,124 @@ def post_outreach_inbound(request: Request, body: InboundEmailBody):
     return {"ok": True, "matched": True, "lead_id": lead_id, "thread_id": thread_id}
 
 
+@app.post("/outreach/generate-email")
+def post_outreach_generate_email(request: Request, body: OutreachGenerateEmailBody):
+    user_id = _get_user_id_from_request(request)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    print("  loading dossier outreach template")
+    linked_opportunity_id = (body.linked_opportunity_id or "").strip()
+    workspace_id = (body.workspace_id or "").strip() or _get_workspace_id_from_request(request)
+
+    crm_sb = _create_crm_client()
+    if body.lead_id and not linked_opportunity_id and crm_sb is not None:
+        lead = _crm_fetch_lead(crm_sb, body.lead_id, user_id)
+        if lead:
+            linked_opportunity_id = str(lead.get("linked_opportunity_id") or "").strip()
+            workspace_id = workspace_id or str(lead.get("workspace_id") or "").strip()
+
+    if not linked_opportunity_id:
+        raise HTTPException(status_code=400, detail="linked_opportunity_id is required")
+    if not _supabase_url or not _supabase_service_key:
+        raise HTTPException(status_code=500, detail="Supabase backend is not configured")
+
+    try:
+        from supabase import create_client
+
+        sb = create_client(_supabase_url, _supabase_service_key)
+        opportunity = {}
+        case_file = {}
+
+        opp_queries = [
+            lambda: (
+                sb.table("opportunities")
+                .select(
+                    "id,business_name,category,city,address,website,opportunity_score,website_status,"
+                    "website_speed,mobile_ready,seo_score,website_quality_score"
+                )
+                .eq("id", linked_opportunity_id)
+                .eq("workspace_id", workspace_id)
+                .limit(1)
+                .execute()
+            ),
+            lambda: (
+                sb.table("opportunities")
+                .select(
+                    "id,business_name,category,city,address,website,opportunity_score,website_status,"
+                    "website_speed,mobile_ready,seo_score,website_quality_score"
+                )
+                .eq("id", linked_opportunity_id)
+                .limit(1)
+                .execute()
+            ),
+        ]
+        for q in opp_queries:
+            try:
+                res = q()
+                rows = res.data or []
+                if rows:
+                    opportunity = rows[0]
+                    break
+            except Exception:
+                continue
+
+        case_queries = [
+            lambda: (
+                sb.table("case_files")
+                .select(
+                    "opportunity_id,mobile_score,performance_score,seo_score,missing_ssl,slow_load,mobile_layout_issue,"
+                    "website_speed,homepage_load_seconds,mobile_ready,ssl_ok,missing_meta_title,missing_meta_description,"
+                    "audit_issues,outdated_design_clues,desktop_screenshot_url,mobile_screenshot_url,internal_screenshot_url,"
+                    "screenshot_url"
+                )
+                .eq("opportunity_id", linked_opportunity_id)
+                .eq("workspace_id", workspace_id)
+                .limit(1)
+                .execute()
+            ),
+            lambda: (
+                sb.table("case_files")
+                .select(
+                    "opportunity_id,mobile_score,performance_score,seo_score,missing_ssl,slow_load,mobile_layout_issue,"
+                    "website_speed,homepage_load_seconds,mobile_ready,ssl_ok,missing_meta_title,missing_meta_description,"
+                    "audit_issues,outdated_design_clues,desktop_screenshot_url,mobile_screenshot_url,internal_screenshot_url,"
+                    "screenshot_url"
+                )
+                .eq("opportunity_id", linked_opportunity_id)
+                .limit(1)
+                .execute()
+            ),
+        ]
+        for q in case_queries:
+            try:
+                res = q()
+                rows = res.data or []
+                if rows:
+                    case_file = rows[0]
+                    break
+            except Exception:
+                continue
+
+        generated = generate_outreach_email(opportunity or {}, case_file or {})
+        print("  outreach template loaded")
+        return {
+            "linked_opportunity_id": linked_opportunity_id,
+            "subject": generated.get("subject"),
+            "body": generated.get("body"),
+            "issues": generated.get("issues") or [],
+            "screenshot_url": generated.get("screenshot_url"),
+            "metadata": {
+                "business_name": (opportunity or {}).get("business_name"),
+                "category": (opportunity or {}).get("category"),
+                "city": (opportunity or {}).get("city") or (opportunity or {}).get("address"),
+                "website": (opportunity or {}).get("website"),
+            },
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"outreach_generate_failed: {e}")
+
+
 @app.post("/outreach/template")
 def post_outreach_template(request: Request, body: OutreachTemplateBody):
     user_id = _get_user_id_from_request(request)
@@ -3461,6 +3828,12 @@ def post_outreach_test(request: Request, body: OutreachTestBody):
         }
     except Exception as e:
         print(f"  test email failed: {e}", file=sys.stderr)
+        msg = str(e)
+        if "email_provider_forbidden" in msg:
+            raise HTTPException(
+                status_code=403,
+                detail="Email provider rejected the send. Check API key, verified domain, and sender address.",
+            )
         raise HTTPException(status_code=500, detail=f"test_email_failed: {e}")
 
 

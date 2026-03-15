@@ -8,7 +8,7 @@ Uses config: home_city, search_radius_miles, categories, max_results_per_categor
 
 import json
 import os
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, TimeoutError as FutureTimeoutError, wait
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -820,7 +820,24 @@ def run(
     current_lat: float | None = None,
     current_lng: float | None = None,
     progress_callback=None,
+    cancel_callback=None,
 ):
+    def is_cancelled() -> bool:
+        if not cancel_callback:
+            return False
+        try:
+            return bool(cancel_callback())
+        except Exception:
+            return False
+
+    def ensure_not_cancelled() -> None:
+        if is_cancelled():
+            raise ScoutRunError(
+                "cancelled",
+                "Scout cancelled by user",
+                "Scout cancelled",
+            )
+
     def report_progress(stage: str, progress: int, message: str, **extra):
         if not progress_callback:
             return
@@ -939,6 +956,7 @@ def run(
     try:
         total_cities = max(1, len(target_cities))
         for city_idx, target in enumerate(target_cities, start=1):
+            ensure_not_cancelled()
             city_name = target.get("city_name") or home_city
             state = target.get("state") or ""
             city_label = f"{city_name}, {state}" if state else city_name
@@ -1058,6 +1076,7 @@ def run(
 
     total_to_analyze = max(1, total_businesses)
     for i, place in enumerate(no_website):
+        ensure_not_cancelled()
         cat = place.get("category") or (categories[0] if categories else "")
         print(f"  [{cat}] ", end="")
         processed += 1
@@ -1071,7 +1090,7 @@ def run(
             case_slugs.append(case["slug"])
         else:
             skipped += 1
-        fetch_progress = 50 + int((processed / total_to_analyze) * 10)
+        fetch_progress = 35 + int((processed / total_to_analyze) * 15)
         report_progress(
             "fetching_websites",
             fetch_progress,
@@ -1079,7 +1098,7 @@ def run(
             analyzed_count=processed,
             total_businesses=total_to_analyze,
         )
-        analysis_progress = 65 + int((processed / total_to_analyze) * 5)
+        analysis_progress = 70 + int((processed / total_to_analyze) * 5)
         print(f"  analyzing business {processed}/{total_to_analyze}")
         report_progress(
             "analyzing_websites",
@@ -1090,6 +1109,7 @@ def run(
         )
 
     for i, place in enumerate(weak_website):
+        ensure_not_cancelled()
         cat = place.get("category") or (categories[0] if categories else "")
         print(f"  [{cat}] ", end="")
         processed += 1
@@ -1115,7 +1135,7 @@ def run(
             weak_place_by_slug[case["slug"]] = place
         else:
             skipped += 1
-        fetch_progress = 50 + int((processed / total_to_analyze) * 10)
+        fetch_progress = 35 + int((processed / total_to_analyze) * 15)
         report_progress(
             "fetching_websites",
             fetch_progress,
@@ -1123,7 +1143,7 @@ def run(
             fetched_count=processed,
             total_businesses=total_to_analyze,
         )
-        analysis_progress = 65 + int((processed / total_to_analyze) * 5)
+        analysis_progress = 70 + int((processed / total_to_analyze) * 5)
         print(f"  analyzing business {processed}/{total_to_analyze}")
         report_progress(
             "analyzing_websites",
@@ -1136,6 +1156,7 @@ def run(
     # Phase 2: deep scan top candidates only (priority: no website, mobile, speed, outdated).
     no_website_cases = []
     for slug in no_website_slugs:
+        ensure_not_cancelled()
         p = CASES_DIR / f"{slug}.json"
         if not p.exists():
             continue
@@ -1156,7 +1177,7 @@ def run(
     if deep_total:
         report_progress(
             "capturing_screenshots",
-            70,
+            50,
             f"Capturing screenshots for 0 of {deep_total} businesses",
             screenshots_count=0,
             screenshot_targets=deep_total,
@@ -1194,49 +1215,70 @@ def run(
 
         completed_deep = 0
         with ThreadPoolExecutor(max_workers=min(deep_scan_concurrency, screenshot_concurrency)) as executor:
-            futures = []
+            futures_by_future = {}
             for idx, case in enumerate(deep_candidates, start=1):
+                ensure_not_cancelled()
                 slug = case.get("slug")
                 if not slug or bool(case.get("no_website")):
                     completed_deep += 1
                     continue
-                futures.append((idx, slug, executor.submit(_run_deep, slug, idx)))
-            for idx, slug, future in futures:
-                try:
-                    deep_case, local_log = future.result(timeout=deep_analysis_timeout)
-                    for line in local_log:
-                        print(line)
-                    if deep_case and slug:
-                        print(f"  deep scan saved: {slug}")
-                except FutureTimeoutError:
-                    print(f"  screenshot capture timed out: {slug}")
-                    print(f"  deep scan timeout: {slug}")
-                    try:
-                        path = CASES_DIR / f"{slug}.json"
-                        if path.exists():
-                            with open(path, encoding="utf-8") as f:
-                                timed_out_case = json.load(f)
-                            timed_out_case["screenshot_failed"] = True
-                            save_case(CASES_DIR, timed_out_case)
-                    except Exception:
-                        pass
-                except Exception as e:
-                    print(f"  deep scan failed: {slug} ({e})")
-                completed_deep += 1
-                report_progress(
-                    "capturing_screenshots",
-                    70 + int((completed_deep / max(1, deep_total)) * 10),
-                    f"Capturing screenshots {completed_deep} of {deep_total}",
-                    screenshots_count=completed_deep,
-                    screenshot_targets=deep_total,
-                )
-                report_progress(
-                    "analyzing_websites",
-                    80 + int((completed_deep / max(1, deep_total)) * 5),
-                    f"Analyzing {completed_deep} of {deep_total} deep-scan businesses",
-                    analyzed_count=completed_deep,
-                    total_businesses=deep_total,
-                )
+                future = executor.submit(_run_deep, slug, idx)
+                futures_by_future[future] = (idx, slug)
+
+            pending = set(futures_by_future.keys())
+            try:
+                while pending:
+                    ensure_not_cancelled()
+                    done, pending = wait(pending, timeout=2, return_when=FIRST_COMPLETED)
+                    if not done:
+                        report_progress(
+                            "capturing_screenshots",
+                            50 + int((completed_deep / max(1, deep_total)) * 20),
+                            f"Capturing screenshots {completed_deep} of {deep_total}",
+                            screenshots_count=completed_deep,
+                            screenshot_targets=deep_total,
+                        )
+                        continue
+                    for future in done:
+                        idx, slug = futures_by_future[future]
+                        try:
+                            deep_case, local_log = future.result(timeout=deep_analysis_timeout)
+                            for line in local_log:
+                                print(line)
+                            if deep_case and slug:
+                                print(f"  deep scan saved: {slug}")
+                        except FutureTimeoutError:
+                            print(f"  screenshot capture timed out: {slug}")
+                            print(f"  deep scan timeout: {slug}")
+                            try:
+                                path = CASES_DIR / f"{slug}.json"
+                                if path.exists():
+                                    with open(path, encoding="utf-8") as f:
+                                        timed_out_case = json.load(f)
+                                    timed_out_case["screenshot_failed"] = True
+                                    save_case(CASES_DIR, timed_out_case)
+                            except Exception:
+                                pass
+                        except Exception as e:
+                            print(f"  deep scan failed: {slug} ({e})")
+                        completed_deep += 1
+                        report_progress(
+                            "capturing_screenshots",
+                            50 + int((completed_deep / max(1, deep_total)) * 20),
+                            f"Capturing screenshots {completed_deep} of {deep_total}",
+                            screenshots_count=completed_deep,
+                            screenshot_targets=deep_total,
+                        )
+                        report_progress(
+                            "analyzing_websites",
+                            70 + int((completed_deep / max(1, deep_total)) * 15),
+                            f"Analyzing website {completed_deep} of {deep_total}",
+                            analyzed_count=completed_deep,
+                            total_businesses=deep_total,
+                        )
+            except ScoutRunError:
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
 
     print()
     print(f"  Processed: {processed}")
@@ -1244,6 +1286,7 @@ def run(
     print(f"  Skipped invalid/incomplete leads: {skipped}")
     print()
 
+    ensure_not_cancelled()
     if not case_slugs:
         _write_empty("No case files written. Check Places API and config.")
         report_progress("generating_dossiers", 85, "No valid leads to generate dossiers")
