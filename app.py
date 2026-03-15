@@ -1967,6 +1967,15 @@ def _provider_reason_from_error(err: Exception | str) -> str:
     return msg or "Provider rejected the send."
 
 
+def _normalize_message_id(value: str | None) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("<") and raw.endswith(">") and len(raw) > 2:
+        raw = raw[1:-1].strip()
+    return raw
+
+
 def _normalize_email_subject(subject: str | None) -> str:
     normalized = str(subject or "").strip().lower()
     while normalized.startswith("re:") or normalized.startswith("fw:") or normalized.startswith("fwd:"):
@@ -2095,7 +2104,9 @@ def _resolve_thread_from_references(
     references: list[str],
     workspace_id: str | None = None,
 ):
-    refs = [str(r or "").strip() for r in references if str(r or "").strip()]
+    refs_raw = [str(r or "").strip() for r in references if str(r or "").strip()]
+    refs_normalized = [_normalize_message_id(r) for r in refs_raw]
+    refs = list({r for r in (refs_raw + refs_normalized) if r})
     if not refs:
         return None
     try:
@@ -2839,7 +2850,6 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str) -> dict:
                 "opportunity_signals,status"
             )
             .eq("workspace_id", workspace_id)
-            .gte("opportunity_score", intake_min_score)
             .order("opportunity_score", desc=True)
             .limit(CRM_INTAKE_MAX_CANDIDATES)
             .execute()
@@ -2854,7 +2864,6 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str) -> dict:
                 "opportunity_signals,status"
             )
             .eq("workspace_id", workspace_id)
-            .gte("score", intake_min_score)
             .order("score", desc=True)
             .limit(CRM_INTAKE_MAX_CANDIDATES)
             .execute()
@@ -2865,8 +2874,10 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str) -> dict:
     query_error = None
     for q in intake_queries:
         try:
-            opportunities = q()
-            break
+            rows = q()
+            if rows:
+                opportunities = rows
+                break
         except Exception as e:
             query_error = e
             continue
@@ -2906,6 +2917,11 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str) -> dict:
     for opp in opportunities:
         stats["evaluated"] += 1
         case = case_by_opp.get(str(opp.get("id"))) or {}
+        score = float(opp.get("opportunity_score") or opp.get("score") or 0)
+
+        if score < intake_min_score:
+            stats["filtered"] += 1
+            continue
 
         status_tokens = " ".join(
             [
@@ -2962,7 +2978,6 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str) -> dict:
             or str(opp.get("backup_contact_method") or "").strip()
             or "website"
         )
-        score = float(opp.get("opportunity_score") or opp.get("score") or 0)
         tier = str(opp.get("tier") or opp.get("lead_tier") or "").strip() or "low_priority"
         issue_list = opp.get("opportunity_signals") if isinstance(opp.get("opportunity_signals"), list) else []
         if not issue_list:
@@ -3406,6 +3421,10 @@ class InboundEmailBody(BaseModel):
     received_at: str | None = None
 
 
+class IntakeBackfillBody(BaseModel):
+    workspace_id: str | None = None
+
+
 @app.get("/job/{job_id}")
 def get_job_status(request: Request, job_id: str):
     workspace_id = _get_workspace_id_from_request(request)
@@ -3542,6 +3561,43 @@ def post_scheduled_scout():
         "started": True,
         "message": "Daily scout started",
     }
+
+
+@app.post("/crm/intake/backfill")
+def post_crm_intake_backfill(request: Request, body: IntakeBackfillBody | None = None):
+    user_id = _get_user_id_from_request(request)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not _supabase_url or not _supabase_service_key:
+        raise HTTPException(status_code=500, detail="Supabase backend is not configured")
+
+    try:
+        from supabase import create_client
+
+        sb = create_client(_supabase_url, _supabase_service_key)
+        requested_workspace_id = (body.workspace_id or "").strip() if body else ""
+        requested_workspace_id = requested_workspace_id or _get_workspace_id_from_request(request) or ""
+        workspace = _get_workspace_for_user(sb, user_id, requested_workspace_id)
+        workspace_id = str(workspace.get("id") or "").strip()
+        if not workspace_id:
+            raise HTTPException(status_code=400, detail="workspace could not be resolved")
+
+        print("  evaluating opportunities for CRM intake")
+        stats = _run_workspace_crm_intake(sb, workspace, user_id)
+        print("  crm intake complete")
+        return {
+            "ok": True,
+            "workspace_id": workspace_id,
+            "stats": stats,
+            "message": (
+                f"Backfill complete: created {int(stats.get('created') or 0)} "
+                f"from {int(stats.get('evaluated') or 0)} evaluated opportunities."
+            ),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"crm_intake_backfill_failed: {e}")
 
 
 @app.post("/run-scout")
@@ -3727,7 +3783,7 @@ def post_outreach_send(request: Request, body: OutreachSendBody):
     thread_id = thread.get("id") if thread else None
     try:
         send_result = _send_resend_email(recipient, subject, content)
-        provider_message_id = send_result.get("provider_message_id")
+        provider_message_id = _normalize_message_id(send_result.get("provider_message_id"))
         provider_thread_id = send_result.get("provider_thread_id")
         if provider_thread_id and thread_id:
             try:
@@ -3887,14 +3943,20 @@ def post_outreach_inbound(request: Request, body: InboundEmailBody):
     from_email = str(body.from_email or "").strip().lower()
     subject = (body.subject or "").strip()
     content = (body.body or "").strip()
-    provider_message_id = str(body.provider_message_id or "").strip() or None
+    provider_message_id = _normalize_message_id(body.provider_message_id) or None
     provider_thread_id = str(body.provider_thread_id or "").strip() or None
     workspace_id = str(body.workspace_id or "").strip() or None
     received_at = (body.received_at or "").strip() or datetime.now(timezone.utc).isoformat()
     references = [str(r or "").strip() for r in (body.references or []) if str(r or "").strip()]
-    in_reply_to = str(body.in_reply_to or "").strip()
+    in_reply_to = _normalize_message_id(body.in_reply_to)
     if in_reply_to:
         references.append(in_reply_to)
+    normalized_refs = []
+    for ref in references:
+        normalized = _normalize_message_id(ref)
+        if normalized:
+            normalized_refs.append(normalized)
+    references = list({r for r in normalized_refs if r})
 
     print("  inbound reply received")
     if not from_email or not content:
@@ -3918,6 +3980,22 @@ def post_outreach_inbound(request: Request, body: InboundEmailBody):
     if not lead_id or not owner_id or not thread_id:
         print("  reply could not be matched")
         return {"ok": False, "matched": False, "reason": "reply could not be matched"}
+
+    if provider_message_id:
+        try:
+            existing = (
+                crm_sb.table("email_messages")
+                .select("id")
+                .eq("provider_message_id", provider_message_id)
+                .limit(1)
+                .execute()
+            )
+            if existing.data:
+                print("  inbound reply duplicate ignored")
+                _mark_lead_replied_after_inbound(crm_sb, lead_id)
+                return {"ok": True, "matched": True, "duplicate_ignored": True, "lead_id": lead_id, "thread_id": thread_id}
+        except Exception:
+            pass
 
     _insert_email_message(
         crm_sb,

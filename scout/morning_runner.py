@@ -7,10 +7,13 @@ Uses config: home_city, search_radius_miles, categories, max_results_per_categor
 """
 
 import json
+import math
 import os
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, TimeoutError as FutureTimeoutError, wait
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 try:
     from .case_schema import empty_case, slug_from_name, save_case
@@ -35,6 +38,22 @@ CHAIN_CLUES = ["mcdonald", "starbucks", "subway", "dunkin", "walmart", "target",
 
 # Template-like prefixes from mock data; skip these (not real Places results)
 WEAK_NAME_PREFIXES = ("family ", "main street ", "local ", "downtown ")
+DEFAULT_TARGET_INDUSTRIES = (
+    "restaurants,plumbers,roofing,auto repair,landscaping,hair salons,"
+    "dentists,chiropractors,law firms,churches"
+)
+HOT_SPRINGS_NEARBY_CITIES = [
+    "Hot Springs Village",
+    "Benton",
+    "Bryant",
+    "Little Rock",
+    "North Little Rock",
+    "Arkadelphia",
+    "Malvern",
+    "Sheridan",
+    "Mena",
+    "Glenwood",
+]
 
 
 def _is_weak_name(name: str, category: str) -> bool:
@@ -90,6 +109,135 @@ def _is_chain(name: str) -> bool:
     return any(c in lower for c in CHAIN_CLUES)
 
 
+def _preferred_industry_terms() -> list[str]:
+    raw = (
+        os.environ.get("SCOUT_TARGET_INDUSTRIES")
+        or DEFAULT_TARGET_INDUSTRIES
+    )
+    return [part.strip().lower() for part in str(raw).split(",") if part.strip()]
+
+
+def _normalize_industry(value: str) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    aliases = {
+        "restaurant": "restaurants",
+        "restaurants": "restaurants",
+        "plumber": "plumbers",
+        "plumbers": "plumbers",
+        "roofing contractor": "roofing",
+        "roofing contractors": "roofing",
+        "roofing": "roofing",
+        "auto repair": "auto repair",
+        "landscaper": "landscaping",
+        "landscaping": "landscaping",
+        "hair salon": "hair salons",
+        "hair salons": "hair salons",
+        "salon": "hair salons",
+        "dentist": "dentists",
+        "dentists": "dentists",
+        "chiropractor": "chiropractors",
+        "chiropractors": "chiropractors",
+        "small law firm": "law firms",
+        "lawyer": "law firms",
+        "law firms": "law firms",
+        "church": "churches",
+        "churches": "churches",
+        "local retail shops": "local retail shops",
+        "retail": "local retail shops",
+    }
+    return aliases.get(text, text)
+
+
+def _industry_is_preferred(value: str) -> bool:
+    normalized = _normalize_industry(value)
+    preferred = {_normalize_industry(term) for term in _preferred_industry_terms()}
+    if not normalized:
+        return False
+    return normalized in preferred
+
+
+def _resolve_discovery_categories(config: dict) -> list[str]:
+    configured = config.get("categories", [
+        "restaurant",
+        "cafe",
+        "bakery",
+        "auto repair",
+        "dentist",
+        "plumber",
+        "lawyer",
+        "gym",
+        "church",
+        "salon",
+        "barber shop",
+        "chiropractor",
+        "contractor",
+    ])
+    configured_list = [str(c).strip() for c in configured if str(c).strip()]
+    preferred = [term for term in _preferred_industry_terms() if term]
+    ordered: list[str] = []
+    seen: set[str] = set()
+
+    # Preferred industries first.
+    for term in preferred:
+        norm = _normalize_industry(term)
+        if not norm:
+            continue
+        if norm not in seen:
+            ordered.append(term)
+            seen.add(norm)
+
+    # Include any configured categories not already covered.
+    for category in configured_list:
+        norm = _normalize_industry(category)
+        if not norm:
+            continue
+        if norm not in seen:
+            ordered.append(category)
+            seen.add(norm)
+
+    return ordered or configured_list
+
+
+def _haversine_miles(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    radius_miles = 3958.8
+    d_lat = math.radians(lat2 - lat1)
+    d_lng = math.radians(lng2 - lng1)
+    a = (
+        math.sin(d_lat / 2) ** 2
+        + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(d_lng / 2) ** 2
+    )
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return radius_miles * c
+
+
+def _quick_site_precheck(url: str, timeout: int = 3) -> dict:
+    result = {
+        "unreachable": False,
+        "http_status": None,
+        "ssl_issue": str(url or "").strip().lower().startswith("http://"),
+    }
+    target = str(url or "").strip()
+    if not target:
+        result["unreachable"] = True
+        return result
+    try:
+        req = urllib_request.Request(
+            target,
+            headers={"User-Agent": "Mozilla/5.0 Scout-Brain/1.0"},
+            method="GET",
+        )
+        with urllib_request.urlopen(req, timeout=max(1, timeout)) as resp:
+            result["http_status"] = int(getattr(resp, "status", 200) or 200)
+    except urllib_error.HTTPError as e:
+        result["http_status"] = int(getattr(e, "code", 0) or 0)
+        result["unreachable"] = result["http_status"] >= 400 or result["http_status"] == 0
+    except Exception:
+        result["unreachable"] = True
+    return result
+
+
 def load_config():
     if not CONFIG_PATH.exists():
         raise FileNotFoundError(f"Config not found: {CONFIG_PATH}")
@@ -139,31 +287,78 @@ def _resolve_target_cities(config: dict) -> list[dict]:
     dataset = load_city_dataset()
     if not dataset:
         return [{"city_name": home_city, "state": "", "latitude": None, "longitude": None, "population": 0}]
+    city_radius = float(os.environ.get("SCOUT_CITY_RADIUS", "80") or "80")
 
     explicit_targets = config.get("target_cities") or []
-    if explicit_targets:
-        selected = []
-        dataset_by_key = {
-            f"{r['city_name'].lower()}|{r['state'].lower()}": r for r in dataset
-        }
-        for t in explicit_targets:
-            if isinstance(t, str):
-                city_name = t.strip()
-                state = ""
-            elif isinstance(t, dict):
-                city_name = str(t.get("city_name") or t.get("city") or "").strip()
-                state = str(t.get("state") or "").strip()
-            else:
-                continue
-            if not city_name:
-                continue
-            row = dataset_by_key.get(f"{city_name.lower()}|{state.lower()}")
-            selected.append(row or {"city_name": city_name, "state": state, "latitude": None, "longitude": None, "population": 0})
-        return selected
+    selected = []
+    dataset_by_key = {
+        f"{r['city_name'].lower()}|{r['state'].lower()}": r for r in dataset
+    }
+    for t in explicit_targets:
+        if isinstance(t, str):
+            city_name = t.strip()
+            state = ""
+        elif isinstance(t, dict):
+            city_name = str(t.get("city_name") or t.get("city") or "").strip()
+            state = str(t.get("state") or "").strip()
+        else:
+            continue
+        if not city_name:
+            continue
+        row = dataset_by_key.get(f"{city_name.lower()}|{state.lower()}")
+        selected.append(row or {"city_name": city_name, "state": state, "latitude": None, "longitude": None, "population": 0})
 
-    max_cities = max(1, int(config.get("max_cities_per_run", 5)))
-    ranked = sorted(dataset, key=lambda r: int(r.get("population") or 0), reverse=True)
-    return ranked[:max_cities]
+    if not selected:
+        max_cities = max(1, int(config.get("max_cities_per_run", 5)))
+        ranked = sorted(dataset, key=lambda r: int(r.get("population") or 0), reverse=True)
+        selected = ranked[:max_cities]
+
+    # Expand nearby cities when home city is Hot Springs (requested behavior).
+    if home_city.strip().lower().startswith("hot springs"):
+        seed = None
+        for row in selected:
+            if str(row.get("city_name") or "").strip().lower() == "hot springs":
+                seed = row
+                break
+        if seed is None:
+            seed = next((r for r in dataset if str(r.get("city_name") or "").strip().lower() == "hot springs"), None)
+        seen = {str(r.get("city_name") or "").strip().lower() for r in selected}
+        for city_name in HOT_SPRINGS_NEARBY_CITIES:
+            match = next((r for r in dataset if str(r.get("city_name") or "").strip().lower() == city_name.lower()), None)
+            if (
+                match
+                and seed
+                and seed.get("latitude") is not None
+                and seed.get("longitude") is not None
+                and match.get("latitude") is not None
+                and match.get("longitude") is not None
+            ):
+                try:
+                    distance = _haversine_miles(
+                        float(seed.get("latitude")),
+                        float(seed.get("longitude")),
+                        float(match.get("latitude")),
+                        float(match.get("longitude")),
+                    )
+                    if distance > city_radius:
+                        continue
+                except Exception:
+                    pass
+            if city_name.lower() in seen:
+                continue
+            selected.append(
+                match
+                or {
+                    "city_name": city_name,
+                    "state": "AR",
+                    "latitude": None,
+                    "longitude": None,
+                    "population": 0,
+                }
+            )
+            seen.add(city_name.lower())
+
+    return selected
 
 
 def _fetch_places(
@@ -242,6 +437,9 @@ def _calculate_base_business_score(lead: dict) -> tuple[int, list[str]]:
     if lead.get("phone") or lead.get("email") or lead.get("contact_page"):
         score += 6
         signals.append("+6 reachable contact available")
+    if _industry_is_preferred(lead.get("category") or lead.get("industry") or ""):
+        score += 20
+        signals.append("+20 preferred industry")
 
     distance = _as_float(lead.get("distance_miles"), 9999.0)
     if distance <= 8:
@@ -278,41 +476,59 @@ def calculateWebsiteQualityScore(lead: dict) -> dict:
     text_content_length = _as_int(lead.get("text_content_length"), 0) if lead.get("text_content_length") is not None else None
     image_count = _as_int(lead.get("image_count"), 0) if lead.get("image_count") is not None else None
     broken_links_count = _as_int(lead.get("broken_links_count"), 0) if lead.get("broken_links_count") is not None else 0
+    platform_used = str(lead.get("platform_used") or "").strip().lower()
+    has_contact_path = bool(
+        str(lead.get("phone") or "").strip()
+        or str(lead.get("email") or "").strip()
+        or str(lead.get("contact_page") or "").strip()
+        or bool(lead.get("tap_to_call_present"))
+        or bool(lead.get("contact_form_present"))
+    )
 
     no_website = not has_website
     unreachable = has_website and (fetch_ok is False)
-    very_slow = bool(load_seconds is not None and load_seconds > 3.0)
+    very_slow = bool(load_seconds is not None and load_seconds > 3.5)
     no_mobile = viewport_ok is False
     no_ssl = bool(has_website and ((ssl_ok is False) or website.lower().startswith("http://")))
     missing_seo_basics = missing_meta_title or missing_meta_description
+    poor_seo = missing_seo_basics or broken_links_count > 0 or bool(text_content_length is not None and text_content_length < 300)
+    missing_contact = not has_contact_path
+    outdated_cms = any(token in platform_used for token in ["weebly", "editmysite", "joomla", "drupal 7", "magento 1"])
+    outdated_design = bool(lead.get("outdated_design_clues"))
     very_low_text = bool(text_content_length is not None and text_content_length < 300)
     missing_images = bool(image_count is not None and image_count == 0)
     broken_links = broken_links_count > 0
 
     if no_website:
-        website_quality_score += 40
+        website_quality_score += 100
         issues.append("no website")
-        boosts.append("+40 no website")
+        boosts.append("+100 no website")
     if unreachable:
-        website_quality_score += 35
+        website_quality_score += 90
         issues.append("website unreachable")
-        boosts.append("+35 website unreachable")
+        boosts.append("+90 website unreachable")
     if very_slow:
-        website_quality_score += 20
+        website_quality_score += 40
         issues.append("website very slow")
-        boosts.append("+20 very slow website")
+        boosts.append("+40 slow load")
     if no_mobile:
-        website_quality_score += 20
+        website_quality_score += 40
         issues.append("no mobile optimization")
-        boosts.append("+20 no mobile optimization")
+        boosts.append("+40 mobile issues")
     if no_ssl:
-        website_quality_score += 15
+        website_quality_score += 30
         issues.append("no SSL")
-        boosts.append("+15 no SSL")
-    if missing_seo_basics:
-        website_quality_score += 10
-        issues.append("missing SEO basics")
-        boosts.append("+10 missing meta title/description")
+        boosts.append("+30 missing HTTPS")
+    if poor_seo:
+        website_quality_score += 25
+        issues.append("poor SEO signals")
+        boosts.append("+25 poor SEO")
+    if missing_contact:
+        website_quality_score += 20
+        issues.append("missing contact information")
+        boosts.append("+20 missing contact info")
+    if outdated_cms or outdated_design:
+        issues.append("outdated CMS/design indicators")
     if very_low_text:
         issues.append("very low text content")
     if missing_images:
@@ -354,6 +570,8 @@ def calculateWebsiteQualityScore(lead: dict) -> dict:
         "website_quality_score": website_quality_score,
         "website_issues": issues,
         "website_boost_signals": boosts,
+        "missing_contact_info": missing_contact,
+        "outdated_cms_indicators": outdated_cms or outdated_design,
     }
     print(
         "website scoring applied: "
@@ -370,18 +588,16 @@ def calculateOpportunityScore(lead: dict) -> tuple[int, list[str], str, dict]:
     base_score, base_signals = _calculate_base_business_score(lead)
     website_quality = calculateWebsiteQualityScore(lead)
     website_score = int(website_quality.get("website_quality_score") or 0)
-
-    total = max(0, min(100, int(round(base_score + website_score))))
+    # Prioritize website pain first; base business score is secondary context only.
+    total = max(0, min(100, int(round(website_score + min(10, max(0, base_score // 10))))))
     score_signals = list(base_signals) + list(website_quality.get("website_boost_signals") or [])
-    if total >= 85:
-        tier = "Hot Lead"
-    elif total >= 70:
-        tier = "Strong Lead"
-    elif total >= 50:
-        tier = "Possible Lead"
+    if total >= 80:
+        tier = "hot_lead"
+    elif total >= 60:
+        tier = "warm_lead"
     else:
-        tier = "Low Priority"
-    print(f"opportunity score updated: base={base_score}, website={website_score}, total={total}")
+        tier = "low_priority"
+    print(f"opportunity score updated: base={base_score}, website={website_score}, total={total}, tier={tier}")
     return total, score_signals, tier, website_quality
 
 
@@ -557,6 +773,7 @@ def _build_no_website_case(place: dict, home_city: str, categories: list, index:
     case["opportunity_score"] = score
     case["internal_score"] = score
     case["lead_tier"] = lead_tier
+    case["tier"] = lead_tier
     case["website_status"] = website_quality.get("website_status")
     case["website_speed"] = website_quality.get("website_speed")
     case["mobile_ready"] = website_quality.get("mobile_ready")
@@ -655,6 +872,74 @@ def _build_weak_website_case(
     case["business_status"] = place.get("business_status")
     case["review_snippets"] = place.get("review_snippets") or []
     case["review_themes"] = place.get("review_themes") or []
+    case["performance_score"] = None
+
+    if not deep_scan:
+        precheck = _quick_site_precheck(website, timeout=min(3, max(1, website_fetch_timeout)))
+        case["homepage_http_status"] = precheck.get("http_status")
+        case["ssl_ok"] = not bool(precheck.get("ssl_issue"))
+        if precheck.get("unreachable"):
+            case["fetch_ok"] = False
+            case["website_status"] = "unreachable"
+            case["strongest_problems"] = ["Website appears unreachable"]
+            case["audit_issues"] = ["Website appears unreachable"]
+            case["strongest_pitch_angle"] = "Fix reliability and get the site loading for customers"
+            case["best_service_to_offer"] = "Stability and performance recovery plan"
+            score, score_signals, lead_tier, website_quality = calculateOpportunityScore(case)
+            score = max(score, 90)
+            case["opportunity_score"] = score
+            case["internal_score"] = score
+            lead_tier = "hot_lead" if score >= 80 else "warm_lead" if score >= 60 else "low_priority"
+            case["lead_tier"] = lead_tier
+            case["tier"] = lead_tier
+            case["website_status"] = website_quality.get("website_status") or "unreachable"
+            case["website_speed"] = website_quality.get("website_speed")
+            case["mobile_ready"] = website_quality.get("mobile_ready")
+            case["seo_score"] = website_quality.get("seo_score")
+            case["website_quality_score"] = website_quality.get("website_quality_score")
+            case["priority"] = "high" if score >= 70 else "medium" if score >= 50 else "low"
+            base_signals = generateOpportunitySignals(case)
+            merged_signals = list(dict.fromkeys(base_signals + score_signals))
+            case["opportunity_signals"] = merged_signals[:8]
+            log.append("  fast precheck short-circuit: website unreachable")
+            valid, reason = _validate_case(case)
+            if not valid:
+                log.append(f"  SKIP validation: {reason}")
+                return None
+            save_case(CASES_DIR, case)
+            log.append(f"  case_file_written: {case['slug']}.json")
+            return case
+        if precheck.get("ssl_issue"):
+            case["missing_ssl"] = True
+            case["ssl_ok"] = False
+            case["strongest_problems"] = ["Website uses HTTP instead of HTTPS"]
+            case["audit_issues"] = ["Website uses HTTP instead of HTTPS"]
+            case["strongest_pitch_angle"] = "Secure the site with HTTPS to improve trust and conversions"
+            case["best_service_to_offer"] = "HTTPS/security and conversion-focused refresh"
+            score, score_signals, lead_tier, website_quality = calculateOpportunityScore(case)
+            score = max(score, 80)
+            case["opportunity_score"] = score
+            case["internal_score"] = score
+            lead_tier = "hot_lead" if score >= 80 else "warm_lead" if score >= 60 else "low_priority"
+            case["lead_tier"] = lead_tier
+            case["tier"] = lead_tier
+            case["website_status"] = website_quality.get("website_status") or "weak"
+            case["website_speed"] = website_quality.get("website_speed")
+            case["mobile_ready"] = website_quality.get("mobile_ready")
+            case["seo_score"] = website_quality.get("seo_score")
+            case["website_quality_score"] = website_quality.get("website_quality_score")
+            case["priority"] = "high" if score >= 70 else "medium" if score >= 50 else "low"
+            base_signals = generateOpportunitySignals(case)
+            merged_signals = list(dict.fromkeys(base_signals + score_signals))
+            case["opportunity_signals"] = merged_signals[:8]
+            log.append("  fast precheck short-circuit: website uses HTTP only")
+            valid, reason = _validate_case(case)
+            if not valid:
+                log.append(f"  SKIP validation: {reason}")
+                return None
+            save_case(CASES_DIR, case)
+            log.append(f"  case_file_written: {case['slug']}.json")
+            return case
 
     log.append(f"  Investigating ({'deep' if deep_scan else 'light'}): {website}")
     screenshot_dir = CASE_FILES_DIR / slug if (deep_scan and capture_screenshots) else None
@@ -781,14 +1066,28 @@ def _build_weak_website_case(
     case["opportunity_score"] = score
     case["internal_score"] = score
     case["lead_tier"] = lead_tier
+    case["tier"] = lead_tier
     case["website_status"] = website_quality.get("website_status")
     case["website_speed"] = website_quality.get("website_speed")
     case["mobile_ready"] = website_quality.get("mobile_ready")
     case["seo_score"] = website_quality.get("seo_score")
     case["website_quality_score"] = website_quality.get("website_quality_score")
+    case["performance_score"] = case.get("website_score")
     case["priority"] = "high" if score >= 70 else "medium" if score >= 50 else "low"
     base_signals = generateOpportunitySignals(case)
     merged_signals = list(dict.fromkeys(base_signals + score_signals))
+    # Early exit for obviously modern, fast sites during lightweight scans.
+    if (
+        not deep_scan
+        and _as_int(case.get("mobile_score"), 0) >= 85
+        and _as_int(case.get("performance_score"), 0) >= 85
+    ):
+        case["opportunity_score"] = min(int(case.get("opportunity_score") or 0), 39)
+        case["internal_score"] = case["opportunity_score"]
+        case["lead_tier"] = "low_priority"
+        case["tier"] = "low_priority"
+        merged_signals.append("Early exit: modern fast site")
+        case["priority"] = "low"
     case["opportunity_signals"] = merged_signals[:8]
 
     valid, reason = _validate_case(case)
@@ -865,21 +1164,7 @@ def run(
     home_city = config.get("home_city", "City")
     target_cities = _resolve_target_cities(config)
     radius = config.get("search_radius_miles", 25)
-    categories = config.get("categories", [
-        "restaurant",
-        "cafe",
-        "bakery",
-        "auto repair",
-        "dentist",
-        "plumber",
-        "lawyer",
-        "gym",
-        "church",
-        "salon",
-        "barber shop",
-        "chiropractor",
-        "contractor",
-    ])
+    categories = _resolve_discovery_categories(config)
     radii_miles = config.get("search_radii_miles", [2, 5, 10, 15])
     max_total_results = int(
         config.get(
@@ -891,6 +1176,36 @@ def run(
     ignore_chains = config.get("ignore_chains", True)
     deep_scan_max_per_run = max(
         1, int(config.get("DEEP_SCAN_MAX_PER_RUN", config.get("deep_scan_max_per_run", 15)))
+    )
+    max_concurrency = max(
+        1,
+        min(
+            12,
+            int(
+                os.environ.get(
+                    "SCOUT_MAX_CONCURRENCY",
+                    config.get("SCOUT_MAX_CONCURRENCY", config.get("max_concurrency", 10)),
+                )
+            ),
+        ),
+    )
+    screenshot_score_threshold = max(
+        0,
+        int(
+            os.environ.get(
+                "SCOUT_SCREENSHOT_SCORE_THRESHOLD",
+                config.get("SCOUT_SCREENSHOT_SCORE_THRESHOLD", 70),
+            )
+        ),
+    )
+    deep_audit_score_threshold = max(
+        0,
+        int(
+            os.environ.get(
+                "SCOUT_DEEP_AUDIT_SCORE_THRESHOLD",
+                config.get("SCOUT_DEEP_AUDIT_SCORE_THRESHOLD", 80),
+            )
+        ),
     )
     screenshot_max_per_run = max(
         1, int(config.get("SCREENSHOT_MAX_PER_RUN", config.get("screenshot_max_per_run", 10)))
@@ -926,7 +1241,10 @@ def run(
     print(f"  categories: {categories}, max_per: {max_per}, ignore_chains: {ignore_chains}")
     print(f"  discovery_max_per_run: {max_total_results}")
     print(f"  deep_scan_max_per_run: {deep_scan_max_per_run}")
+    print(f"  max_concurrency: {max_concurrency}")
     print(f"  screenshot_max_per_run: {screenshot_max_per_run}")
+    print(f"  screenshot_score_threshold: {screenshot_score_threshold}")
+    print(f"  deep_audit_score_threshold: {deep_audit_score_threshold}")
     print(f"  screenshot_concurrency: {screenshot_concurrency}")
     print(f"  deep_scan_concurrency: {deep_scan_concurrency}")
     print(
@@ -948,7 +1266,7 @@ def run(
             "Scout failed: Google Maps API key not configured. Add GOOGLE_MAPS_API_KEY to scout/.env",
         )
     print()
-    report_progress("discovering_businesses", 20, "Discovery started")
+    report_progress("discovering_businesses", 10, "Discovery started")
 
     places = []
     seen_place_ids: set[str] = set()
@@ -993,7 +1311,7 @@ def run(
                     break
             print(f"  businesses discovered: {city_added}")
             print(f"  duplicates skipped: {city_dupes}")
-            discovery_progress = 20 + int((city_idx / total_cities) * 15)
+            discovery_progress = 10 + int((city_idx / total_cities) * 15)
             report_progress(
                 "discovering_businesses",
                 discovery_progress,
@@ -1053,14 +1371,14 @@ def run(
     total_businesses = len(no_website) + len(weak_website)
     report_progress(
         "businesses_discovered",
-        35,
-        f"Businesses discovered: {total_businesses}",
+        25,
+        f"Websites collected for {total_businesses} businesses",
         total_businesses=total_businesses,
     )
     report_progress(
-        "fetching_websites",
-        50,
-        f"Fetching websites for {total_businesses} businesses",
+        "quick_scans_running",
+        45,
+        f"Quick scans running for {total_businesses} businesses",
         total_businesses=total_businesses,
     )
 
@@ -1090,68 +1408,79 @@ def run(
             case_slugs.append(case["slug"])
         else:
             skipped += 1
-        fetch_progress = 35 + int((processed / total_to_analyze) * 15)
+        fetch_progress = 25 + int((processed / total_to_analyze) * 20)
         report_progress(
-            "fetching_websites",
+            "quick_scans_running",
             fetch_progress,
-            f"Fetching websites for {processed} of {total_to_analyze} businesses",
-            analyzed_count=processed,
-            total_businesses=total_to_analyze,
-        )
-        analysis_progress = 70 + int((processed / total_to_analyze) * 5)
-        print(f"  analyzing business {processed}/{total_to_analyze}")
-        report_progress(
-            "analyzing_websites",
-            analysis_progress,
-            f"Analyzing website {processed} of {total_to_analyze}",
+            f"Quick scans running {processed} of {total_to_analyze}",
             analyzed_count=processed,
             total_businesses=total_to_analyze,
         )
 
-    for i, place in enumerate(weak_website):
-        ensure_not_cancelled()
+    def _run_light_scan(position: int, place: dict):
         cat = place.get("category") or (categories[0] if categories else "")
-        print(f"  [{cat}] ", end="")
-        processed += 1
+        local_log: list[str] = [f"  [{cat}] "]
         case = _build_weak_website_case(
             place,
             home_city,
             categories,
-            len(no_website) + i,
-            debug_log,
+            len(no_website) + position,
+            local_log,
             category=cat,
             deep_scan=False,
             website_fetch_timeout=website_fetch_timeout,
             screenshot_timeout=screenshot_timeout,
         )
-        for line in debug_log:
-            print(line)
-        debug_log.clear()
-        if case:
-            saved += 1
-            weak_website_slugs.append(case["slug"])
-            case_slugs.append(case["slug"])
-            weak_light_cases.append(case)
-            weak_place_by_slug[case["slug"]] = place
-        else:
-            skipped += 1
-        fetch_progress = 35 + int((processed / total_to_analyze) * 15)
-        report_progress(
-            "fetching_websites",
-            fetch_progress,
-            f"Fetching websites for {processed} of {total_to_analyze} businesses",
-            fetched_count=processed,
-            total_businesses=total_to_analyze,
-        )
-        analysis_progress = 70 + int((processed / total_to_analyze) * 5)
-        print(f"  analyzing business {processed}/{total_to_analyze}")
-        report_progress(
-            "analyzing_websites",
-            analysis_progress,
-            f"Analyzing website {processed} of {total_to_analyze}",
-            analyzed_count=processed,
-            total_businesses=total_to_analyze,
-        )
+        return position, place, case, local_log
+
+    if weak_website:
+        with ThreadPoolExecutor(max_workers=max_concurrency) as executor:
+            futures = {
+                executor.submit(_run_light_scan, i, place): (i, place)
+                for i, place in enumerate(weak_website)
+            }
+            pending = set(futures.keys())
+            try:
+                while pending:
+                    ensure_not_cancelled()
+                    done, pending = wait(pending, timeout=2, return_when=FIRST_COMPLETED)
+                    if not done:
+                        report_progress(
+                            "quick_scans_running",
+                            25 + int((processed / max(1, total_to_analyze)) * 20),
+                            f"Quick scans running {processed} of {total_to_analyze}",
+                            analyzed_count=processed,
+                            total_businesses=total_to_analyze,
+                        )
+                        continue
+                    for future in done:
+                        try:
+                            _, place, case, local_log = future.result(timeout=website_fetch_timeout + 5)
+                        except Exception as e:
+                            local_log = [f"  light scan failed: {e}"]
+                            place = futures[future][1]
+                            case = None
+                        for line in local_log:
+                            print(line)
+                        processed += 1
+                        if case:
+                            saved += 1
+                            weak_website_slugs.append(case["slug"])
+                            case_slugs.append(case["slug"])
+                            weak_light_cases.append(case)
+                            weak_place_by_slug[case["slug"]] = place
+                        else:
+                            skipped += 1
+                        report_progress(
+                            "quick_scans_running",
+                            25 + int((processed / total_to_analyze) * 20),
+                            f"Quick scans running {processed} of {total_to_analyze}",
+                            fetched_count=processed,
+                            total_businesses=total_to_analyze,
+                        )
+            except ScoutRunError:
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
 
     # Phase 2: deep scan top candidates only (priority: no website, mobile, speed, outdated).
     no_website_cases = []
@@ -1168,16 +1497,23 @@ def run(
 
     all_candidates = no_website_cases + weak_light_cases
     ranked_candidates = sorted(all_candidates, key=_deep_priority_rank)
-    deep_candidates = ranked_candidates[:deep_scan_max_per_run]
+    deep_eligible = [
+        c for c in ranked_candidates if float(c.get("opportunity_score") or 0) >= deep_audit_score_threshold
+    ]
+    deep_candidates = deep_eligible[:deep_scan_max_per_run]
     for c in deep_candidates:
         print(f"  deep scan candidate selected: {c.get('slug') or c.get('business_name')}")
-    for c in ranked_candidates[deep_scan_max_per_run:]:
+    for c in ranked_candidates:
+        score = float(c.get("opportunity_score") or 0)
+        if score < deep_audit_score_threshold:
+            print(f"  deep scan skipped below threshold ({score:.0f}): {c.get('slug') or c.get('business_name')}")
+    for c in deep_eligible[deep_scan_max_per_run:]:
         print(f"  deep scan skipped due to run cap: {c.get('slug') or c.get('business_name')}")
     deep_total = len(deep_candidates)
     if deep_total:
         report_progress(
             "capturing_screenshots",
-            50,
+            65,
             f"Capturing screenshots for 0 of {deep_total} businesses",
             screenshots_count=0,
             screenshot_targets=deep_total,
@@ -1186,7 +1522,7 @@ def run(
         screenshot_candidate_slugs = [
             c.get("slug")
             for c in deep_candidates
-            if not bool(c.get("no_website"))
+            if not bool(c.get("no_website")) and float(c.get("opportunity_score") or 0) >= screenshot_score_threshold
         ][:screenshot_max_per_run]
         screenshot_candidate_set = {str(s) for s in screenshot_candidate_slugs if s}
 
@@ -1233,7 +1569,7 @@ def run(
                     if not done:
                         report_progress(
                             "capturing_screenshots",
-                            50 + int((completed_deep / max(1, deep_total)) * 20),
+                            65 + int((completed_deep / max(1, deep_total)) * 10),
                             f"Capturing screenshots {completed_deep} of {deep_total}",
                             screenshots_count=completed_deep,
                             screenshot_targets=deep_total,
@@ -1264,14 +1600,14 @@ def run(
                         completed_deep += 1
                         report_progress(
                             "capturing_screenshots",
-                            50 + int((completed_deep / max(1, deep_total)) * 20),
+                            65 + int((completed_deep / max(1, deep_total)) * 10),
                             f"Capturing screenshots {completed_deep} of {deep_total}",
                             screenshots_count=completed_deep,
                             screenshot_targets=deep_total,
                         )
                         report_progress(
                             "analyzing_websites",
-                            70 + int((completed_deep / max(1, deep_total)) * 15),
+                            85 + int((completed_deep / max(1, deep_total)) * 10),
                             f"Analyzing website {completed_deep} of {deep_total}",
                             analyzed_count=completed_deep,
                             total_businesses=deep_total,
@@ -1289,7 +1625,7 @@ def run(
     ensure_not_cancelled()
     if not case_slugs:
         _write_empty("No case files written. Check Places API and config.")
-        report_progress("generating_dossiers", 85, "No valid leads to generate dossiers")
+        report_progress("generating_dossiers", 95, "No valid leads to generate dossiers")
         return
 
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1333,7 +1669,7 @@ def run(
         json.dump(ui_list, f, indent=2)
     report_progress(
         "generating_dossiers",
-        85,
+        95,
         "Generating dossiers",
         generated_count=len(case_slugs),
     )
@@ -1341,7 +1677,7 @@ def run(
     print()
     print(f"  Wrote {len(case_slugs)} cases. {len(no_website_slugs)} no-website (priority), {len(weak_website_slugs)} weak-website.")
     print(f"  unique leads created: {len(case_slugs)}")
-    report_progress("saving_results", 95, "Saving results")
+    report_progress("saving_results", 98, "Saving results")
 
 
 def _write_empty(summary: str | None = None):
