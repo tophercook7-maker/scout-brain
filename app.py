@@ -127,6 +127,8 @@ CRM_LEADS_TABLE = (os.environ.get("CRM_LEADS_TABLE", "leads") or "leads").strip(
 INBOUND_EMAIL_WEBHOOK_SECRET = (os.environ.get("INBOUND_EMAIL_WEBHOOK_SECRET", "") or "").strip()
 SCOUT_WORKSPACE_ID = (os.environ.get("SCOUT_WORKSPACE_ID", "") or "").strip()
 SCHEDULED_SCOUT_WORKSPACE = (os.environ.get("SCHEDULED_SCOUT_WORKSPACE", "") or "").strip()
+SCOUT_VERBOSE_LOGS = _env_flag("SCOUT_VERBOSE_LOGS", default=False)
+SCOUT_AUTH_DEBUG = _env_flag("SCOUT_AUTH_DEBUG", default=False)
 
 app = FastAPI(title="Massive Brain", version="2.0")
 
@@ -167,6 +169,26 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/healthz")
+def get_healthz():
+    snapshot = _runtime_config_snapshot()
+    return {
+        "ok": True,
+        "service": "scout-brain",
+        "scheduler_enabled": bool(ENABLE_SCHEDULED_SCOUT),
+        "runtime": {
+            "supabase_url_present": bool(snapshot.get("supabase_url_present")),
+            "supabase_service_key_present": bool(snapshot.get("supabase_service_key_present")),
+            "supabase_url_host": snapshot.get("supabase_url_host"),
+            "crm_supabase_url_present": bool(snapshot.get("crm_supabase_url_present")),
+            "crm_supabase_service_key_present": bool(snapshot.get("crm_supabase_service_key_present")),
+            "crm_supabase_url_host": snapshot.get("crm_supabase_url_host"),
+            "scout_workspace_id_env_set": bool(snapshot.get("scout_workspace_id_env_set")),
+            "scheduled_scout_workspace_env_set": bool(snapshot.get("scheduled_scout_workspace_env_set")),
+        },
+    }
 
 
 def _run_morning_runner(
@@ -339,59 +361,26 @@ def _decode_rs_token_via_jwks(token: str, alg: str, kid: str | None) -> dict:
 def _get_user_id_from_request(request: Request) -> str | None:
     """Verify Bearer JWT and return user_id (uuid). Returns None if no/invalid auth."""
     auth = request.headers.get("Authorization")
-    print(f"  [Auth] Authorization header present: {bool(auth)}")
     if not auth or not auth.startswith("Bearer "):
-        print("  [Auth] missing/invalid bearer header")
         return None
     token = auth[7:].strip()
     if not token:
-        print("  [Auth] empty bearer token")
         return None
 
-    print("  [Auth] token decode starting")
-    token_issuer_host = None
     token_alg = None
     token_kid = None
-    token_role = None
-    token_has_sub = False
     try:
         import jwt
         header = jwt.get_unverified_header(token)
         token_alg = str(header.get("alg") or "").strip() or None
         token_kid = str(header.get("kid") or "").strip() or None
-        unverified = jwt.decode(
-            token,
-            options={"verify_signature": False, "verify_aud": False},
-        )
-        token_issuer = str(unverified.get("iss") or "").strip()
-        token_issuer_host = urlparse(token_issuer).netloc or None
-        token_role = str(unverified.get("role") or "").strip() or None
-        token_has_sub = bool(str(unverified.get("sub") or "").strip())
     except Exception:
-        token_issuer_host = None
+        token_alg = None
+        token_kid = None
 
-    configured_supabase_host = urlparse(_supabase_url or "").netloc or None
-    print(
-        f"  [Auth] token shape clues: len={len(token)} segments={len(token.split('.'))} "
-        f"alg={token_alg or 'unknown'} kid={'present' if token_kid else 'missing'} "
-        f"role={token_role or 'unknown'} has_sub={token_has_sub}"
-    )
-    if token_issuer_host:
-        print(f"  [Auth] token issuer host: {token_issuer_host}")
-    if configured_supabase_host:
-        print(f"  [Auth] backend SUPABASE_URL host: {configured_supabase_host}")
-    if token_issuer_host and configured_supabase_host:
-        print(
-            f"  [Auth] token issuer host matches backend SUPABASE_URL host: "
-            f"{token_issuer_host == configured_supabase_host}"
-        )
-
-    # Preferred verification path: ask Supabase Auth to validate the access token.
-    # This supports both HS256 and RS256 projects.
     supabase_verify_error_type = None
     if _supabase_url and _supabase_service_key:
         try:
-            print("  [Auth] verification method attempted: supabase-auth-user")
             req = urllib_request.Request(
                 f"{_supabase_url.rstrip('/')}/auth/v1/user",
                 headers={
@@ -407,40 +396,24 @@ def _get_user_id_from_request(request: Request) -> str | None:
                 if 200 <= int(code) < 300:
                     user_id = str(payload.get("id") or payload.get("sub") or "").strip()
                     if user_id:
-                        print("  [Auth] token verification succeeded")
-                        print("  [Auth] user id resolved")
                         return user_id
-                    print("  [Auth] token verification failed: user id not resolved", file=sys.stderr)
-                else:
-                    print(f"  [Auth] token verification failed: upstream {code}", file=sys.stderr)
-                    supabase_verify_error_type = f"upstream_{code}"
+                supabase_verify_error_type = f"upstream_{code}"
         except Exception as e:
             supabase_verify_error_type = type(e).__name__
-            print(
-                f"  [Auth] token verification via Supabase failed: {type(e).__name__}",
-                file=sys.stderr,
-            )
-            if isinstance(e, urllib_error.URLError):
-                print("  [Auth] supabase verification network failure; trying local fallback", file=sys.stderr)
+            if SCOUT_AUTH_DEBUG:
+                print(f"  [Auth] supabase-auth-user verify failed: {supabase_verify_error_type}", file=sys.stderr)
 
-    # Fallback path for RS*/ES* tokens via Supabase JWKS (works without JWT secret).
     if token_alg and token_alg.upper().startswith("RS"):
         try:
-            print("  [Auth] verification method attempted: local-jwks")
             payload = _decode_rs_token_via_jwks(token, token_alg, token_kid)
             user_id = str(payload.get("sub") or payload.get("id") or "").strip()
             if user_id:
-                print("  [Auth] token verification succeeded")
-                print("  [Auth] user id resolved")
                 return user_id
-            print("  [Auth] token verification failed: user id not resolved", file=sys.stderr)
-        except Exception as e:
-            print(f"  [Auth] token verification failed: {type(e).__name__}", file=sys.stderr)
+        except Exception:
+            if SCOUT_AUTH_DEBUG:
+                print("  [Auth] local-jwks verify failed", file=sys.stderr)
 
-    # Fallback for legacy HS* setups.
     if not _supabase_jwt_secret:
-        print("  [Auth] SUPABASE_JWT_SECRET is missing (HS* local fallback unavailable)")
-        print("  [Auth] user id not resolved")
         return None
 
     try:
@@ -448,7 +421,6 @@ def _get_user_id_from_request(request: Request) -> str | None:
         allowed_algs = ["HS256", "HS384", "HS512"]
         if token_alg and token_alg.upper().startswith("HS"):
             allowed_algs = [token_alg.upper()]
-        print("  [Auth] verification method attempted: local-hs")
         payload = jwt.decode(
             token,
             _supabase_jwt_secret,
@@ -457,30 +429,16 @@ def _get_user_id_from_request(request: Request) -> str | None:
         )
         user_id = str(payload.get("sub") or "").strip()
         if user_id:
-            print("  [Auth] token verification succeeded")
-            print("  [Auth] user id resolved")
             return user_id
-        print("  [Auth] token verification failed: user id not resolved", file=sys.stderr)
         return None
     except HTTPException:
         raise
     except Exception as e:
-        reason = type(e).__name__
-        if reason == "InvalidSignatureError":
-            print(
-                "  [Auth] token verification failed: InvalidSignatureError (likely Supabase project mismatch or wrong JWT secret)",
-                file=sys.stderr,
-            )
-        elif reason == "InvalidAlgorithmError":
-            print(
-                "  [Auth] token verification failed: InvalidAlgorithmError (token/signing algorithm mismatch for local HS fallback)",
-                file=sys.stderr,
-            )
-        else:
-            print(f"  [Auth] token verification failed: {reason}", file=sys.stderr)
-        if supabase_verify_error_type:
-            print(f"  [Auth] prior supabase verify failure: {supabase_verify_error_type}", file=sys.stderr)
-        print("  [Auth] user id not resolved")
+        if SCOUT_AUTH_DEBUG:
+            reason = type(e).__name__
+            print(f"  [Auth] local-hs verify failed: {reason}", file=sys.stderr)
+            if supabase_verify_error_type:
+                print(f"  [Auth] prior supabase verify failure: {supabase_verify_error_type}", file=sys.stderr)
         return None
 
 
@@ -582,6 +540,18 @@ def _safe_error_payload(error: Exception) -> dict:
 
 
 def _log_write_stage(stage: str, event: str, meta: dict | None = None) -> None:
+    if not SCOUT_VERBOSE_LOGS:
+        important_events = {
+            "job_created",
+            "started",
+            "finished",
+            "failed",
+            "workspace_unresolved",
+            "workspace_resolution_failed",
+            "workspace_fallback_applied",
+        }
+        if event not in important_events:
+            return
     details = meta or {}
     try:
         printable = json.dumps(details, default=str)
@@ -622,6 +592,8 @@ def _runtime_config_snapshot() -> dict:
 
 
 def _log_runtime_config(context: str) -> None:
+    if context != "startup" and not SCOUT_VERBOSE_LOGS:
+        return
     snapshot = _runtime_config_snapshot()
     print(
         f"  [Config:{context}] "
@@ -1586,14 +1558,12 @@ def _job_progress(
             _job_store(restored)
             job = _job_update(job_id, **updates)
     if job:
-        print(f"  job progress updated to {updates.get('progress')}")
-        if result_summary is not None:
-            print("  job message updated")
-        print(
-            f"  job progress updated: {updates.get('progress')}% "
-            f"status={updates.get('status') or job.get('status')} "
-            f"stage={updates.get('stage') or job.get('stage') or 'n/a'}"
-        )
+        if SCOUT_VERBOSE_LOGS:
+            print(
+                f"  job progress updated: {updates.get('progress')}% "
+                f"status={updates.get('status') or job.get('status')} "
+                f"stage={updates.get('stage') or job.get('stage') or 'n/a'}"
+            )
         _upsert_job_supabase(job)
 
 

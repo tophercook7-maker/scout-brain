@@ -9,6 +9,8 @@ Uses config: home_city, search_radius_miles, categories, max_results_per_categor
 import json
 import math
 import os
+import sys
+import builtins as _builtins
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, TimeoutError as FutureTimeoutError, wait
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,6 +35,36 @@ CASES_DIR = SCRIPT_DIR / "cases"
 CASE_FILES_DIR = SCRIPT_DIR / "case_files"
 TODAY_PATH = SCRIPT_DIR / "today.json"
 OPPORTUNITIES_PATH = SCRIPT_DIR / "opportunities.json"
+SCOUT_VERBOSE_LOGS = str(os.environ.get("SCOUT_VERBOSE_LOGS", "") or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _should_emit_runner_log(message: str, stream) -> bool:
+    if stream is sys.stderr:
+        return True
+    if SCOUT_VERBOSE_LOGS:
+        return True
+    msg = str(message or "")
+    lowered = msg.lower()
+    important_fragments = (
+        "morning runner",
+        "error:",
+        "failed",
+        "processed:",
+        "saved valid case files:",
+        "skipped invalid/incomplete leads:",
+        "wrote ",
+        "no website:",
+        "weak website:",
+        "total businesses discovered:",
+    )
+    return any(fragment in lowered for fragment in important_fragments)
+
+
+def print(*args, **kwargs):  # type: ignore[override]
+    message = " ".join(str(a) for a in args)
+    stream = kwargs.get("file")
+    if _should_emit_runner_log(message, stream):
+        _builtins.print(*args, **kwargs)
 
 CHAIN_CLUES = ["mcdonald", "starbucks", "subway", "dunkin", "walmart", "target", "chain", "franchise"]
 
