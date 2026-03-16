@@ -125,6 +125,8 @@ CRM_SUPABASE_URL = (os.environ.get("CRM_SUPABASE_URL", "") or "").strip() or _su
 CRM_SUPABASE_SERVICE_ROLE_KEY = (os.environ.get("CRM_SUPABASE_SERVICE_ROLE_KEY", "") or "").strip() or _supabase_service_key
 CRM_LEADS_TABLE = (os.environ.get("CRM_LEADS_TABLE", "leads") or "leads").strip()
 INBOUND_EMAIL_WEBHOOK_SECRET = (os.environ.get("INBOUND_EMAIL_WEBHOOK_SECRET", "") or "").strip()
+SCOUT_WORKSPACE_ID = (os.environ.get("SCOUT_WORKSPACE_ID", "") or "").strip()
+SCHEDULED_SCOUT_WORKSPACE = (os.environ.get("SCHEDULED_SCOUT_WORKSPACE", "") or "").strip()
 
 app = FastAPI(title="Massive Brain", version="2.0")
 
@@ -593,6 +595,43 @@ def _normalize_plan(plan: str | None) -> str:
     if raw in {"internal", "free", "pro", "agency"}:
         return raw
     return "free"
+
+
+def _workspace_env_fallback_id() -> str | None:
+    """
+    Optional workspace fallback for manual runs when membership lookup fails.
+    """
+    candidate = SCOUT_WORKSPACE_ID or SCHEDULED_SCOUT_WORKSPACE
+    candidate = str(candidate or "").strip()
+    return candidate or None
+
+
+def _runtime_config_snapshot() -> dict:
+    backend_host = urlparse(_supabase_url or "").netloc or None
+    crm_host = urlparse(CRM_SUPABASE_URL or "").netloc or None
+    return {
+        "supabase_url_present": bool(_supabase_url),
+        "supabase_service_key_present": bool(_supabase_service_key),
+        "supabase_url_host": backend_host,
+        "crm_supabase_url_present": bool(CRM_SUPABASE_URL),
+        "crm_supabase_service_key_present": bool(CRM_SUPABASE_SERVICE_ROLE_KEY),
+        "crm_supabase_url_host": crm_host,
+        "scout_workspace_id_env_set": bool(SCOUT_WORKSPACE_ID),
+        "scheduled_scout_workspace_env_set": bool(SCHEDULED_SCOUT_WORKSPACE),
+    }
+
+
+def _log_runtime_config(context: str) -> None:
+    snapshot = _runtime_config_snapshot()
+    print(
+        f"  [Config:{context}] "
+        f"SUPABASE_URL set={snapshot['supabase_url_present']} host={snapshot['supabase_url_host'] or 'missing'} | "
+        f"SUPABASE_SERVICE_ROLE_KEY set={snapshot['supabase_service_key_present']} | "
+        f"CRM_SUPABASE_URL set={snapshot['crm_supabase_url_present']} host={snapshot['crm_supabase_url_host'] or 'missing'} | "
+        f"CRM_SUPABASE_SERVICE_ROLE_KEY set={snapshot['crm_supabase_service_key_present']} | "
+        f"SCOUT_WORKSPACE_ID set={snapshot['scout_workspace_id_env_set']} | "
+        f"SCHEDULED_SCOUT_WORKSPACE set={snapshot['scheduled_scout_workspace_env_set']}"
+    )
 
 
 def _get_workspace_for_user(sb, user_id: str, requested_workspace_id: str | None = None) -> dict:
@@ -1644,7 +1683,13 @@ def _execute_scout_job(
         "duplicates_skipped": 0,
         "workspace_id": workspace_id,
         "backend_supabase_url": _supabase_url,
+        "backend_admin_supabase_url": CRM_SUPABASE_URL,
         "admin_supabase_url": CRM_SUPABASE_URL,
+        "backend_supabase_url_host": urlparse(_supabase_url or "").netloc or None,
+        "backend_admin_supabase_url_host": urlparse(CRM_SUPABASE_URL or "").netloc or None,
+        "admin_supabase_url_host": urlparse(CRM_SUPABASE_URL or "").netloc or None,
+        "supabase_url_present": bool(_supabase_url),
+        "supabase_service_key_present": bool(_supabase_service_key),
         "errors": [],
     }
 
@@ -1681,6 +1726,30 @@ def _execute_scout_job(
         if user_id:
             _checkpoint_scout_run_supabase(user_id, workspace_id, job)
     try:
+        if not _supabase_url:
+            persistence_debug["errors"].append(
+                {
+                    "stage": "runtime_config",
+                    "error": "backend Supabase URL missing (SUPABASE_URL)",
+                    "required_env": "SUPABASE_URL",
+                }
+            )
+        if not _supabase_service_key:
+            persistence_debug["errors"].append(
+                {
+                    "stage": "runtime_config",
+                    "error": "backend service role key missing (SUPABASE_SERVICE_ROLE_KEY)",
+                    "required_env": "SUPABASE_SERVICE_ROLE_KEY",
+                }
+            )
+        if not workspace_id:
+            persistence_debug["errors"].append(
+                {
+                    "stage": "workspace_resolution",
+                    "error": "workspace_id unresolved before scout execution",
+                    "fallback_workspace_env_present": bool(_workspace_env_fallback_id()),
+                }
+            )
         if _job_is_cancelled(job_id):
             cancelled = _job_update(
                 job_id,
@@ -5134,6 +5203,13 @@ def post_run_scout(request: Request, body: RunScoutBody | None = None):
         requested_workspace_id = _get_workspace_id_from_request(request)
         workspace_plan = "free"
         workspace_id = requested_workspace_id
+        workspace_resolution = {
+            "requested_workspace_id": requested_workspace_id,
+            "resolved_workspace_id": None,
+            "workspace_plan": workspace_plan,
+            "resolution_source": "request_header",
+            "resolution_error": None,
+        }
         _log_write_stage(
             "run_scout",
             "request_received",
@@ -5142,15 +5218,20 @@ def post_run_scout(request: Request, body: RunScoutBody | None = None):
                 "requested_workspace_id": requested_workspace_id,
                 "backend_supabase_url": _supabase_url,
                 "crm_supabase_url": CRM_SUPABASE_URL,
+                "runtime_config": _runtime_config_snapshot(),
             },
         )
+        _log_runtime_config("run_scout")
         if user_id and _supabase_url and _supabase_service_key:
             try:
                 from supabase import create_client
                 sb = create_client(_supabase_url, _supabase_service_key)
                 ws = _get_workspace_for_user(sb, user_id, requested_workspace_id)
-                workspace_id = ws.get("id")
+                workspace_id = str(ws.get("id") or "").strip() or None
                 workspace_plan = _normalize_plan(ws.get("plan"))
+                workspace_resolution["resolved_workspace_id"] = workspace_id
+                workspace_resolution["workspace_plan"] = workspace_plan
+                workspace_resolution["resolution_source"] = "workspace_lookup"
                 _log_write_stage(
                     "run_scout",
                     "workspace_resolved",
@@ -5158,8 +5239,23 @@ def post_run_scout(request: Request, body: RunScoutBody | None = None):
                         "resolved_user_id": user_id,
                         "resolved_workspace_id": workspace_id,
                         "workspace_plan": workspace_plan,
+                        "resolution_source": workspace_resolution["resolution_source"],
                     },
                 )
+                if not workspace_id:
+                    bootstrap = _bootstrap_workspace_for_user(sb, user_id)
+                    workspace_id = str(bootstrap.get("workspace_id") or "").strip() or None
+                    workspace_resolution["resolved_workspace_id"] = workspace_id
+                    workspace_resolution["resolution_source"] = "workspace_bootstrap"
+                    _log_write_stage(
+                        "run_scout",
+                        "workspace_bootstrapped",
+                        {
+                            "resolved_user_id": user_id,
+                            "resolved_workspace_id": workspace_id,
+                            "workspace_created": bool(bootstrap.get("created")),
+                        },
+                    )
                 allowed, limit_msg = _check_plan_limits_for_run(workspace_plan, _get_workspace_usage(sb, workspace_id))
                 if not allowed:
                     print("  upgrade prompt shown")
@@ -5168,9 +5264,68 @@ def post_run_scout(request: Request, body: RunScoutBody | None = None):
                         limit_msg or _plan_limit_message(),
                         limit_msg or _plan_limit_message(),
                     )
-            except Exception:
+            except Exception as workspace_error:
                 # Never block scout run if plan lookup fails unexpectedly.
                 workspace_plan = "free"
+                workspace_resolution["resolution_error"] = _safe_error_payload(workspace_error)
+                _log_write_stage(
+                    "run_scout",
+                    "workspace_resolution_failed",
+                    {
+                        "resolved_user_id": user_id,
+                        "requested_workspace_id": requested_workspace_id,
+                        "error": _safe_error_payload(workspace_error),
+                    },
+                )
+        else:
+            missing = []
+            if not _supabase_url:
+                missing.append("SUPABASE_URL")
+            if not _supabase_service_key:
+                missing.append("SUPABASE_SERVICE_ROLE_KEY")
+            workspace_resolution["resolution_error"] = {
+                "type": "RuntimeConfigMissing",
+                "message": "Cannot resolve workspace via membership lookup because backend Supabase config is missing.",
+                "missing_env": missing,
+            }
+            _log_write_stage(
+                "run_scout",
+                "workspace_resolution_skipped",
+                {
+                    "resolved_user_id": user_id,
+                    "missing_env": missing,
+                },
+            )
+
+        if not workspace_id:
+            fallback_workspace_id = _workspace_env_fallback_id()
+            if fallback_workspace_id:
+                workspace_id = fallback_workspace_id
+                workspace_resolution["resolved_workspace_id"] = workspace_id
+                workspace_resolution["resolution_source"] = "env_fallback"
+                _log_write_stage(
+                    "run_scout",
+                    "workspace_fallback_applied",
+                    {
+                        "resolved_user_id": user_id,
+                        "resolved_workspace_id": workspace_id,
+                        "fallback_source": "SCOUT_WORKSPACE_ID|SCHEDULED_SCOUT_WORKSPACE",
+                    },
+                )
+            else:
+                workspace_resolution["resolution_error"] = workspace_resolution["resolution_error"] or {
+                    "type": "WorkspaceResolutionFailed",
+                    "message": "No workspace_id resolved from header, membership lookup, bootstrap, or env fallback.",
+                }
+                _log_write_stage(
+                    "run_scout",
+                    "workspace_unresolved",
+                    {
+                        "resolved_user_id": user_id,
+                        "requested_workspace_id": requested_workspace_id,
+                        "resolution_error": workspace_resolution["resolution_error"],
+                    },
+                )
 
         current_lat = body.current_lat if body else None
         current_lng = body.current_lng if body else None
@@ -5180,6 +5335,7 @@ def post_run_scout(request: Request, body: RunScoutBody | None = None):
             "current_lng": current_lng,
             "location_mode": "current" if current_lat is not None and current_lng is not None else "saved",
             "scan_settings": scan_settings,
+            "workspace_resolution": workspace_resolution,
         }
         job_id = str(uuid4())
         job = {
@@ -6306,6 +6462,7 @@ def _stop_scheduler():
 
 @app.on_event("startup")
 def _on_startup():
+    _log_runtime_config("startup")
     _start_scheduler()
 
 
