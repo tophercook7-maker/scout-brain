@@ -39,8 +39,8 @@ CHAIN_CLUES = ["mcdonald", "starbucks", "subway", "dunkin", "walmart", "target",
 # Template-like prefixes from mock data; skip these (not real Places results)
 WEAK_NAME_PREFIXES = ("family ", "main street ", "local ", "downtown ")
 DEFAULT_TARGET_INDUSTRIES = (
-    "restaurants,plumbers,roofing,auto repair,landscaping,hair salons,"
-    "dentists,chiropractors,law firms,churches"
+    "restaurant,cafe,auto repair,mechanic,body shop,tire shop,plumber,electrician,roofing,"
+    "landscaping,cleaning service,pressure washing,boutique,florist,bakery,dentist,chiropractor,church"
 )
 HOT_SPRINGS_NEARBY_CITIES = [
     "Hot Springs Village",
@@ -54,6 +54,14 @@ HOT_SPRINGS_NEARBY_CITIES = [
     "Mena",
     "Glenwood",
 ]
+
+LOW_PRIORITY_INDUSTRIES = {
+    "law firms",
+    "marketing agencies",
+    "software companies",
+    "consultants",
+    "large franchises",
+}
 
 
 def _is_weak_name(name: str, category: str) -> bool:
@@ -124,14 +132,36 @@ def _normalize_industry(value: str) -> str:
     aliases = {
         "restaurant": "restaurants",
         "restaurants": "restaurants",
+        "cafe": "cafes",
+        "cafes": "cafes",
+        "coffee shop": "cafes",
+        "bakery": "bakeries",
+        "bakeries": "bakeries",
         "plumber": "plumbers",
         "plumbers": "plumbers",
+        "electrician": "electricians",
+        "electricians": "electricians",
         "roofing contractor": "roofing",
         "roofing contractors": "roofing",
         "roofing": "roofing",
         "auto repair": "auto repair",
+        "mechanic": "mechanics",
+        "mechanics": "mechanics",
+        "body shop": "body shops",
+        "body shops": "body shops",
+        "tire shop": "tire shops",
+        "tire shops": "tire shops",
         "landscaper": "landscaping",
         "landscaping": "landscaping",
+        "cleaning service": "cleaning services",
+        "cleaning services": "cleaning services",
+        "pressure washing": "pressure washing",
+        "pressure washer": "pressure washing",
+        "pressure washers": "pressure washing",
+        "boutique": "boutiques",
+        "boutiques": "boutiques",
+        "florist": "florists",
+        "florists": "florists",
         "hair salon": "hair salons",
         "hair salons": "hair salons",
         "salon": "hair salons",
@@ -142,6 +172,15 @@ def _normalize_industry(value: str) -> str:
         "small law firm": "law firms",
         "lawyer": "law firms",
         "law firms": "law firms",
+        "marketing agency": "marketing agencies",
+        "marketing agencies": "marketing agencies",
+        "software company": "software companies",
+        "software companies": "software companies",
+        "consultant": "consultants",
+        "consultants": "consultants",
+        "franchise": "large franchises",
+        "large franchise": "large franchises",
+        "large franchises": "large franchises",
         "church": "churches",
         "churches": "churches",
         "local retail shops": "local retail shops",
@@ -156,6 +195,11 @@ def _industry_is_preferred(value: str) -> bool:
     if not normalized:
         return False
     return normalized in preferred
+
+
+def _industry_is_lower_priority(value: str) -> bool:
+    normalized = _normalize_industry(value)
+    return normalized in {_normalize_industry(v) for v in LOW_PRIORITY_INDUSTRIES}
 
 
 def _resolve_discovery_categories(config: dict) -> list[str]:
@@ -437,9 +481,17 @@ def _calculate_base_business_score(lead: dict) -> tuple[int, list[str]]:
     if lead.get("phone") or lead.get("email") or lead.get("contact_page"):
         score += 6
         signals.append("+6 reachable contact available")
-    if _industry_is_preferred(lead.get("category") or lead.get("industry") or ""):
+    industry_value = lead.get("category") or lead.get("industry") or ""
+    if _industry_is_preferred(industry_value):
         score += 20
         signals.append("+20 preferred industry")
+    if _industry_is_lower_priority(industry_value):
+        score -= 20
+        signals.append("-20 lower-priority industry")
+    business_name = str(lead.get("business_name") or lead.get("name") or "").strip().lower()
+    if any(token in business_name for token in ["franchise", "group", "corporate"]):
+        score -= 12
+        signals.append("-12 likely larger chain/franchise fit")
 
     distance = _as_float(lead.get("distance_miles"), 9999.0)
     if distance <= 8:
@@ -477,6 +529,7 @@ def calculateWebsiteQualityScore(lead: dict) -> dict:
     image_count = _as_int(lead.get("image_count"), 0) if lead.get("image_count") is not None else None
     broken_links_count = _as_int(lead.get("broken_links_count"), 0) if lead.get("broken_links_count") is not None else 0
     platform_used = str(lead.get("platform_used") or "").strip().lower()
+    category = _normalize_industry(lead.get("category") or lead.get("industry") or "")
     has_contact_path = bool(
         str(lead.get("phone") or "").strip()
         or str(lead.get("email") or "").strip()
@@ -495,9 +548,41 @@ def calculateWebsiteQualityScore(lead: dict) -> dict:
     missing_contact = not has_contact_path
     outdated_cms = any(token in platform_used for token in ["weebly", "editmysite", "joomla", "drupal 7", "magento 1"])
     outdated_design = bool(lead.get("outdated_design_clues"))
+    outdated_wordpress_theme = bool("wordpress" in platform_used and outdated_design)
+    builder_lock_in = any(token in platform_used for token in ["wix", "godaddy"])
     very_low_text = bool(text_content_length is not None and text_content_length < 300)
     missing_images = bool(image_count is not None and image_count == 0)
     broken_links = broken_links_count > 0
+    broken_layout = bool(
+        broken_links
+        or str(lead.get("menu_visibility") or "").strip().lower() in {"false", "0", "none"}
+        or str(lead.get("hours_visibility") or "").strip().lower() in {"false", "0", "none"}
+    )
+    is_restaurant = category in {"restaurants", "cafes", "bakeries"}
+    is_service_business = category in {
+        "plumbers",
+        "electricians",
+        "roofing",
+        "landscaping",
+        "cleaning services",
+        "pressure washing",
+        "auto repair",
+        "mechanics",
+        "body shops",
+        "tire shops",
+    }
+    missing_online_ordering = bool(
+        is_restaurant
+        and has_website
+        and not str(lead.get("order_link") or "").strip()
+        and not str(lead.get("reservation_link") or "").strip()
+    )
+    missing_booking = bool(
+        is_service_business
+        and has_website
+        and not str(lead.get("reservation_link") or "").strip()
+        and not bool(lead.get("contact_form_present"))
+    )
 
     if no_website:
         website_quality_score += 100
@@ -527,6 +612,26 @@ def calculateWebsiteQualityScore(lead: dict) -> dict:
         website_quality_score += 20
         issues.append("missing contact information")
         boosts.append("+20 missing contact info")
+    if missing_online_ordering:
+        website_quality_score += 24
+        issues.append("missing online ordering")
+        boosts.append("+24 missing online ordering")
+    if missing_booking:
+        website_quality_score += 22
+        issues.append("missing booking system")
+        boosts.append("+22 missing booking")
+    if outdated_wordpress_theme:
+        website_quality_score += 18
+        issues.append("outdated WordPress theme")
+        boosts.append("+18 outdated WordPress theme")
+    if builder_lock_in:
+        website_quality_score += 14
+        issues.append("Wix or GoDaddy builder")
+        boosts.append("+14 builder lock-in")
+    if broken_layout:
+        website_quality_score += 20
+        issues.append("broken layout")
+        boosts.append("+20 broken layout")
     if outdated_cms or outdated_design:
         issues.append("outdated CMS/design indicators")
     if very_low_text:
@@ -572,6 +677,11 @@ def calculateWebsiteQualityScore(lead: dict) -> dict:
         "website_boost_signals": boosts,
         "missing_contact_info": missing_contact,
         "outdated_cms_indicators": outdated_cms or outdated_design,
+        "missing_online_ordering": missing_online_ordering,
+        "missing_booking_system": missing_booking,
+        "outdated_wordpress_theme": outdated_wordpress_theme,
+        "builder_lock_in": builder_lock_in,
+        "broken_layout": broken_layout,
     }
     print(
         "website scoring applied: "
@@ -580,10 +690,37 @@ def calculateWebsiteQualityScore(lead: dict) -> dict:
     return result
 
 
-def calculateOpportunityScore(lead: dict) -> tuple[int, list[str], str, dict]:
+def _derive_opportunity_reason(website_quality: dict, lead: dict) -> str:
+    issues = [str(i).strip().lower() for i in (website_quality.get("website_issues") or []) if str(i).strip()]
+    if "missing online ordering" in issues:
+        return "Missing online ordering"
+    if "missing booking system" in issues:
+        return "Missing booking system"
+    if "website very slow" in issues:
+        return "Slow mobile speed"
+    if "no mobile optimization" in issues:
+        return "No mobile optimization"
+    if "outdated wordpress theme" in issues:
+        return "Outdated WordPress theme"
+    if "wix or godaddy builder" in issues:
+        return "Wix or GoDaddy builder limitations"
+    if "broken layout" in issues:
+        return "Broken layout"
+    if "no ssl" in issues:
+        return "No SSL"
+    if "website unreachable" in issues:
+        return "Website unreachable"
+    if "no website" in issues:
+        return "No website"
+    if "outdated cms/design indicators" in issues:
+        return "Outdated design"
+    return "Outdated design"
+
+
+def calculateOpportunityScore(lead: dict) -> tuple[int, list[str], str, dict, str]:
     """
     Opportunity score engine (0-100).
-    Returns: (score, scoring_signals, lead_tier, website_quality_payload).
+    Returns: (score, scoring_signals, lead_tier, website_quality_payload, opportunity_reason).
     """
     base_score, base_signals = _calculate_base_business_score(lead)
     website_quality = calculateWebsiteQualityScore(lead)
@@ -597,8 +734,9 @@ def calculateOpportunityScore(lead: dict) -> tuple[int, list[str], str, dict]:
         tier = "warm_lead"
     else:
         tier = "low_priority"
+    opportunity_reason = _derive_opportunity_reason(website_quality, lead)
     print(f"opportunity score updated: base={base_score}, website={website_score}, total={total}, tier={tier}")
-    return total, score_signals, tier, website_quality
+    return total, score_signals, tier, website_quality, opportunity_reason
 
 
 def generateOpportunitySignals(caseData: dict) -> list[str]:
@@ -769,7 +907,7 @@ def _build_no_website_case(place: dict, home_city: str, categories: list, index:
     case["what_stood_out"] = "No website"
     case["next_action"] = "Call or visit with short pitch"
     case["follow_up_suggestion"] = "Follow up in 3–5 days"
-    score, score_signals, lead_tier, website_quality = calculateOpportunityScore(case)
+    score, score_signals, lead_tier, website_quality, opportunity_reason = calculateOpportunityScore(case)
     case["opportunity_score"] = score
     case["internal_score"] = score
     case["lead_tier"] = lead_tier
@@ -780,6 +918,7 @@ def _build_no_website_case(place: dict, home_city: str, categories: list, index:
     case["seo_score"] = website_quality.get("seo_score")
     case["website_quality_score"] = website_quality.get("website_quality_score")
     case["priority"] = "high" if score >= 70 else "medium" if score >= 50 else "low"
+    case["opportunity_reason"] = opportunity_reason
     case["contact_matrix"] = {
         "best_contact": "phone" if case["phone"] else "visit",
         "best_contact_method": "phone" if case["phone"] else "visit",
@@ -885,7 +1024,7 @@ def _build_weak_website_case(
             case["audit_issues"] = ["Website appears unreachable"]
             case["strongest_pitch_angle"] = "Fix reliability and get the site loading for customers"
             case["best_service_to_offer"] = "Stability and performance recovery plan"
-            score, score_signals, lead_tier, website_quality = calculateOpportunityScore(case)
+            score, score_signals, lead_tier, website_quality, opportunity_reason = calculateOpportunityScore(case)
             score = max(score, 90)
             case["opportunity_score"] = score
             case["internal_score"] = score
@@ -898,6 +1037,7 @@ def _build_weak_website_case(
             case["seo_score"] = website_quality.get("seo_score")
             case["website_quality_score"] = website_quality.get("website_quality_score")
             case["priority"] = "high" if score >= 70 else "medium" if score >= 50 else "low"
+            case["opportunity_reason"] = opportunity_reason
             base_signals = generateOpportunitySignals(case)
             merged_signals = list(dict.fromkeys(base_signals + score_signals))
             case["opportunity_signals"] = merged_signals[:8]
@@ -916,7 +1056,7 @@ def _build_weak_website_case(
             case["audit_issues"] = ["Website uses HTTP instead of HTTPS"]
             case["strongest_pitch_angle"] = "Secure the site with HTTPS to improve trust and conversions"
             case["best_service_to_offer"] = "HTTPS/security and conversion-focused refresh"
-            score, score_signals, lead_tier, website_quality = calculateOpportunityScore(case)
+            score, score_signals, lead_tier, website_quality, opportunity_reason = calculateOpportunityScore(case)
             score = max(score, 80)
             case["opportunity_score"] = score
             case["internal_score"] = score
@@ -929,6 +1069,7 @@ def _build_weak_website_case(
             case["seo_score"] = website_quality.get("seo_score")
             case["website_quality_score"] = website_quality.get("website_quality_score")
             case["priority"] = "high" if score >= 70 else "medium" if score >= 50 else "low"
+            case["opportunity_reason"] = opportunity_reason
             base_signals = generateOpportunitySignals(case)
             merged_signals = list(dict.fromkeys(base_signals + score_signals))
             case["opportunity_signals"] = merged_signals[:8]
@@ -1062,7 +1203,7 @@ def _build_weak_website_case(
     case["what_stood_out"] = problems[0] if problems else None
     case["next_action"] = "Send short email or try contact form"
     case["follow_up_suggestion"] = "Follow up in 5–7 days"
-    score, score_signals, lead_tier, website_quality = calculateOpportunityScore(case)
+    score, score_signals, lead_tier, website_quality, opportunity_reason = calculateOpportunityScore(case)
     case["opportunity_score"] = score
     case["internal_score"] = score
     case["lead_tier"] = lead_tier
@@ -1074,6 +1215,7 @@ def _build_weak_website_case(
     case["website_quality_score"] = website_quality.get("website_quality_score")
     case["performance_score"] = case.get("website_score")
     case["priority"] = "high" if score >= 70 else "medium" if score >= 50 else "low"
+    case["opportunity_reason"] = opportunity_reason
     base_signals = generateOpportunitySignals(case)
     merged_signals = list(dict.fromkeys(base_signals + score_signals))
     # Early exit for obviously modern, fast sites during lightweight scans.

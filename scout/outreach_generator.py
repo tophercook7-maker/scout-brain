@@ -74,7 +74,8 @@ def generate_outreach_pack(
         (case.get("website_analysis") or {}).get("issues")
     )
     audit_issues = _as_list(case.get("audit_issues"))
-    issue_pool = list(dict.fromkeys([*strongest_problems, *audit_issues]))
+    opportunity_reason = _first(case.get("opportunity_reason"), case.get("main_issue_observed"))
+    issue_pool = list(dict.fromkeys([*( [opportunity_reason] if opportunity_reason else [] ), *strongest_problems, *audit_issues]))
 
     issue_fallback = None
     if lane == "no_website":
@@ -138,14 +139,18 @@ def generate_outreach_pack(
         else "Happy to use whatever contact method works best for your team."
     )
 
+    issue_hint = _first(main_issue, (issue_pool or [None])[0], "something that might be affecting conversions")
+    issue_line = (
+        f"I was looking at your website and noticed: {issue_hint}."
+        if issue_hint
+        else "I was looking at your website and noticed something that might be affecting conversions."
+    )
     short_email = (
-        f"{greeting}\n\n"
-        f"{primary_observation}\n"
-        f"{value_angle}\n\n"
-        "If helpful, I can send one quick idea you can review in a few minutes.\n\n"
-        "Thanks,\n"
-        "Topher\n"
-        "topher@mixedmakershop.com"
+        "Hi,\n\n"
+        f"{issue_line}\n\n"
+        "I grabbed a quick screenshot showing it.\n\n"
+        "Would you like me to send it over?\n\n"
+        "– Topher"
     )
 
     long_sections = [
@@ -176,10 +181,10 @@ def generate_outreach_pack(
     longer_email = "\n".join([line for line in long_sections if line is not None])
 
     contact_form_version = (
-        f"{primary_observation} {value_angle} "
-        f"Offer: {offer_line}. "
-        "If helpful, I can send one quick idea you can review today. "
-        "Topher (MixedMakerShop) — topher@mixedmakershop.com"
+        f"{issue_line} "
+        "I grabbed a quick screenshot showing it. "
+        "Would you like me to send it over? "
+        "– Topher"
     ).strip()
 
     social_dm_version = (

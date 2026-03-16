@@ -116,6 +116,9 @@ SCHEDULED_SCOUT_WORKSPACE_NAME = (os.environ.get("SCHEDULED_SCOUT_WORKSPACE_NAME
 CRM_AUTO_INTAKE_ENABLED = _env_flag("CRM_AUTO_INTAKE_ENABLED", default=True)
 CRM_INTAKE_MIN_SCORE = float(os.environ.get("CRM_INTAKE_MIN_SCORE", "80"))
 CRM_INTAKE_MAX_CANDIDATES = int(os.environ.get("CRM_INTAKE_MAX_CANDIDATES", "250"))
+AUTO_SEQUENCE_SEND_STEP1 = _env_flag("AUTO_SEQUENCE_SEND_STEP1", default=False)
+SEQUENCE_STEP_2_DELAY_DAYS = int(os.environ.get("SEQUENCE_STEP_2_DELAY_DAYS", "3"))
+SEQUENCE_STEP_3_DELAY_DAYS = int(os.environ.get("SEQUENCE_STEP_3_DELAY_DAYS", "7"))
 CRM_SUPABASE_URL = (os.environ.get("CRM_SUPABASE_URL", "") or "").strip() or _supabase_url
 CRM_SUPABASE_SERVICE_ROLE_KEY = (os.environ.get("CRM_SUPABASE_SERVICE_ROLE_KEY", "") or "").strip() or _supabase_service_key
 CRM_LEADS_TABLE = (os.environ.get("CRM_LEADS_TABLE", "leads") or "leads").strip()
@@ -786,6 +789,7 @@ def _sync_scout_to_supabase(
                 "lead_tier": opp_ui.get("lead_tier"),
                 "tier": opp_ui.get("tier") or opp_ui.get("lead_tier"),
                 "opportunity_signals": opp_ui.get("opportunity_signals") or [],
+                "opportunity_reason": opp_ui.get("opportunity_reason") or opp_ui.get("what_stood_out"),
                 "priority": opp_ui.get("priority"),
                 "status": opp_ui.get("status") or "New",
             }
@@ -818,6 +822,7 @@ def _sync_scout_to_supabase(
                         "lead_tier",
                         "tier",
                         "opportunity_signals",
+                        "opportunity_reason",
                         "place_id",
                         "city",
                         "state",
@@ -835,6 +840,7 @@ def _sync_scout_to_supabase(
                     legacy_opp.pop("lead_tier", None)
                     legacy_opp.pop("tier", None)
                     legacy_opp.pop("opportunity_signals", None)
+                    legacy_opp.pop("opportunity_reason", None)
                     legacy_opp.pop("place_id", None)
                     legacy_opp.pop("city", None)
                     legacy_opp.pop("state", None)
@@ -1375,6 +1381,7 @@ def _execute_scout_job(
                     {"id": workspace_id or ""},
                     user_id,
                 )
+                _process_workspace_outreach_sequences(workspace_id or "", user_id)
             except Exception as intake_error:
                 print(f"  [Scout] crm intake after run failed: {intake_error}", file=sys.stderr)
 
@@ -1539,6 +1546,7 @@ def getTopOpportunities(workspace_id: str | None):
                     "lane": "no_website" if r.get("no_website") else (r.get("lane") or "weak_website"),
                     "best_contact_method": r.get("recommended_contact_method") or r.get("backup_contact_method"),
                     "opportunity_signals": r.get("opportunity_signals") or [],
+                    "opportunity_reason": r.get("opportunity_reason"),
                     "slug": r.get("id"),
                 }
                 for r in ranked
@@ -1582,6 +1590,7 @@ def getTopOpportunities(workspace_id: str | None):
                 "seo_score": r.get("seo_score"),
                 "website_quality_score": r.get("website_quality_score"),
                 "opportunity_signals": r.get("opportunity_signals") or [],
+                "opportunity_reason": r.get("opportunity_reason"),
                 "slug": r.get("id"),
             }
             for r in ranked
@@ -2206,6 +2215,7 @@ def _mark_lead_replied_after_inbound(crm_sb, lead_id: str):
         updates = {
             "last_contacted_at": now_iso,
             "next_follow_up_at": None,
+            "sequence_active": False,
         }
         if current_status in {"new", "contacted", "follow_up_due"}:
             updates["status"] = "replied"
@@ -2224,16 +2234,79 @@ def _crm_fetch_lead(crm_sb, lead_id: str, user_id: str | None):
     return rows[0] if rows else None
 
 
-def _mark_lead_contacted_after_email(crm_sb, lead: dict, message_type: str):
+def _crm_fetch_lead_by_linked_opportunity(
+    crm_sb,
+    *,
+    owner_id: str,
+    workspace_id: str | None,
+    linked_opportunity_id: str,
+):
+    if not linked_opportunity_id:
+        return None
+    try:
+        q = (
+            crm_sb.table(CRM_LEADS_TABLE)
+            .select("*")
+            .eq("owner_id", owner_id)
+            .eq("linked_opportunity_id", linked_opportunity_id)
+            .order("created_at", desc=True)
+            .limit(1)
+        )
+        if workspace_id:
+            q = q.eq("workspace_id", workspace_id)
+        rows = q.execute().data or []
+        return rows[0] if rows else None
+    except Exception:
+        return None
+
+
+def _apply_lead_updates_safe(crm_sb, lead_id: str, updates: dict) -> None:
+    if not str(lead_id or "").strip():
+        return
+    payload = dict(updates or {})
+    try:
+        crm_sb.table(CRM_LEADS_TABLE).update(payload).eq("id", lead_id).execute()
+    except Exception as e:
+        msg = str(e).lower()
+        if "column" in msg and (
+            "sequence_step" in msg
+            or "sequence_active" in msg
+        ):
+            payload.pop("sequence_step", None)
+            payload.pop("sequence_active", None)
+            crm_sb.table(CRM_LEADS_TABLE).update(payload).eq("id", lead_id).execute()
+            return
+        raise
+
+
+def _mark_lead_contacted_after_email(
+    crm_sb,
+    lead: dict,
+    message_type: str,
+    *,
+    sequence_step_sent: int | None = None,
+):
     now = datetime.now(timezone.utc)
     is_follow_up = str(message_type or "").strip().lower() in {"follow_up", "follow-up", "followup"}
-    next_days = 7 if is_follow_up else 4
-    next_follow_up = now + timedelta(days=next_days)
     current_status = str(lead.get("status") or "").strip().lower()
-    updates = {
-        "last_contacted_at": now.isoformat(),
-        "next_follow_up_at": next_follow_up.isoformat(),
-    }
+    updates = {"last_contacted_at": now.isoformat()}
+    if sequence_step_sent is not None:
+        if int(sequence_step_sent) <= 1:
+            updates["sequence_step"] = 2
+            updates["sequence_active"] = True
+            updates["next_follow_up_at"] = (now + timedelta(days=SEQUENCE_STEP_2_DELAY_DAYS)).isoformat()
+        elif int(sequence_step_sent) == 2:
+            updates["sequence_step"] = 3
+            updates["sequence_active"] = True
+            updates["next_follow_up_at"] = (now + timedelta(days=SEQUENCE_STEP_3_DELAY_DAYS)).isoformat()
+        else:
+            updates["sequence_step"] = 4
+            updates["sequence_active"] = False
+            updates["next_follow_up_at"] = None
+    else:
+        next_days = 7 if is_follow_up else 4
+        next_follow_up = now + timedelta(days=next_days)
+        updates["next_follow_up_at"] = next_follow_up.isoformat()
     if current_status == "new":
         updates["status"] = "contacted"
         print("  lead marked contacted")
@@ -2241,8 +2314,192 @@ def _mark_lead_contacted_after_email(crm_sb, lead: dict, message_type: str):
         updates["status"] = "contacted"
     if is_follow_up:
         updates["follow_up_count"] = int(lead.get("follow_up_count") or 0) + 1
-    crm_sb.table(CRM_LEADS_TABLE).update(updates).eq("id", lead.get("id")).execute()
+    _apply_lead_updates_safe(crm_sb, str(lead.get("id") or ""), updates)
     return updates
+
+
+def _sequence_step_from_lead(lead: dict) -> int:
+    try:
+        step = int(lead.get("sequence_step") or 1)
+        return max(1, step)
+    except Exception:
+        return 1
+
+
+def _sequence_stop_status(status: str | None) -> bool:
+    s = str(status or "").strip().lower()
+    return s in {"replied", "closed_won", "do_not_contact"}
+
+
+def _sequence_template_for_step(lead: dict, step: int) -> tuple[str, str, str]:
+    business_name = str(lead.get("business_name") or "your business").strip() or "your business"
+    linked_opp_id = str(lead.get("linked_opportunity_id") or "").strip()
+    workspace_id = str(lead.get("workspace_id") or "").strip() or None
+    template = _load_outreach_template_for_opportunity(linked_opp_id, workspace_id=workspace_id) if linked_opp_id else {}
+
+    short_email = str(template.get("short_email") or "").strip()
+    longer_email = str(template.get("longer_email") or "").strip()
+    follow_up_1 = str(template.get("follow_up_1") or template.get("follow_up_note") or "").strip()
+    follow_up_2 = str(template.get("follow_up_2") or "").strip()
+
+    if step <= 1:
+        subject = "quick question about your website"
+        body = short_email or longer_email
+        message_type = "short_email"
+    elif step == 2:
+        subject = f"Quick follow-up for {business_name}"
+        body = follow_up_1 or short_email or longer_email
+        message_type = "follow_up"
+    else:
+        subject = f"Final follow-up for {business_name}"
+        body = follow_up_2 or follow_up_1 or longer_email or short_email
+        message_type = "follow_up"
+
+    if not body:
+        fallback = generate_outreach_email(
+            {
+                "business_name": business_name,
+                "category": lead.get("industry"),
+                "website": lead.get("website"),
+                "address": lead.get("address"),
+            }
+        )
+        body = str(fallback.get("body") or "").strip()
+        if not subject:
+            subject = str(fallback.get("subject") or "").strip()
+
+    return subject, body, message_type
+
+
+def _send_outreach_email_for_lead(
+    crm_sb,
+    *,
+    lead: dict,
+    owner_id: str,
+    workspace_id: str | None,
+    recipient: str,
+    subject: str,
+    content: str,
+    message_type: str,
+    case_id: str | None = None,
+    sequence_step_sent: int | None = None,
+) -> dict:
+    lead_id = str(lead.get("id") or "").strip()
+    if not lead_id:
+        return {"ok": False, "error": "lead id is missing"}
+    if not recipient:
+        return {"ok": False, "error": "recipient email is missing"}
+    if not subject:
+        return {"ok": False, "error": "email subject is required"}
+    if not content:
+        return {"ok": False, "error": "message body is empty"}
+
+    lead_status = str(lead.get("status") or "").strip().lower()
+    if lead_status == "do_not_contact":
+        return {"ok": False, "error": "lead is marked do_not_contact"}
+    if lead_status == "closed_lost":
+        return {"ok": False, "error": "lead is marked closed_lost"}
+
+    provider_message_id = None
+    provider_thread_id = None
+    thread = _upsert_email_thread(
+        crm_sb,
+        workspace_id=workspace_id or None,
+        lead_id=lead_id,
+        contact_email=recipient,
+        subject=subject,
+        provider_thread_id=None,
+        owner_id=owner_id,
+    )
+    thread_id = thread.get("id") if thread else None
+    try:
+        send_result = _send_resend_email(recipient, subject, content)
+        provider_message_id = _normalize_message_id(send_result.get("provider_message_id"))
+        provider_thread_id = send_result.get("provider_thread_id")
+        if provider_thread_id and thread_id:
+            try:
+                crm_sb.table("email_threads").update(
+                    {"provider_thread_id": provider_thread_id}
+                ).eq("id", thread_id).execute()
+            except Exception:
+                pass
+        updates = _mark_lead_contacted_after_email(
+            crm_sb,
+            lead,
+            message_type,
+            sequence_step_sent=sequence_step_sent,
+        )
+        _insert_email_message(
+            crm_sb,
+            {
+                "thread_id": thread_id,
+                "lead_id": lead_id,
+                "direction": "outbound",
+                "provider_message_id": provider_message_id,
+                "subject": subject,
+                "body": content,
+                "delivery_status": "sent",
+                "sent_at": datetime.now(timezone.utc).isoformat(),
+                "received_at": None,
+                "owner_id": owner_id,
+            },
+        )
+        _insert_email_event(
+            crm_sb,
+            {
+                "workspace_id": workspace_id or None,
+                "lead_id": lead_id,
+                "case_id": case_id,
+                "recipient_email": recipient,
+                "subject": subject,
+                "body": content,
+                "message_type": message_type,
+                "send_status": "sent",
+                "provider_message_id": provider_message_id,
+                "sent_at": datetime.now(timezone.utc).isoformat(),
+                "owner_id": owner_id,
+            },
+        )
+        return {
+            "ok": True,
+            "provider_message_id": provider_message_id,
+            "email_thread_id": thread_id,
+            "lead_id": lead_id,
+            "lead_updates": updates,
+        }
+    except Exception as e:
+        _insert_email_message(
+            crm_sb,
+            {
+                "thread_id": thread_id,
+                "lead_id": lead_id,
+                "direction": "outbound",
+                "provider_message_id": provider_message_id,
+                "subject": subject,
+                "body": content,
+                "delivery_status": "failed",
+                "sent_at": None,
+                "received_at": None,
+                "owner_id": owner_id,
+            },
+        )
+        _insert_email_event(
+            crm_sb,
+            {
+                "workspace_id": workspace_id or None,
+                "lead_id": lead_id,
+                "case_id": case_id,
+                "recipient_email": recipient,
+                "subject": subject,
+                "body": content,
+                "message_type": message_type,
+                "send_status": "failed",
+                "provider_message_id": provider_message_id,
+                "sent_at": None,
+                "owner_id": owner_id,
+            },
+        )
+        return {"ok": False, "error": str(e)}
 
 
 def _load_outreach_template_for_opportunity(
@@ -2427,6 +2684,11 @@ def generate_outreach_email(lead: dict) -> dict:
     outdated_design = bool(case_file.get("outdated_design_clues"))
     missing_meta_title = bool(case_file.get("missing_meta_title"))
     missing_meta_description = bool(case_file.get("missing_meta_description"))
+    opportunity_reason = str(
+        opportunity.get("opportunity_reason")
+        or case_file.get("opportunity_reason")
+        or ""
+    ).strip()
 
     try:
         if mobile_score is not None and float(mobile_score) < 70:
@@ -2483,6 +2745,8 @@ def generate_outreach_email(lead: dict) -> dict:
                         issue_candidates.append(text)
 
     issues: list[str] = []
+    if opportunity_reason:
+        issues.append(opportunity_reason)
     for candidate in issue_candidates:
         normalized = candidate.strip()
         if not normalized:
@@ -2498,24 +2762,18 @@ def generate_outreach_email(lead: dict) -> dict:
             "The site likely has opportunities to improve local search visibility",
         ]
 
-    issue_lines = "\n".join([f"• {issue}" for issue in issues[:3]])
-    screenshot_line = (
-        f"I grabbed a quick screenshot while reviewing the site:\n{screenshot_url}\n\n"
-        if screenshot_url
-        else ""
-    )
-    subject = "Quick idea for improving your website"
+    lead_issue = issues[0] if issues else "something that might be affecting conversions"
+    if screenshot_url:
+        screenshot_line = f"I grabbed a quick screenshot showing it:\n{screenshot_url}\n\n"
+    else:
+        screenshot_line = "I grabbed a quick screenshot showing it.\n\n"
+    subject = "quick question about your website"
     body = (
-        f"Hi {greeting_name},\n\n"
-        f"I came across {business_name} while reviewing local {category} businesses in {city}.\n\n"
-        "I noticed a couple things that might be affecting how customers interact with your site:\n\n"
-        f"{issue_lines}\n\n"
+        "Hi,\n\n"
+        f"I was looking at your website and noticed: {lead_issue}.\n\n"
         f"{screenshot_line}"
-        "I help businesses improve website performance and customer conversion.\n\n"
-        "If you'd like, I can send a quick breakdown of what I found and how it could be improved.\n\n"
-        "Best,\n"
-        "Topher\n"
-        "MixedMakerShop"
+        "Would you like me to send it over?\n\n"
+        "– Topher"
     )
     return {
         "subject": subject,
@@ -2781,12 +3039,13 @@ def _opportunity_has_contact_path(opp: dict, case: dict | None) -> bool:
 
 def _insert_crm_lead(crm_sb, row: dict) -> bool:
     try:
-        crm_sb.table(CRM_LEADS_TABLE).insert(row).execute()
-        return {"ok": True, "mode": "full", "error": None}
+        res = crm_sb.table(CRM_LEADS_TABLE).insert(row).execute()
+        data = res.data or []
+        return {"ok": True, "mode": "full", "error": None, "data": (data[0] if data else None)}
     except Exception as e:
         # Schema fallback for older CRM deployments that have fewer intake columns.
         if "column" not in str(e).lower():
-            return {"ok": False, "mode": "full", "error": str(e)}
+            return {"ok": False, "mode": "full", "error": str(e), "data": None}
         minimal = {
             "owner_id": row.get("owner_id"),
             "business_name": row.get("business_name"),
@@ -2800,10 +3059,11 @@ def _insert_crm_lead(crm_sb, row: dict) -> bool:
             "notes": row.get("notes"),
         }
         try:
-            crm_sb.table(CRM_LEADS_TABLE).insert(minimal).execute()
-            return {"ok": True, "mode": "minimal", "error": None}
+            res = crm_sb.table(CRM_LEADS_TABLE).insert(minimal).execute()
+            data = res.data or []
+            return {"ok": True, "mode": "minimal", "error": None, "data": (data[0] if data else None)}
         except Exception as retry_e:
-            return {"ok": False, "mode": "minimal", "error": str(retry_e)}
+            return {"ok": False, "mode": "minimal", "error": str(retry_e), "data": None}
 
 
 def _refresh_workspace_followups(crm_sb, workspace_id: str, owner_id: str) -> None:
@@ -2821,6 +3081,111 @@ def _refresh_workspace_followups(crm_sb, workspace_id: str, owner_id: str) -> No
             ).in_("status", ["contacted", "replied"]).lte("next_follow_up_at", now_iso).execute()
         except Exception:
             pass
+
+
+def _process_workspace_outreach_sequences(workspace_id: str, owner_id: str) -> dict:
+    stats = {
+        "checked": 0,
+        "sent": 0,
+        "failed": 0,
+        "stopped": 0,
+    }
+    crm_sb = _create_crm_client()
+    if crm_sb is None or not workspace_id or not owner_id:
+        return stats
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        due_rows = (
+            crm_sb.table(CRM_LEADS_TABLE)
+            .select(
+                "id,owner_id,workspace_id,business_name,email,status,linked_opportunity_id,"
+                "industry,address,website,sequence_step,sequence_active,next_follow_up_at"
+            )
+            .eq("owner_id", owner_id)
+            .eq("workspace_id", workspace_id)
+            .eq("sequence_active", True)
+            .lte("next_follow_up_at", now_iso)
+            .order("next_follow_up_at", desc=False)
+            .limit(200)
+            .execute()
+            .data
+            or []
+        )
+    except Exception as e:
+        print(f"  [Scout] outreach sequence scan skipped: {e}", file=sys.stderr)
+        return stats
+
+    for lead in due_rows:
+        stats["checked"] += 1
+        lead_id = str(lead.get("id") or "").strip()
+        if not lead_id:
+            continue
+        status = str(lead.get("status") or "").strip().lower()
+        if _sequence_stop_status(status):
+            _apply_lead_updates_safe(
+                crm_sb,
+                lead_id,
+                {"sequence_active": False, "next_follow_up_at": None},
+            )
+            stats["stopped"] += 1
+            continue
+        recipient = str(lead.get("email") or "").strip()
+        if not recipient:
+            _apply_lead_updates_safe(
+                crm_sb,
+                lead_id,
+                {"sequence_active": False, "next_follow_up_at": None},
+            )
+            stats["stopped"] += 1
+            print(f"  [Scout] sequence stopped (missing recipient) lead_id={lead_id}")
+            continue
+
+        step = _sequence_step_from_lead(lead)
+        if step == 1 and not AUTO_SEQUENCE_SEND_STEP1:
+            _apply_lead_updates_safe(
+                crm_sb,
+                lead_id,
+                {"next_follow_up_at": None},
+            )
+            continue
+        if step > 3:
+            _apply_lead_updates_safe(
+                crm_sb,
+                lead_id,
+                {"sequence_active": False, "next_follow_up_at": None},
+            )
+            stats["stopped"] += 1
+            continue
+
+        subject, body, message_type = _sequence_template_for_step(lead, step)
+        result = _send_outreach_email_for_lead(
+            crm_sb,
+            lead=lead,
+            owner_id=owner_id,
+            workspace_id=workspace_id,
+            recipient=recipient,
+            subject=subject,
+            content=body,
+            message_type=message_type,
+            sequence_step_sent=step,
+        )
+        if result.get("ok"):
+            stats["sent"] += 1
+            print(f"  [Scout] sequence email sent lead_id={lead_id} step={step}")
+        else:
+            stats["failed"] += 1
+            retry_at = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+            _apply_lead_updates_safe(
+                crm_sb,
+                lead_id,
+                {"next_follow_up_at": retry_at},
+            )
+            print(
+                f"  [Scout] sequence email failed lead_id={lead_id} step={step} "
+                f"error={result.get('error')}",
+                file=sys.stderr,
+            )
+    return stats
 
 
 def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bool = False) -> dict:
@@ -2843,6 +3208,9 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
         "insert_attempted": 0,
         "insert_succeeded": 0,
         "insert_failed": 0,
+        "sequence_started": 0,
+        "sequence_send_failed": 0,
+        "sequence_stopped": 0,
         "top_contacts": [],
         "insert_errors": 0,
         "insert_error_samples": [],
@@ -2933,7 +3301,7 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
             .select(
                 "id,workspace_id,business_name,category,city,lane,address,phone,website,place_id,"
                 "recommended_contact_method,backup_contact_method,opportunity_score,score,tier,lead_tier,"
-                "opportunity_signals,status"
+                "opportunity_signals,opportunity_reason,status"
             )
             .eq("workspace_id", workspace_id)
             .order("opportunity_score", desc=True)
@@ -2947,7 +3315,7 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
             .select(
                 "id,workspace_id,business_name,category,city,lane,address,phone,website,place_id,"
                 "recommended_contact_method,backup_contact_method,opportunity_score,score,tier,lead_tier,"
-                "opportunity_signals,status"
+                "opportunity_signals,opportunity_reason,status"
             )
             .eq("workspace_id", workspace_id)
             .order("score", desc=True)
@@ -3178,6 +3546,7 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
         if not issue_list:
             issue_list = case.get("strongest_problems") if isinstance(case.get("strongest_problems"), list) else []
         issues_summary = ", ".join([str(i).strip() for i in issue_list if str(i).strip()][:3]) or "Website pain signals detected"
+        opportunity_reason = str(opp.get("opportunity_reason") or "").strip()
         if not business_name:
             stats["filtered_missing_business_name"] += 1
             print(f"  [Intake] filtered: missing_business_name opp_id={opp_id or '(missing)'}")
@@ -3212,9 +3581,13 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
             "opportunity_score": score,
             "auto_intake": True,
             "status": "new",
+            "sequence_active": True,
+            "sequence_step": 1,
+            "next_follow_up_at": datetime.now(timezone.utc).isoformat() if AUTO_SEQUENCE_SEND_STEP1 else None,
             "notes": (
                 f"Auto-added from Scout-Brain (lane: {opp.get('lane') or 'unknown'}, tier: {tier}). "
-                f"Issues: {issues_summary}."
+                f"Issues: {issues_summary}. "
+                f"Reason: {opportunity_reason or issues_summary}."
             ),
         }
         stats["insert_attempted"] += 1
@@ -3249,6 +3622,54 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
                 existing_name_city.add(name_city_key)
             if opp_id:
                 existing_linked_opps.add(opp_id)
+            inserted_lead = None
+            inserted_data = insert_result.get("data") if isinstance(insert_result, dict) else None
+            inserted_id = str((inserted_data or {}).get("id") or "").strip() if isinstance(inserted_data, dict) else ""
+            if inserted_id:
+                inserted_lead = _crm_fetch_lead(crm_sb, inserted_id, owner_id)
+            if inserted_lead is None and opp_id:
+                inserted_lead = _crm_fetch_lead_by_linked_opportunity(
+                    crm_sb,
+                    owner_id=owner_id,
+                    workspace_id=workspace_id,
+                    linked_opportunity_id=opp_id,
+                )
+            if inserted_lead and AUTO_SEQUENCE_SEND_STEP1:
+                recipient = str(inserted_lead.get("email") or "").strip()
+                if recipient:
+                    subject, email_body, message_type = _sequence_template_for_step(inserted_lead, 1)
+                    seq_result = _send_outreach_email_for_lead(
+                        crm_sb,
+                        lead=inserted_lead,
+                        owner_id=owner_id,
+                        workspace_id=workspace_id,
+                        recipient=recipient,
+                        subject=subject,
+                        content=email_body,
+                        message_type=message_type,
+                        sequence_step_sent=1,
+                    )
+                    if seq_result.get("ok"):
+                        stats["sequence_started"] += 1
+                    else:
+                        stats["sequence_send_failed"] += 1
+                        print(
+                            f"  [Scout] sequence start failed opp_id={opp_id or '(missing)'} "
+                            f"lead_id={inserted_lead.get('id')} error={seq_result.get('error')}",
+                            file=sys.stderr,
+                        )
+                else:
+                    stats["sequence_stopped"] += 1
+                    _apply_lead_updates_safe(
+                        crm_sb,
+                        str(inserted_lead.get("id") or ""),
+                        {"sequence_active": False, "next_follow_up_at": None},
+                    )
+                    print(
+                        f"  [Scout] sequence stopped (missing email) "
+                        f"lead_id={inserted_lead.get('id')}",
+                        file=sys.stderr,
+                    )
             _append_decision(
                 opp_id,
                 business_name,
@@ -3285,6 +3706,8 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
         f"(evaluated={stats['evaluated']}, eligible={stats['eligible']}, created={stats['created']}, "
         f"duplicate_skipped={stats['duplicate_skipped']}, insert_attempted={stats['insert_attempted']}, "
         f"insert_succeeded={stats['insert_succeeded']}, insert_failed={stats['insert_failed']}, "
+        f"sequence_started={stats['sequence_started']}, sequence_send_failed={stats['sequence_send_failed']}, "
+        f"sequence_stopped={stats['sequence_stopped']}, "
         f"filtered_low_score={stats['filtered_low_score']}, filtered_missing_contact_path={stats['filtered_missing_contact_path']}, "
         f"filtered_closed_or_dnc={stats['filtered_closed_or_dnc']})"
     )
@@ -3322,6 +3745,7 @@ def daily_scout_job():
             data = _load_scout_data()
             _record_scout_run_supabase(owner_id, ws.get("id"), data.get("today"), data.get("opportunities"))
             _run_workspace_crm_intake(sb, ws, owner_id)
+            _process_workspace_outreach_sequences(str(ws.get("id") or ""), owner_id)
             user_rows = (
                 sb.table("profiles")
                 .select("id,email,display_name")
@@ -3334,6 +3758,7 @@ def daily_scout_job():
             if user_rows:
                 _send_workspace_briefing_if_enabled(sb, user_rows[0], ws)
 
+        print("  morning intake complete")
         print("  scheduled scout finished")
     except Exception as e:
         print(f"  [Scout] daily scout error: {e}", file=sys.stderr)
@@ -3812,6 +4237,42 @@ def post_scheduled_scout():
     }
 
 
+@app.post("/scheduled/outreach-sequences")
+def post_scheduled_outreach_sequences():
+    if not _supabase_url or not _supabase_service_key:
+        raise HTTPException(status_code=500, detail="Supabase backend is not configured")
+    try:
+        from supabase import create_client
+
+        sb = create_client(_supabase_url, _supabase_service_key)
+        workspaces = sb.table("workspaces").select("id,owner_user_id,name").execute().data or []
+        total_checked = 0
+        total_sent = 0
+        total_failed = 0
+        total_stopped = 0
+        for ws in workspaces:
+            owner_id = str(ws.get("owner_user_id") or "").strip()
+            workspace_id = str(ws.get("id") or "").strip()
+            if not owner_id or not workspace_id:
+                continue
+            stats = _process_workspace_outreach_sequences(workspace_id, owner_id)
+            total_checked += int(stats.get("checked") or 0)
+            total_sent += int(stats.get("sent") or 0)
+            total_failed += int(stats.get("failed") or 0)
+            total_stopped += int(stats.get("stopped") or 0)
+        return {
+            "ok": True,
+            "checked": total_checked,
+            "sent": total_sent,
+            "failed": total_failed,
+            "stopped": total_stopped,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"scheduled_outreach_sequences_failed: {e}")
+
+
 @app.post("/crm/intake/backfill")
 def post_crm_intake_backfill(request: Request, body: IntakeBackfillBody | None = None):
     user_id = _get_user_id_from_request(request)
@@ -4025,111 +4486,37 @@ def post_outreach_send(request: Request, body: OutreachSendBody):
             workspace_id = ""
 
     print("  sending outreach email")
-    provider_message_id = None
-    provider_thread_id = None
-    thread = _upsert_email_thread(
+    sequence_step_sent = None
+    if bool(lead.get("sequence_active")):
+        current_step = _sequence_step_from_lead(lead)
+        if 1 <= current_step <= 3:
+            sequence_step_sent = current_step
+    result = _send_outreach_email_for_lead(
         crm_sb,
-        workspace_id=workspace_id or None,
-        lead_id=body.lead_id,
-        contact_email=recipient,
-        subject=subject,
-        provider_thread_id=None,
+        lead=lead,
         owner_id=user_id,
+        workspace_id=workspace_id or None,
+        recipient=recipient,
+        subject=subject,
+        content=content,
+        message_type=message_type,
+        case_id=body.case_id,
+        sequence_step_sent=sequence_step_sent,
     )
-    thread_id = thread.get("id") if thread else None
-    try:
-        send_result = _send_resend_email(recipient, subject, content)
-        provider_message_id = _normalize_message_id(send_result.get("provider_message_id"))
-        provider_thread_id = send_result.get("provider_thread_id")
-        if provider_thread_id and thread_id:
-            try:
-                crm_sb.table("email_threads").update(
-                    {"provider_thread_id": provider_thread_id}
-                ).eq("id", thread_id).execute()
-            except Exception:
-                pass
-        updates = _mark_lead_contacted_after_email(crm_sb, lead, message_type)
+    if result.get("ok"):
         print("  outreach email sent")
-        _insert_email_message(
-            crm_sb,
-            {
-                "thread_id": thread_id,
-                "lead_id": body.lead_id,
-                "direction": "outbound",
-                "provider_message_id": provider_message_id,
-                "subject": subject,
-                "body": content,
-                "delivery_status": "sent",
-                "sent_at": datetime.now(timezone.utc).isoformat(),
-                "received_at": None,
-                "owner_id": user_id,
-            },
-        )
         print("  outbound email logged")
-        _insert_email_event(
-            crm_sb,
-            {
-                "workspace_id": workspace_id or None,
-                "lead_id": body.lead_id,
-                "case_id": body.case_id,
-                "recipient_email": recipient,
-                "subject": subject,
-                "body": content,
-                "message_type": message_type,
-                "send_status": "sent",
-                "provider_message_id": provider_message_id,
-                "sent_at": datetime.now(timezone.utc).isoformat(),
-                "owner_id": user_id,
-            },
+        return result
+    error_text = str(result.get("error") or "unknown send error")
+    print(f"  outreach email failed: {error_text}", file=sys.stderr)
+    print("  outbound email logged")
+    if "email_provider_forbidden" in error_text:
+        provider_reason = _provider_reason_from_error(Exception(error_text))
+        raise HTTPException(
+            status_code=403,
+            detail=f"Email provider rejected the send: {provider_reason}",
         )
-        return {
-            "ok": True,
-            "provider_message_id": provider_message_id,
-            "email_thread_id": thread_id,
-            "lead_id": body.lead_id,
-            "lead_updates": updates,
-        }
-    except Exception as e:
-        print(f"  outreach email failed: {e}", file=sys.stderr)
-        _insert_email_message(
-            crm_sb,
-            {
-                "thread_id": thread_id,
-                "lead_id": body.lead_id,
-                "direction": "outbound",
-                "provider_message_id": provider_message_id,
-                "subject": subject,
-                "body": content,
-                "delivery_status": "failed",
-                "sent_at": None,
-                "received_at": None,
-                "owner_id": user_id,
-            },
-        )
-        print("  outbound email logged")
-        _insert_email_event(
-            crm_sb,
-            {
-                "workspace_id": workspace_id or None,
-                "lead_id": body.lead_id,
-                "case_id": body.case_id,
-                "recipient_email": recipient,
-                "subject": subject,
-                "body": content,
-                "message_type": message_type,
-                "send_status": "failed",
-                "provider_message_id": provider_message_id,
-                "sent_at": None,
-                "owner_id": user_id,
-            },
-        )
-        if "email_provider_forbidden" in str(e):
-            provider_reason = _provider_reason_from_error(e)
-            raise HTTPException(
-                status_code=403,
-                detail=f"Email provider rejected the send: {provider_reason}",
-            )
-        raise HTTPException(status_code=500, detail=f"outreach_email_failed: {e}")
+    raise HTTPException(status_code=500, detail=f"outreach_email_failed: {error_text}")
 
 
 @app.get("/outreach/thread/{lead_id}")
@@ -4317,7 +4704,7 @@ def post_outreach_generate_email(request: Request, body: OutreachGenerateEmailBo
                 sb.table("opportunities")
                 .select(
                     "id,business_name,category,city,address,website,opportunity_score,website_status,"
-                    "website_speed,mobile_ready,seo_score,website_quality_score"
+                    "website_speed,mobile_ready,seo_score,website_quality_score,opportunity_reason"
                 )
                 .eq("id", linked_opportunity_id)
                 .eq("workspace_id", workspace_id)
@@ -4328,7 +4715,7 @@ def post_outreach_generate_email(request: Request, body: OutreachGenerateEmailBo
                 sb.table("opportunities")
                 .select(
                     "id,business_name,category,city,address,website,opportunity_score,website_status,"
-                    "website_speed,mobile_ready,seo_score,website_quality_score"
+                    "website_speed,mobile_ready,seo_score,website_quality_score,opportunity_reason"
                 )
                 .eq("id", linked_opportunity_id)
                 .limit(1)
