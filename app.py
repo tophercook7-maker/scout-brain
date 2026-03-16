@@ -743,6 +743,7 @@ def _sync_scout_to_supabase(
         "case_files_attempted": 0,
         "case_files_failed": 0,
         "case_file_errors": [],
+        "resolved_workspace_id": None,
     }
     if not _supabase_url or not _supabase_service_key:
         return stats
@@ -754,6 +755,7 @@ def _sync_scout_to_supabase(
             return stats
         sb = create_client(_supabase_url, _supabase_service_key)
         effective_workspace_id = _resolve_workspace_id_for_user(sb, user_id, requested_workspace_id=workspace_id)
+        stats["resolved_workspace_id"] = effective_workspace_id
         effective_workspace_plan = _normalize_plan(workspace_plan)
         _log_write_stage(
             "sync",
@@ -1640,6 +1642,19 @@ def _execute_scout_job(
                 workspace_id=workspace_id,
                 workspace_plan=workspace_plan,
             ) or sync_stats
+            intake_workspace_id = (
+                str(sync_stats.get("resolved_workspace_id") or "").strip()
+                or str(workspace_id or "").strip()
+            )
+            if not intake_workspace_id:
+                persistence_debug["errors"].append(
+                    {
+                        "stage": "workspace_resolution",
+                        "error": "No workspace_id resolved for CRM intake",
+                        "requested_workspace_id": workspace_id,
+                        "sync_resolved_workspace_id": sync_stats.get("resolved_workspace_id"),
+                    }
+                )
             scout_run_checkpoint_ok = _checkpoint_scout_run_supabase(
                 user_id,
                 workspace_id,
@@ -1654,11 +1669,12 @@ def _execute_scout_job(
             persistence_debug["case_files_created"] = int(sync_stats.get("inserted") or 0)
             persistence_debug["case_files_updated"] = int(sync_stats.get("updated") or 0)
             persistence_debug["duplicates_skipped"] = int(sync_stats.get("duplicate_skipped") or 0)
+            persistence_debug["workspace_id"] = intake_workspace_id or workspace_id
             _log_write_stage(
                 "opportunities",
                 "insert_succeeded",
                 {
-                    "workspace_id": workspace_id,
+                    "workspace_id": intake_workspace_id or workspace_id,
                     "attempted": int(sync_stats.get("opportunities_attempted") or 0),
                     "inserted": int(sync_stats.get("opportunities_inserted") or 0),
                     "updated": int(sync_stats.get("opportunities_updated") or 0),
@@ -1669,7 +1685,7 @@ def _execute_scout_job(
                 "case_files",
                 "insert_succeeded",
                 {
-                    "workspace_id": workspace_id,
+                    "workspace_id": intake_workspace_id or workspace_id,
                     "attempted": int(sync_stats.get("case_files_attempted") or 0),
                     "inserted": int(sync_stats.get("inserted") or 0),
                     "updated": int(sync_stats.get("updated") or 0),
@@ -1699,15 +1715,29 @@ def _execute_scout_job(
                 sb = create_client(_supabase_url, _supabase_service_key)
                 intake_stats = _run_workspace_crm_intake(
                     sb,
-                    {"id": workspace_id or ""},
+                    {"id": intake_workspace_id},
                     user_id,
                 )
                 persistence_debug["leads_created"] = int((intake_stats or {}).get("created") or 0)
+                persistence_debug["intake"] = {
+                    "workspace_id": intake_workspace_id,
+                    "opportunities_loaded": int((intake_stats or {}).get("opportunities_loaded") or 0),
+                    "evaluated": int((intake_stats or {}).get("evaluated") or 0),
+                    "eligible": int((intake_stats or {}).get("eligible") or 0),
+                    "created": int((intake_stats or {}).get("created") or 0),
+                    "duplicate_skipped": int((intake_stats or {}).get("duplicate_skipped") or 0),
+                    "insert_failed": int((intake_stats or {}).get("insert_failed") or 0),
+                    "filtered_low_score": int((intake_stats or {}).get("filtered_low_score") or 0),
+                    "filtered_missing_contact_path": int((intake_stats or {}).get("filtered_missing_contact_path") or 0),
+                    "filtered_closed_or_dnc": int((intake_stats or {}).get("filtered_closed_or_dnc") or 0),
+                    "query_error": (intake_stats or {}).get("query_error"),
+                    "intake_threshold_used": (intake_stats or {}).get("intake_threshold_used"),
+                }
                 _log_write_stage(
                     "leads_intake",
                     "insert_succeeded",
                     {
-                        "workspace_id": workspace_id,
+                        "workspace_id": intake_workspace_id or workspace_id,
                         "created": int((intake_stats or {}).get("created") or 0),
                         "eligible": int((intake_stats or {}).get("eligible") or 0),
                         "duplicates": int((intake_stats or {}).get("duplicate_skipped") or 0),
