@@ -179,6 +179,16 @@ def get_healthz():
         "service": "scout-brain",
         "scheduler_enabled": bool(ENABLE_SCHEDULED_SCOUT),
         "runtime": {
+            # Canonical keys requested by admin diagnostics.
+            "has_supabase_url": bool(snapshot.get("supabase_url_present")),
+            "has_service_role_key": bool(snapshot.get("supabase_service_key_present")),
+            "backend_supabase_host": snapshot.get("supabase_url_host"),
+            "crm_supabase_host": snapshot.get("crm_supabase_url_host"),
+            "workspace_fallback_set": bool(
+                snapshot.get("scout_workspace_id_env_set")
+                or snapshot.get("scheduled_scout_workspace_env_set")
+            ),
+            # Backward-compatible fields used by existing debug panels.
             "supabase_url_present": bool(snapshot.get("supabase_url_present")),
             "supabase_service_key_present": bool(snapshot.get("supabase_service_key_present")),
             "supabase_url_host": snapshot.get("supabase_url_host"),
