@@ -3697,36 +3697,48 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
     stats["intake_threshold_used"] = intake_min_score
     stats["contact_rule_used"] = "website_or_phone_or_email" if debug_mode else "strict_contact_path"
     opportunities = []
-    intake_queries = [
-        lambda: (
-            sb.table("opportunities")
-            .select(
-                "id,workspace_id,business_name,category,city,lane,address,phone,website,place_id,"
-                "recommended_contact_method,backup_contact_method,opportunity_score,internal_score,"
-                "opportunity_signals,opportunity_reason,status"
-            )
-            .eq("workspace_id", workspace_id)
-            .order("opportunity_score", desc=True)
-            .limit(CRM_INTAKE_MAX_CANDIDATES)
-            .execute()
-            .data
-            or []
+    intake_select_variants = [
+        (
+            "id,workspace_id,business_name,category,city,lane,address,phone,website,place_id,"
+            "recommended_contact_method,backup_contact_method,opportunity_score,internal_score,"
+            "opportunity_signals,opportunity_reason,status"
         ),
-        lambda: (
-            sb.table("opportunities")
-            .select(
-                "id,workspace_id,business_name,category,city,lane,address,phone,website,place_id,"
-                "recommended_contact_method,backup_contact_method,opportunity_score,internal_score,"
-                "opportunity_signals,opportunity_reason,status"
-            )
-            .eq("workspace_id", workspace_id)
-            .order("created_at", desc=True)
-            .limit(CRM_INTAKE_MAX_CANDIDATES)
-            .execute()
-            .data
-            or []
+        (
+            "id,workspace_id,business_name,category,city,lane,address,phone,website,place_id,"
+            "recommended_contact_method,backup_contact_method,opportunity_score,internal_score,"
+            "opportunity_reason,status"
+        ),
+        (
+            "id,workspace_id,business_name,category,city,lane,address,phone,website,place_id,"
+            "recommended_contact_method,backup_contact_method,opportunity_score,internal_score,status"
         ),
     ]
+    intake_queries = []
+    for select_clause in intake_select_variants:
+        intake_queries.append(
+            lambda select_clause=select_clause: (
+                sb.table("opportunities")
+                .select(select_clause)
+                .eq("workspace_id", workspace_id)
+                .order("opportunity_score", desc=True)
+                .limit(CRM_INTAKE_MAX_CANDIDATES)
+                .execute()
+                .data
+                or []
+            )
+        )
+        intake_queries.append(
+            lambda select_clause=select_clause: (
+                sb.table("opportunities")
+                .select(select_clause)
+                .eq("workspace_id", workspace_id)
+                .order("created_at", desc=True)
+                .limit(CRM_INTAKE_MAX_CANDIDATES)
+                .execute()
+                .data
+                or []
+            )
+        )
     query_error = None
     for q in intake_queries:
         try:
