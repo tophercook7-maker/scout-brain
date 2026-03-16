@@ -1086,6 +1086,114 @@ def _record_scout_run_supabase(
         print(f"  [Scout] scout_runs insert error: {e}", file=sys.stderr)
 
 
+_scout_run_row_by_job_id: dict[str, str] = {}
+_scout_run_optional_columns = {
+    "job_id",
+    "status",
+    "progress",
+    "started_at",
+    "completed_at",
+    "discovered_count",
+    "case_files_count",
+    "stage",
+    "message",
+}
+
+
+def _safe_write_scout_run(sb, row: dict, existing_run_id: str | None = None):
+    payload = dict(row)
+    while True:
+        try:
+            if existing_run_id:
+                return (
+                    sb.table("scout_runs")
+                    .update(payload)
+                    .eq("id", existing_run_id)
+                    .execute()
+                )
+            return _insert_with_workspace_fallback(sb, "scout_runs", payload)
+        except Exception as e:
+            msg = str(e).lower()
+            removable = [k for k in list(payload.keys()) if k in _scout_run_optional_columns and k in msg]
+            if not removable:
+                raise
+            for key in removable:
+                payload.pop(key, None)
+
+
+def _checkpoint_scout_run_supabase(
+    user_id: str,
+    workspace_id: str | None,
+    job: dict | None,
+    today: dict | None = None,
+    opportunities: list | None = None,
+    sync_stats: dict | None = None,
+) -> None:
+    if not _supabase_url or not _supabase_service_key or not user_id:
+        return
+    try:
+        from supabase import create_client
+
+        sb = create_client(_supabase_url, _supabase_service_key)
+        opps = opportunities or []
+        processed_count = int((today or {}).get("processed_count") or len(opps))
+        saved_count = int((today or {}).get("saved_count") or len(opps))
+        skipped_count = int((today or {}).get("skipped_count") or max(0, processed_count - saved_count))
+        strong_opportunities = int(
+            len(
+                [
+                    o
+                    for o in opps
+                    if float(o.get("opportunity_score") or o.get("score") or o.get("internal_score") or 0) >= 70
+                ]
+            )
+        )
+        no_website_count = int(
+            (today or {}).get("no_website")
+            or len([o for o in opps if o.get("no_website") or o.get("lane") == "no_website"])
+        )
+        weak_websites_count = int((today or {}).get("weak_websites") or max(0, len(opps) - no_website_count))
+        case_files_count = int((sync_stats or {}).get("inserted") or 0) + int((sync_stats or {}).get("updated") or 0)
+
+        job_id = str((job or {}).get("id") or "").strip()
+        summary = str((today or {}).get("summary") or (job or {}).get("result_summary") or "").strip()
+        row = {
+            "user_id": user_id,
+            "workspace_id": workspace_id,
+            "run_date": datetime.now().date().isoformat(),
+            "run_time": datetime.now(timezone.utc).isoformat(),
+            "summary": summary,
+            "processed_count": processed_count,
+            "saved_count": saved_count,
+            "skipped_count": skipped_count,
+            "businesses_discovered": int((today or {}).get("businesses_discovered") or len(opps)),
+            "analyzed_total": int((today or {}).get("processed_count") or len(opps)),
+            "high_opportunity_total": int(strong_opportunities),
+            "leads_found": int((today or {}).get("leads_found") or len(opps)),
+            "strong_opportunities": strong_opportunities,
+            "weak_websites": weak_websites_count,
+            "no_website": no_website_count,
+            "job_id": job_id or None,
+            "status": (job or {}).get("status"),
+            "progress": int((job or {}).get("progress") or 0),
+            "started_at": (job or {}).get("started_at"),
+            "completed_at": (job or {}).get("finished_at"),
+            "discovered_count": int((today or {}).get("businesses_discovered") or len(opps)),
+            "case_files_count": case_files_count,
+            "stage": (job or {}).get("stage"),
+            "message": (job or {}).get("message") or (job or {}).get("result_summary"),
+        }
+        existing_run_id = _scout_run_row_by_job_id.get(job_id) if job_id else None
+        result = _safe_write_scout_run(sb, row, existing_run_id=existing_run_id)
+        if job_id and not existing_run_id:
+            inserted = getattr(result, "data", None) or []
+            inserted_id = str((inserted[0] or {}).get("id") or "").strip() if inserted else ""
+            if inserted_id:
+                _scout_run_row_by_job_id[job_id] = inserted_id
+    except Exception as e:
+        print(f"  [Scout] scout_runs checkpoint error: {e}", file=sys.stderr)
+
+
 def _upsert_job_supabase(job: dict) -> None:
     if not _supabase_url or not _supabase_service_key:
         return
@@ -1301,6 +1409,8 @@ def _execute_scout_job(
     if job:
         print("  scout job started")
         _upsert_job_supabase(job)
+        if user_id:
+            _checkpoint_scout_run_supabase(user_id, workspace_id, job)
     try:
         if _job_is_cancelled(job_id):
             cancelled = _job_update(
@@ -1323,6 +1433,8 @@ def _execute_scout_job(
             result_summary="Discovery started",
             stage="discovering_businesses",
         )
+        if user_id:
+            _checkpoint_scout_run_supabase(user_id, workspace_id, _job_get(job_id))
         _run_morning_runner(
             current_lat=current_lat,
             current_lng=current_lng,
@@ -1351,6 +1463,8 @@ def _execute_scout_job(
             result_summary="Generating dossiers",
             stage="generating_dossiers",
         )
+        if user_id:
+            _checkpoint_scout_run_supabase(user_id, workspace_id, _job_get(job_id))
 
         data = _load_scout_data()
         today = data["today"]
@@ -1363,6 +1477,8 @@ def _execute_scout_job(
             result_summary="Saving results",
             stage="saving_results",
         )
+        if user_id:
+            _checkpoint_scout_run_supabase(user_id, workspace_id, _job_get(job_id))
 
         sync_stats = {"inserted": 0, "updated": 0, "duplicate_skipped": 0}
         if user_id and _supabase_url and _supabase_service_key:
@@ -1371,7 +1487,14 @@ def _execute_scout_job(
                 workspace_id=workspace_id,
                 workspace_plan=workspace_plan,
             ) or sync_stats
-            _record_scout_run_supabase(user_id, workspace_id, today, opportunities)
+            _checkpoint_scout_run_supabase(
+                user_id,
+                workspace_id,
+                _job_get(job_id),
+                today=today,
+                opportunities=opportunities,
+                sync_stats=sync_stats,
+            )
             try:
                 from supabase import create_client
 
@@ -1408,6 +1531,15 @@ def _execute_scout_job(
         if finished:
             print("  scout job finished")
             _upsert_job_supabase(finished)
+            if user_id:
+                _checkpoint_scout_run_supabase(
+                    user_id,
+                    workspace_id,
+                    finished,
+                    today=today,
+                    opportunities=opportunities,
+                    sync_stats=sync_stats,
+                )
     except Exception as e:
         if ScoutRunError and isinstance(e, ScoutRunError) and e.error_type == "cancelled":
             cancelled = _job_update(
@@ -1423,6 +1555,8 @@ def _execute_scout_job(
             if cancelled:
                 print("  scout job cancelled")
                 _upsert_job_supabase(cancelled)
+                if user_id:
+                    _checkpoint_scout_run_supabase(user_id, workspace_id, cancelled)
             return
         failed = _job_update(
             job_id,
@@ -1437,6 +1571,8 @@ def _execute_scout_job(
         print("  scout job failed")
         if failed:
             _upsert_job_supabase(failed)
+            if user_id:
+                _checkpoint_scout_run_supabase(user_id, workspace_id, failed)
 
 
 def _is_ignored_lead_status(status: str | None) -> bool:
@@ -3300,7 +3436,7 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
             sb.table("opportunities")
             .select(
                 "id,workspace_id,business_name,category,city,lane,address,phone,website,place_id,"
-                "recommended_contact_method,backup_contact_method,opportunity_score,"
+                "recommended_contact_method,backup_contact_method,opportunity_score,internal_score,"
                 "opportunity_signals,opportunity_reason,status"
             )
             .eq("workspace_id", workspace_id)
@@ -3314,7 +3450,7 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
             sb.table("opportunities")
             .select(
                 "id,workspace_id,business_name,category,city,lane,address,phone,website,place_id,"
-                "recommended_contact_method,backup_contact_method,opportunity_score,"
+                "recommended_contact_method,backup_contact_method,opportunity_score,internal_score,"
                 "opportunity_signals,opportunity_reason,status"
             )
             .eq("workspace_id", workspace_id)
@@ -3373,7 +3509,7 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
     for opp in opportunities:
         stats["evaluated"] += 1
         case = case_by_opp.get(str(opp.get("id"))) or {}
-        score = float(opp.get("opportunity_score") or 0)
+        score = float(opp.get("opportunity_score") or opp.get("internal_score") or 0)
         opp_id = str(opp.get("id") or "").strip()
         business_name = str(opp.get("business_name") or "").strip()
         display_name = business_name or "(missing)"
@@ -3467,7 +3603,7 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
     candidates.sort(
         key=lambda item: (
             _lane_priority(item["opp"].get("lane")),
-            -float(item["opp"].get("opportunity_score") or 0),
+            -float(item["opp"].get("opportunity_score") or item["opp"].get("internal_score") or 0),
         )
     )
 
@@ -3475,7 +3611,7 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
         opp = item["opp"]
         case = item["case"] or {}
         opp_id = str(opp.get("id") or "").strip()
-        score = float(opp.get("opportunity_score") or 0)
+        score = float(opp.get("opportunity_score") or opp.get("internal_score") or 0)
         business_name = str(opp.get("business_name") or "").strip() or "(missing)"
         stats["eligible"] += 1
 
@@ -5083,17 +5219,20 @@ def get_scout_summary(request: Request):
                 last_run_time = runs.data[0].get("run_time") or runs.data[0].get("created_at")
 
         leads_found_today = _count_new_leads_today(sb, workspace_id)
-        top_opportunities_count = len(getTopOpportunities(workspace_id))
+        top_opps = getTopOpportunities(workspace_id)
+        top_opportunities_count = len(top_opps)
         followups_due = _count_followups_due(sb, workspace_id)
         today_businesses_discovered = 0
         today_analyzed_total = 0
         today_high_opportunity_total = 0
+        today_weak_websites = 0
+        today_no_website = 0
         if workspace_id:
             today_key = datetime.now().date().isoformat()
             try:
                 day_runs = (
                     sb.table("scout_runs")
-                    .select("run_date,businesses_discovered,analyzed_total,high_opportunity_total,created_at")
+                    .select("run_date,businesses_discovered,analyzed_total,high_opportunity_total,weak_websites,no_website,created_at")
                     .eq("workspace_id", workspace_id)
                     .order("created_at", desc=True)
                     .limit(20)
@@ -5113,18 +5252,10 @@ def get_scout_summary(request: Request):
                     today_businesses_discovered += int(row.get("businesses_discovered") or 0)
                     today_analyzed_total += int(row.get("analyzed_total") or 0)
                     today_high_opportunity_total += int(row.get("high_opportunity_total") or 0)
+                    today_weak_websites += int(row.get("weak_websites") or 0)
+                    today_no_website += int(row.get("no_website") or 0)
             except Exception:
                 pass
-
-        latest_today = {}
-        latest_top = []
-        try:
-            scout_snapshot = _load_scout_data()
-            latest_today = scout_snapshot.get("today") or {}
-            latest_top = scout_snapshot.get("opportunities") or []
-        except Exception:
-            latest_today = {}
-            latest_top = []
 
         dashboard_businesses_discovered = 0
         dashboard_websites_audited = 0
@@ -5188,10 +5319,10 @@ def get_scout_summary(request: Request):
             "today_businesses_discovered": today_businesses_discovered,
             "today_analyzed_total": today_analyzed_total,
             "today_high_opportunity_total": today_high_opportunity_total,
-            "total_businesses_scanned": int(latest_today.get("total_businesses_scanned") or latest_today.get("businesses_discovered") or 0),
-            "businesses_without_websites": int(latest_today.get("businesses_without_websites") or len(latest_today.get("no_website_slugs") or [])),
-            "weak_websites_detected": int(latest_today.get("weak_websites_detected") or len(latest_today.get("weak_website_slugs") or [])),
-            "top_opportunities": latest_top[:10],
+            "total_businesses_scanned": int(today_businesses_discovered),
+            "businesses_without_websites": int(today_no_website),
+            "weak_websites_detected": int(today_weak_websites),
+            "top_opportunities": top_opps[:10],
             "dashboard_businesses_discovered": dashboard_businesses_discovered,
             "dashboard_websites_audited": dashboard_websites_audited,
             "dashboard_high_opportunities": dashboard_high_opportunities,
