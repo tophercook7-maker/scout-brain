@@ -450,6 +450,8 @@ def _get_user_id_from_request(request: Request) -> str | None:
             return user_id
         print("  [Auth] token verification failed: user id not resolved", file=sys.stderr)
         return None
+    except HTTPException:
+        raise
     except Exception as e:
         reason = type(e).__name__
         if reason == "InvalidSignatureError":
@@ -549,6 +551,31 @@ def _insert_with_workspace_fallback(sb, table_name: str, row: dict):
             legacy.pop("workspace_id", None)
             return sb.table(table_name).insert(legacy).execute()
         raise
+
+
+def _safe_error_payload(error: Exception) -> dict:
+    payload = {
+        "type": type(error).__name__,
+        "message": str(error),
+        "args": [str(a) for a in getattr(error, "args", [])],
+    }
+    for key in ("code", "details", "hint", "status_code"):
+        value = getattr(error, key, None)
+        if value is not None:
+            payload[key] = value
+    response = getattr(error, "response", None)
+    if response is not None:
+        payload["response"] = str(response)
+    return payload
+
+
+def _log_write_stage(stage: str, event: str, meta: dict | None = None) -> None:
+    details = meta or {}
+    try:
+        printable = json.dumps(details, default=str)
+    except Exception:
+        printable = str(details)
+    print(f"  [Persist:{stage}] {event} {printable}")
 
 
 def _normalize_plan(plan: str | None) -> str:
@@ -704,7 +731,19 @@ def _sync_scout_to_supabase(
     workspace_plan: str | None = None,
 ) -> dict:
     """Load scout results from local files and upsert into Supabase (opportunities + case_files)."""
-    stats = {"inserted": 0, "updated": 0, "duplicate_skipped": 0}
+    stats = {
+        "inserted": 0,
+        "updated": 0,
+        "duplicate_skipped": 0,
+        "opportunities_attempted": 0,
+        "opportunities_inserted": 0,
+        "opportunities_updated": 0,
+        "opportunities_failed": 0,
+        "opportunity_errors": [],
+        "case_files_attempted": 0,
+        "case_files_failed": 0,
+        "case_file_errors": [],
+    }
     if not _supabase_url or not _supabase_service_key:
         return stats
     try:
@@ -716,6 +755,17 @@ def _sync_scout_to_supabase(
         sb = create_client(_supabase_url, _supabase_service_key)
         effective_workspace_id = _resolve_workspace_id_for_user(sb, user_id, requested_workspace_id=workspace_id)
         effective_workspace_plan = _normalize_plan(workspace_plan)
+        _log_write_stage(
+            "sync",
+            "started",
+            {
+                "user_id": user_id,
+                "requested_workspace_id": workspace_id,
+                "resolved_workspace_id": effective_workspace_id,
+                "supabase_url": _supabase_url,
+                "opportunities_loaded": len(opportunities_ui),
+            },
+        )
         existing_by_place_id: dict[str, str] = {}
         existing_by_website: dict[str, str] = {}
         existing_by_phone: dict[str, str] = {}
@@ -754,6 +804,7 @@ def _sync_scout_to_supabase(
             name = (opp_ui.get("name") or opp_ui.get("business_name") or "").strip()
             if not name:
                 continue
+            stats["opportunities_attempted"] += 1
             opp_row = {
                 "user_id": user_id,
                 "workspace_id": effective_workspace_id,
@@ -858,11 +909,34 @@ def _sync_scout_to_supabase(
                     else:
                         ins = _insert_with_workspace_fallback(sb, "opportunities", legacy_opp)
                 else:
-                    raise
+                    stats["opportunities_failed"] += 1
+                    payload = _safe_error_payload(e)
+                    if len(stats["opportunity_errors"]) < 8:
+                        stats["opportunity_errors"].append(payload)
+                    _log_write_stage(
+                        "opportunities",
+                        "insert_failed",
+                        {"business_name": name, "workspace_id": effective_workspace_id, "error": payload},
+                    )
+                    continue
             ins_data = ins.data if hasattr(ins, "data") else ins.get("data")
             if not ins_data or len(ins_data) == 0:
+                stats["opportunities_failed"] += 1
+                _log_write_stage(
+                    "opportunities",
+                    "insert_failed",
+                    {
+                        "business_name": name,
+                        "workspace_id": effective_workspace_id,
+                        "error": {"message": "Supabase returned no inserted/updated rows"},
+                    },
+                )
                 continue
             opp_id = ins_data[0]["id"]
+            if existing_id:
+                stats["opportunities_updated"] += 1
+            else:
+                stats["opportunities_inserted"] += 1
             if place_id_key:
                 existing_by_place_id[place_id_key] = opp_id
             if website_key:
@@ -873,6 +947,7 @@ def _sync_scout_to_supabase(
                 existing_by_name_city[name_city_key] = opp_id
             case_path = CASES_DIR / f"{slug}.json"
             if case_path.exists():
+                stats["case_files_attempted"] += 1
                 with open(case_path, encoding="utf-8") as f:
                     case = json.load(f)
                 case = _apply_outreach_plan_limits(case, effective_workspace_plan)
@@ -977,7 +1052,16 @@ def _sync_scout_to_supabase(
                                 print("  scout run continuing after case file conflict")
                                 stats["duplicate_skipped"] += 1
                                 continue
-                            raise
+                            stats["case_files_failed"] += 1
+                            payload = _safe_error_payload(legacy_err)
+                            if len(stats["case_file_errors"]) < 8:
+                                stats["case_file_errors"].append(payload)
+                            _log_write_stage(
+                                "case_files",
+                                "insert_failed",
+                                {"opportunity_id": opp_id, "workspace_id": effective_workspace_id, "error": payload},
+                            )
+                            continue
                     else:
                         if (
                             "duplicate key value violates unique constraint" in msg
@@ -987,15 +1071,41 @@ def _sync_scout_to_supabase(
                             print("  scout run continuing after case file conflict")
                             stats["duplicate_skipped"] += 1
                             continue
-                        raise
+                        stats["case_files_failed"] += 1
+                        payload = _safe_error_payload(e)
+                        if len(stats["case_file_errors"]) < 8:
+                            stats["case_file_errors"].append(payload)
+                        _log_write_stage(
+                            "case_files",
+                            "insert_failed",
+                            {"opportunity_id": opp_id, "workspace_id": effective_workspace_id, "error": payload},
+                        )
+                        continue
         print(
             "  case file sync summary: "
             f"inserted {stats['inserted']} case files, "
             f"updated {stats['updated']} existing case files, "
             f"skipped {stats['duplicate_skipped']} duplicates"
         )
+        _log_write_stage(
+            "sync",
+            "finished",
+            {
+                "workspace_id": effective_workspace_id,
+                "opportunities_attempted": stats["opportunities_attempted"],
+                "opportunities_inserted": stats["opportunities_inserted"],
+                "opportunities_updated": stats["opportunities_updated"],
+                "opportunities_failed": stats["opportunities_failed"],
+                "case_files_attempted": stats["case_files_attempted"],
+                "case_files_inserted": stats["inserted"],
+                "case_files_updated": stats["updated"],
+                "case_files_duplicates": stats["duplicate_skipped"],
+                "case_files_failed": stats["case_files_failed"],
+            },
+        )
         return stats
     except Exception as e:
+        _log_write_stage("sync", "failed", {"error": _safe_error_payload(e)})
         print(f"  [Scout] Supabase sync error: {e}", file=sys.stderr)
         raise
 
@@ -1102,20 +1212,47 @@ _scout_run_optional_columns = {
 
 def _safe_write_scout_run(sb, row: dict, existing_run_id: str | None = None):
     payload = dict(row)
+    _log_write_stage(
+        "scout_runs",
+        "insert_attempted" if not existing_run_id else "update_attempted",
+        {
+            "workspace_id": payload.get("workspace_id"),
+            "job_id": payload.get("job_id"),
+            "status": payload.get("status"),
+            "progress": payload.get("progress"),
+        },
+    )
     while True:
         try:
             if existing_run_id:
-                return (
+                result = (
                     sb.table("scout_runs")
                     .update(payload)
                     .eq("id", existing_run_id)
                     .execute()
                 )
-            return _insert_with_workspace_fallback(sb, "scout_runs", payload)
+                _log_write_stage(
+                    "scout_runs",
+                    "update_succeeded",
+                    {"workspace_id": payload.get("workspace_id"), "job_id": payload.get("job_id")},
+                )
+                return result
+            result = _insert_with_workspace_fallback(sb, "scout_runs", payload)
+            _log_write_stage(
+                "scout_runs",
+                "insert_succeeded",
+                {"workspace_id": payload.get("workspace_id"), "job_id": payload.get("job_id")},
+            )
+            return result
         except Exception as e:
             msg = str(e).lower()
             removable = [k for k in list(payload.keys()) if k in _scout_run_optional_columns and k in msg]
             if not removable:
+                _log_write_stage(
+                    "scout_runs",
+                    "write_failed",
+                    {"workspace_id": payload.get("workspace_id"), "job_id": payload.get("job_id"), "error": _safe_error_payload(e)},
+                )
                 raise
             for key in removable:
                 payload.pop(key, None)
@@ -1128,9 +1265,9 @@ def _checkpoint_scout_run_supabase(
     today: dict | None = None,
     opportunities: list | None = None,
     sync_stats: dict | None = None,
-) -> None:
+) -> bool:
     if not _supabase_url or not _supabase_service_key or not user_id:
-        return
+        return False
     try:
         from supabase import create_client
 
@@ -1190,8 +1327,10 @@ def _checkpoint_scout_run_supabase(
             inserted_id = str((inserted[0] or {}).get("id") or "").strip() if inserted else ""
             if inserted_id:
                 _scout_run_row_by_job_id[job_id] = inserted_id
+        return True
     except Exception as e:
         print(f"  [Scout] scout_runs checkpoint error: {e}", file=sys.stderr)
+        return False
 
 
 def _upsert_job_supabase(job: dict) -> None:
@@ -1378,6 +1517,19 @@ def _execute_scout_job(
     current_lng: float | None,
 ) -> None:
     current_stage: str | None = None
+    persistence_debug = {
+        "scout_run_saved": False,
+        "opportunities_created": 0,
+        "opportunities_updated": 0,
+        "case_files_created": 0,
+        "case_files_updated": 0,
+        "leads_created": 0,
+        "duplicates_skipped": 0,
+        "workspace_id": workspace_id,
+        "backend_supabase_url": _supabase_url,
+        "admin_supabase_url": CRM_SUPABASE_URL,
+        "errors": [],
+    }
 
     def _runner_progress_update(payload: dict) -> None:
         nonlocal current_stage
@@ -1481,13 +1633,14 @@ def _execute_scout_job(
             _checkpoint_scout_run_supabase(user_id, workspace_id, _job_get(job_id))
 
         sync_stats = {"inserted": 0, "updated": 0, "duplicate_skipped": 0}
+        intake_stats = None
         if user_id and _supabase_url and _supabase_service_key:
             sync_stats = _sync_scout_to_supabase(
                 user_id,
                 workspace_id=workspace_id,
                 workspace_plan=workspace_plan,
             ) or sync_stats
-            _checkpoint_scout_run_supabase(
+            scout_run_checkpoint_ok = _checkpoint_scout_run_supabase(
                 user_id,
                 workspace_id,
                 _job_get(job_id),
@@ -1495,18 +1648,93 @@ def _execute_scout_job(
                 opportunities=opportunities,
                 sync_stats=sync_stats,
             )
+            persistence_debug["scout_run_saved"] = bool(scout_run_checkpoint_ok)
+            persistence_debug["opportunities_created"] = int(sync_stats.get("opportunities_inserted") or 0)
+            persistence_debug["opportunities_updated"] = int(sync_stats.get("opportunities_updated") or 0)
+            persistence_debug["case_files_created"] = int(sync_stats.get("inserted") or 0)
+            persistence_debug["case_files_updated"] = int(sync_stats.get("updated") or 0)
+            persistence_debug["duplicates_skipped"] = int(sync_stats.get("duplicate_skipped") or 0)
+            _log_write_stage(
+                "opportunities",
+                "insert_succeeded",
+                {
+                    "workspace_id": workspace_id,
+                    "attempted": int(sync_stats.get("opportunities_attempted") or 0),
+                    "inserted": int(sync_stats.get("opportunities_inserted") or 0),
+                    "updated": int(sync_stats.get("opportunities_updated") or 0),
+                    "failed": int(sync_stats.get("opportunities_failed") or 0),
+                },
+            )
+            _log_write_stage(
+                "case_files",
+                "insert_succeeded",
+                {
+                    "workspace_id": workspace_id,
+                    "attempted": int(sync_stats.get("case_files_attempted") or 0),
+                    "inserted": int(sync_stats.get("inserted") or 0),
+                    "updated": int(sync_stats.get("updated") or 0),
+                    "duplicates": int(sync_stats.get("duplicate_skipped") or 0),
+                    "failed": int(sync_stats.get("case_files_failed") or 0),
+                },
+            )
+            if sync_stats.get("opportunities_failed"):
+                persistence_debug["errors"].append(
+                    {
+                        "stage": "opportunities",
+                        "failed": int(sync_stats.get("opportunities_failed") or 0),
+                        "samples": sync_stats.get("opportunity_errors") or [],
+                    }
+                )
+            if sync_stats.get("case_files_failed"):
+                persistence_debug["errors"].append(
+                    {
+                        "stage": "case_files",
+                        "failed": int(sync_stats.get("case_files_failed") or 0),
+                        "samples": sync_stats.get("case_file_errors") or [],
+                    }
+                )
             try:
                 from supabase import create_client
 
                 sb = create_client(_supabase_url, _supabase_service_key)
-                _run_workspace_crm_intake(
+                intake_stats = _run_workspace_crm_intake(
                     sb,
                     {"id": workspace_id or ""},
                     user_id,
                 )
+                persistence_debug["leads_created"] = int((intake_stats or {}).get("created") or 0)
+                _log_write_stage(
+                    "leads_intake",
+                    "insert_succeeded",
+                    {
+                        "workspace_id": workspace_id,
+                        "created": int((intake_stats or {}).get("created") or 0),
+                        "eligible": int((intake_stats or {}).get("eligible") or 0),
+                        "duplicates": int((intake_stats or {}).get("duplicate_skipped") or 0),
+                        "failed": int((intake_stats or {}).get("insert_failed") or 0),
+                    },
+                )
                 _process_workspace_outreach_sequences(workspace_id or "", user_id)
             except Exception as intake_error:
                 print(f"  [Scout] crm intake after run failed: {intake_error}", file=sys.stderr)
+                persistence_debug["errors"].append(
+                    {"stage": "leads_intake", "error": _safe_error_payload(intake_error)}
+                )
+            current_job = _job_get(job_id) or {}
+            _job_update(
+                job_id,
+                payload={**(current_job.get("payload") or {}), "persistence_debug": persistence_debug},
+            )
+        else:
+            persistence_debug["errors"].append(
+                {
+                    "stage": "persistence",
+                    "error": "persistence skipped because user_id or Supabase backend env is missing",
+                    "user_id_present": bool(user_id),
+                    "supabase_url_present": bool(_supabase_url),
+                    "supabase_service_key_present": bool(_supabase_service_key),
+                }
+            )
 
         processed = int((today or {}).get("processed_count") or len(opportunities))
         saved = int((today or {}).get("saved_count") or len(opportunities))
@@ -1530,6 +1758,7 @@ def _execute_scout_job(
         )
         if finished:
             print("  scout job finished")
+            finished["payload"] = {**(finished.get("payload") or {}), "persistence_debug": persistence_debug}
             _upsert_job_supabase(finished)
             if user_id:
                 _checkpoint_scout_run_supabase(
@@ -1570,6 +1799,8 @@ def _execute_scout_job(
         )
         print("  scout job failed")
         if failed:
+            persistence_debug["errors"].append({"stage": "scout_job", "error": _safe_error_payload(e)})
+            failed["payload"] = {**(failed.get("payload") or {}), "persistence_debug": persistence_debug}
             _upsert_job_supabase(failed)
             if user_id:
                 _checkpoint_scout_run_supabase(user_id, workspace_id, failed)
@@ -3427,6 +3658,11 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
 
     _refresh_workspace_followups(crm_sb, workspace_id, owner_id)
     print("  evaluating opportunities for CRM intake")
+    _log_write_stage(
+        "leads_intake",
+        "attempted",
+        {"owner_id": owner_id, "workspace_id": workspace_id, "debug_mode": bool(debug_mode)},
+    )
     intake_min_score = 60.0 if debug_mode else max(float(CRM_INTAKE_MIN_SCORE), 80.0)
     stats["intake_threshold_used"] = intake_min_score
     stats["contact_rule_used"] = "website_or_phone_or_email" if debug_mode else "strict_contact_path"
@@ -3474,6 +3710,11 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
     if not opportunities and query_error is not None:
         print(f"  [Scout] crm intake query failed: {query_error}", file=sys.stderr)
         stats["query_error"] = str(query_error)
+        _log_write_stage(
+            "leads_intake",
+            "failed",
+            {"workspace_id": workspace_id, "error": _safe_error_payload(query_error)},
+        )
         return stats
 
     stats["opportunities_loaded"] = len(opportunities)
@@ -3850,6 +4091,18 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
         f"sequence_stopped={stats['sequence_stopped']}, "
         f"filtered_low_score={stats['filtered_low_score']}, filtered_missing_contact_path={stats['filtered_missing_contact_path']}, "
         f"filtered_closed_or_dnc={stats['filtered_closed_or_dnc']})"
+    )
+    _log_write_stage(
+        "leads_intake",
+        "succeeded",
+        {
+            "workspace_id": workspace_id,
+            "created": stats["created"],
+            "duplicate_skipped": stats["duplicate_skipped"],
+            "filtered_low_score": stats["filtered_low_score"],
+            "insert_failed": stats["insert_failed"],
+            "query_error": stats["query_error"],
+        },
     )
     return stats
 
@@ -4260,6 +4513,7 @@ def get_job_status(request: Request, job_id: str):
         "created_at": job.get("created_at"),
         "started_at": job.get("started_at"),
         "finished_at": job.get("finished_at"),
+        "persistence_debug": (job.get("payload") or {}).get("persistence_debug"),
     }
 
 
@@ -4335,6 +4589,7 @@ def get_active_job(request: Request):
                                 "created_at": active_for_ws.get("created_at"),
                                 "started_at": active_for_ws.get("started_at"),
                                 "finished_at": active_for_ws.get("finished_at"),
+                                "persistence_debug": (active_for_ws.get("payload") or {}).get("persistence_debug"),
                             }
                         }
         except Exception:
@@ -4356,6 +4611,7 @@ def get_active_job(request: Request):
             "created_at": active.get("created_at"),
             "started_at": active.get("started_at"),
             "finished_at": active.get("finished_at"),
+            "persistence_debug": (active.get("payload") or {}).get("persistence_debug"),
         }
     }
 
@@ -4461,9 +4717,26 @@ def post_crm_intake_backfill(request: Request, body: IntakeBackfillBody | None =
 def post_run_scout(request: Request, body: RunScoutBody | None = None):
     try:
         user_id = _get_user_id_from_request(request)
+        if not user_id:
+            _log_write_stage(
+                "run_scout",
+                "request_rejected",
+                {"reason": "user_id_not_resolved"},
+            )
+            raise HTTPException(status_code=401, detail="Unauthorized")
         requested_workspace_id = _get_workspace_id_from_request(request)
         workspace_plan = "free"
         workspace_id = requested_workspace_id
+        _log_write_stage(
+            "run_scout",
+            "request_received",
+            {
+                "resolved_user_id": user_id,
+                "requested_workspace_id": requested_workspace_id,
+                "backend_supabase_url": _supabase_url,
+                "crm_supabase_url": CRM_SUPABASE_URL,
+            },
+        )
         if user_id and _supabase_url and _supabase_service_key:
             try:
                 from supabase import create_client
@@ -4471,6 +4744,15 @@ def post_run_scout(request: Request, body: RunScoutBody | None = None):
                 ws = _get_workspace_for_user(sb, user_id, requested_workspace_id)
                 workspace_id = ws.get("id")
                 workspace_plan = _normalize_plan(ws.get("plan"))
+                _log_write_stage(
+                    "run_scout",
+                    "workspace_resolved",
+                    {
+                        "resolved_user_id": user_id,
+                        "resolved_workspace_id": workspace_id,
+                        "workspace_plan": workspace_plan,
+                    },
+                )
                 allowed, limit_msg = _check_plan_limits_for_run(workspace_plan, _get_workspace_usage(sb, workspace_id))
                 if not allowed:
                     print("  upgrade prompt shown")
@@ -4510,6 +4792,11 @@ def post_run_scout(request: Request, body: RunScoutBody | None = None):
         _job_store(job)
         _upsert_job_supabase(job)
         print("  scout job created")
+        _log_write_stage(
+            "run_scout",
+            "job_created",
+            {"job_id": job_id, "workspace_id": workspace_id, "status": "queued"},
+        )
 
         worker = threading.Thread(
             target=_execute_scout_job,
