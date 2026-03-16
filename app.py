@@ -170,6 +170,7 @@ app.add_middleware(
 def _run_morning_runner(
     current_lat: float | None = None,
     current_lng: float | None = None,
+    scan_settings: dict | None = None,
     progress_callback=None,
     cancel_callback=None,
 ):
@@ -177,6 +178,7 @@ def _run_morning_runner(
     run(
         current_lat=current_lat,
         current_lng=current_lng,
+        scan_settings=scan_settings or {},
         progress_callback=progress_callback,
         cancel_callback=cancel_callback,
     )
@@ -840,6 +842,7 @@ def _sync_scout_to_supabase(
                 "website": opp_ui.get("website"),
                 "maps_link": opp_ui.get("maps_url") or opp_ui.get("maps_link"),
                 "rating": opp_ui.get("rating"),
+                "google_rating": opp_ui.get("rating"),
                 "website_score": opp_ui.get("website_score"),
                 "website_status": opp_ui.get("website_status"),
                 "website_speed": opp_ui.get("website_speed"),
@@ -860,7 +863,12 @@ def _sync_scout_to_supabase(
                 "tier": opp_ui.get("tier") or opp_ui.get("lead_tier"),
                 "opportunity_signals": opp_ui.get("opportunity_signals") or [],
                 "opportunity_reason": _reason_to_text(opp_ui.get("opportunity_reason")) or _reason_to_text(opp_ui.get("what_stood_out")),
+                "lead_bucket": opp_ui.get("lead_bucket"),
                 "close_probability": opp_ui.get("close_probability"),
+                "lead_type": opp_ui.get("lead_type"),
+                "best_contact_method": opp_ui.get("best_contact_method"),
+                "best_pitch_angle": opp_ui.get("best_pitch_angle"),
+                "recommended_next_action": opp_ui.get("recommended_next_action"),
                 "priority": opp_ui.get("priority"),
                 "status": opp_ui.get("status") or "New",
             }
@@ -894,12 +902,18 @@ def _sync_scout_to_supabase(
                         "tier",
                         "opportunity_signals",
                         "opportunity_reason",
+                        "lead_bucket",
                         "close_probability",
+                        "lead_type",
+                        "best_contact_method",
+                        "best_pitch_angle",
+                        "recommended_next_action",
                         "place_id",
                         "city",
                         "state",
                         "industry",
                         "website_score",
+                        "google_rating",
                         "website_status",
                         "website_speed",
                         "mobile_ready",
@@ -913,12 +927,18 @@ def _sync_scout_to_supabase(
                     legacy_opp.pop("tier", None)
                     legacy_opp.pop("opportunity_signals", None)
                     legacy_opp.pop("opportunity_reason", None)
+                    legacy_opp.pop("lead_bucket", None)
                     legacy_opp.pop("close_probability", None)
+                    legacy_opp.pop("lead_type", None)
+                    legacy_opp.pop("best_contact_method", None)
+                    legacy_opp.pop("best_pitch_angle", None)
+                    legacy_opp.pop("recommended_next_action", None)
                     legacy_opp.pop("place_id", None)
                     legacy_opp.pop("city", None)
                     legacy_opp.pop("state", None)
                     legacy_opp.pop("industry", None)
                     legacy_opp.pop("website_score", None)
+                    legacy_opp.pop("google_rating", None)
                     legacy_opp.pop("website_status", None)
                     legacy_opp.pop("website_speed", None)
                     legacy_opp.pop("mobile_ready", None)
@@ -978,9 +998,12 @@ def _sync_scout_to_supabase(
                     "workspace_id": effective_workspace_id,
                     "email": case.get("email"),
                     "contact_page": case.get("contact_page"),
+                    "contact_form_url": case.get("contact_form_url"),
                     "phone_from_site": case.get("phone_from_site"),
                     "facebook": case.get("facebook"),
+                    "facebook_url": case.get("facebook_url") or case.get("facebook"),
                     "instagram": case.get("instagram"),
+                    "instagram_url": case.get("instagram_url") or case.get("instagram"),
                     "owner_manager_name": case.get("owner_manager_name"),
                     "owner_name": case.get("owner_name"),
                     "owner_title": case.get("owner_title"),
@@ -1048,6 +1071,9 @@ def _sync_scout_to_supabase(
                             "website_issues",
                             "audit_issues",
                             "high_opportunity",
+                            "contact_form_url",
+                            "facebook_url",
+                            "instagram_url",
                         ]
                     ):
                         legacy_cf = dict(cf_row)
@@ -1068,6 +1094,9 @@ def _sync_scout_to_supabase(
                         legacy_cf.pop("website_issues", None)
                         legacy_cf.pop("audit_issues", None)
                         legacy_cf.pop("high_opportunity", None)
+                        legacy_cf.pop("contact_form_url", None)
+                        legacy_cf.pop("facebook_url", None)
+                        legacy_cf.pop("instagram_url", None)
                         try:
                             action = _upsert_case_file_row(sb, legacy_cf)
                             if action == "updated":
@@ -1602,6 +1631,7 @@ def _execute_scout_job(
     workspace_plan: str,
     current_lat: float | None,
     current_lng: float | None,
+    scan_settings: dict | None = None,
 ) -> None:
     current_stage: str | None = None
     persistence_debug = {
@@ -1677,6 +1707,7 @@ def _execute_scout_job(
         _run_morning_runner(
             current_lat=current_lat,
             current_lng=current_lng,
+            scan_settings=scan_settings or {},
             progress_callback=_runner_progress_update,
             cancel_callback=lambda: _job_is_cancelled(job_id),
         )
@@ -2035,6 +2066,14 @@ def getTopOpportunities(workspace_id: str | None):
                     "category": r.get("category"),
                     "distance": r.get("distance_miles"),
                     "score": r.get("opportunity_score") if r.get("opportunity_score") is not None else r.get("internal_score"),
+                    "lead_bucket": (
+                        r.get("lead_bucket")
+                        or ("Easy Win" if float(r.get("opportunity_score") or r.get("internal_score") or 0) >= 90 else None)
+                        or ("High Value" if float(r.get("opportunity_score") or r.get("internal_score") or 0) >= 75 else None)
+                        or ("Good Prospect" if float(r.get("opportunity_score") or r.get("internal_score") or 0) >= 60 else None)
+                        or ("Needs Review" if float(r.get("opportunity_score") or r.get("internal_score") or 0) >= 40 else None)
+                        or "Low Priority"
+                    ),
                     "rating": r.get("rating"),
                     "review_count": r.get("review_count"),
                     "lead_tier": r.get("tier") or r.get("lead_tier"),
@@ -2075,6 +2114,14 @@ def getTopOpportunities(workspace_id: str | None):
                 "category": r.get("category"),
                 "distance": r.get("distance_miles"),
                 "score": r.get("opportunity_score") if r.get("opportunity_score") is not None else r.get("internal_score"),
+                "lead_bucket": (
+                    r.get("lead_bucket")
+                    or ("Easy Win" if float(r.get("opportunity_score") or r.get("internal_score") or 0) >= 90 else None)
+                    or ("High Value" if float(r.get("opportunity_score") or r.get("internal_score") or 0) >= 75 else None)
+                    or ("Good Prospect" if float(r.get("opportunity_score") or r.get("internal_score") or 0) >= 60 else None)
+                    or ("Needs Review" if float(r.get("opportunity_score") or r.get("internal_score") or 0) >= 40 else None)
+                    or "Low Priority"
+                ),
                 "rating": r.get("rating"),
                 "review_count": r.get("review_count"),
                 "lead_tier": r.get("tier") or r.get("lead_tier"),
@@ -3057,7 +3104,7 @@ def _load_outreach_template_for_opportunity(
                 sb.table("opportunities")
                 .select(
                     "id,business_name,category,lane,opportunity_score,strongest_pitch_angle,best_service_to_offer,"
-                    "demo_to_show,website_score,rating,review_count,address,website,close_probability"
+                    "demo_to_show,website_score,rating,review_count,address,website,lead_bucket,close_probability"
                 )
                 .eq("id", linked_opportunity_id)
                 .eq("workspace_id", workspace_id)
@@ -3068,7 +3115,7 @@ def _load_outreach_template_for_opportunity(
                 sb.table("opportunities")
                 .select(
                     "id,business_name,category,lane,opportunity_score,strongest_pitch_angle,best_service_to_offer,"
-                    "demo_to_show,website_score,rating,review_count,address,website,close_probability"
+                    "demo_to_show,website_score,rating,review_count,address,website,lead_bucket,close_probability"
                 )
                 .eq("id", linked_opportunity_id)
                 .limit(1)
@@ -3854,12 +3901,12 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
         (
             "id,workspace_id,business_name,category,city,lane,address,phone,website,place_id,"
             "recommended_contact_method,backup_contact_method,opportunity_score,internal_score,"
-            "opportunity_signals,opportunity_reason,close_probability,status"
+            "opportunity_signals,opportunity_reason,lead_bucket,close_probability,status"
         ),
         (
             "id,workspace_id,business_name,category,city,lane,address,phone,website,place_id,"
             "recommended_contact_method,backup_contact_method,opportunity_score,internal_score,"
-            "opportunity_reason,close_probability,status"
+            "opportunity_reason,lead_bucket,close_probability,status"
         ),
         (
             "id,workspace_id,business_name,category,city,lane,address,phone,website,place_id,"
@@ -4782,6 +4829,7 @@ def _scout_error_response(error_type: str, error_message: str, user_friendly_mes
 class RunScoutBody(BaseModel):
     current_lat: float | None = None
     current_lng: float | None = None
+    scan_settings: dict | None = None
 
 
 class UserSettingsBody(BaseModel):
@@ -4866,6 +4914,7 @@ def get_job_status(request: Request, job_id: str):
         "finished_at": job.get("finished_at"),
         "persistence_debug": (job.get("payload") or {}).get("persistence_debug"),
         "scout_summary": (job.get("payload") or {}).get("scout_summary"),
+        "scan_settings": (job.get("payload") or {}).get("scan_settings"),
     }
 
 
@@ -4943,6 +4992,7 @@ def get_active_job(request: Request):
                                 "finished_at": active_for_ws.get("finished_at"),
                                 "persistence_debug": (active_for_ws.get("payload") or {}).get("persistence_debug"),
                                 "scout_summary": (active_for_ws.get("payload") or {}).get("scout_summary"),
+                                "scan_settings": (active_for_ws.get("payload") or {}).get("scan_settings"),
                             }
                         }
         except Exception:
@@ -4966,6 +5016,7 @@ def get_active_job(request: Request):
             "finished_at": active.get("finished_at"),
             "persistence_debug": (active.get("payload") or {}).get("persistence_debug"),
             "scout_summary": (active.get("payload") or {}).get("scout_summary"),
+            "scan_settings": (active.get("payload") or {}).get("scan_settings"),
         }
     }
 
@@ -5123,10 +5174,12 @@ def post_run_scout(request: Request, body: RunScoutBody | None = None):
 
         current_lat = body.current_lat if body else None
         current_lng = body.current_lng if body else None
+        scan_settings = body.scan_settings if body and isinstance(body.scan_settings, dict) else {}
         payload = {
             "current_lat": current_lat,
             "current_lng": current_lng,
             "location_mode": "current" if current_lat is not None and current_lng is not None else "saved",
+            "scan_settings": scan_settings,
         }
         job_id = str(uuid4())
         job = {
@@ -5156,7 +5209,7 @@ def post_run_scout(request: Request, body: RunScoutBody | None = None):
 
         worker = threading.Thread(
             target=_execute_scout_job,
-            args=(job_id, user_id, workspace_id, workspace_plan, current_lat, current_lng),
+            args=(job_id, user_id, workspace_id, workspace_plan, current_lat, current_lng, scan_settings),
             daemon=True,
         )
         worker.start()
@@ -5487,7 +5540,7 @@ def post_outreach_generate_email(request: Request, body: OutreachGenerateEmailBo
                 sb.table("opportunities")
                 .select(
                     "id,business_name,category,city,address,website,opportunity_score,website_status,"
-                    "website_speed,mobile_ready,seo_score,website_quality_score,opportunity_reason,close_probability"
+                    "website_speed,mobile_ready,seo_score,website_quality_score,opportunity_reason,lead_bucket,close_probability"
                 )
                 .eq("id", linked_opportunity_id)
                 .eq("workspace_id", workspace_id)
@@ -5498,7 +5551,7 @@ def post_outreach_generate_email(request: Request, body: OutreachGenerateEmailBo
                 sb.table("opportunities")
                 .select(
                     "id,business_name,category,city,address,website,opportunity_score,website_status,"
-                    "website_speed,mobile_ready,seo_score,website_quality_score,opportunity_reason,close_probability"
+                    "website_speed,mobile_ready,seo_score,website_quality_score,opportunity_reason,lead_bucket,close_probability"
                 )
                 .eq("id", linked_opportunity_id)
                 .limit(1)

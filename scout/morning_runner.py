@@ -392,6 +392,7 @@ def _is_easy_close_category(value: str) -> bool:
 def _derive_easy_target_reasons(lead: dict, website_quality: dict | None = None) -> list[str]:
     website_quality = website_quality or {}
     website = str(lead.get("website") or "").strip()
+    facebook_url = str(lead.get("facebook") or lead.get("facebook_url") or "").strip()
     has_website = bool(website) and not bool(lead.get("no_website"))
     fetch_ok = lead.get("fetch_ok")
     ssl_ok = lead.get("ssl_ok")
@@ -403,9 +404,11 @@ def _derive_easy_target_reasons(lead: dict, website_quality: dict | None = None)
     contact_depth = _as_int(lead.get("contact_link_depth"), 1)
     website_status = str(website_quality.get("website_status") or lead.get("website_status") or "").strip().lower()
     reasons: list[str] = []
-    if not has_website:
+    if not has_website and facebook_url:
+        reasons.append("Facebook-only presence")
+    elif not has_website:
         reasons.append("No website found")
-    if has_website and (fetch_ok is False or website_status == "unreachable"):
+    if has_website and (fetch_ok is False or website_status in {"unreachable", "broken_website"}):
         reasons.append("Website unreachable")
     if has_website and (website.lower().startswith("http://") or ssl_ok is False):
         reasons.append("Website uses insecure HTTP")
@@ -561,6 +564,7 @@ def _resolve_target_cities(config: dict) -> list[dict]:
         row = dataset_by_key.get(f"{city_name.lower()}|{state.lower()}")
         selected.append(row or {"city_name": city_name, "state": state, "latitude": None, "longitude": None, "population": 0})
 
+    nearby_seed = str(config.get("nearby_city_seed") or "").strip()
     if not selected and home_city.strip().lower().startswith("hot springs"):
         for city_name in DEFAULT_MULTI_CITY_SEQUENCE:
             row = next((r for r in dataset if str(r.get("city_name") or "").strip().lower() == city_name.lower()), None)
@@ -580,7 +584,7 @@ def _resolve_target_cities(config: dict) -> list[dict]:
         ranked = sorted(dataset, key=lambda r: int(r.get("population") or 0), reverse=True)
         selected = ranked[:max_cities]
 
-    # Expand nearby cities when home city is Hot Springs (requested behavior).
+    # Expand nearby cities when home city is Hot Springs (legacy behavior).
     if home_city.strip().lower().startswith("hot springs"):
         seed = None
         for row in selected:
@@ -624,6 +628,35 @@ def _resolve_target_cities(config: dict) -> list[dict]:
                 }
             )
             seen.add(city_name.lower())
+
+    # Generic nearby-city expansion when explicitly requested by scan settings.
+    if nearby_seed:
+        seed = next((r for r in dataset if str(r.get("city_name") or "").strip().lower() == nearby_seed.lower()), None)
+        if seed:
+            seed_lat = seed.get("latitude")
+            seed_lng = seed.get("longitude")
+            seen = {str(r.get("city_name") or "").strip().lower() for r in selected}
+            candidates: list[tuple[float, dict]] = []
+            for row in dataset:
+                city_name = str(row.get("city_name") or "").strip()
+                if not city_name or city_name.lower() in seen or city_name.lower() == nearby_seed.lower():
+                    continue
+                if seed_lat is None or seed_lng is None or row.get("latitude") is None or row.get("longitude") is None:
+                    continue
+                try:
+                    distance = _haversine_miles(float(seed_lat), float(seed_lng), float(row.get("latitude")), float(row.get("longitude")))
+                except Exception:
+                    continue
+                if distance <= city_radius:
+                    candidates.append((distance, row))
+            candidates.sort(key=lambda item: item[0])
+            max_cities = max(1, int(config.get("max_cities_per_run", 8)))
+            if not any(str(r.get("city_name") or "").strip().lower() == nearby_seed.lower() for r in selected):
+                selected.insert(0, seed)
+            for _, row in candidates:
+                if len(selected) >= max_cities:
+                    break
+                selected.append(row)
 
     return selected
 
@@ -770,7 +803,8 @@ def calculateWebsiteQualityScore(lead: dict) -> dict:
         or bool(lead.get("contact_form_present"))
     )
 
-    no_website = not has_website
+    facebook_only = bool((has_website and "facebook.com" in website.lower()) or ((not has_website) and facebook_url))
+    no_website = (not has_website) and (not facebook_only)
     unreachable = has_website and (fetch_ok is False)
     very_slow = bool(load_seconds is not None and load_seconds > 3.5)
     no_mobile = viewport_ok is False
@@ -819,27 +853,31 @@ def calculateWebsiteQualityScore(lead: dict) -> dict:
 
     if no_website:
         website_quality_score += 100
-        issues.append("no website present")
+        issues.append("No website found")
         boosts.append("+100 no website")
+    if facebook_only:
+        website_quality_score += 88
+        issues.append("Facebook-only presence")
+        boosts.append("+88 facebook-only presence")
     if unreachable:
         website_quality_score += 95
-        issues.append("website unreachable")
+        issues.append("Website does not load")
         boosts.append("+95 website unreachable")
     if no_ssl:
         website_quality_score += 85
-        issues.append("broken SSL / http site")
+        issues.append("Website uses insecure HTTP")
         boosts.append("+85 missing HTTPS")
     if contact_page_missing:
         website_quality_score += 75
-        issues.append("contact page missing")
+        issues.append("Contact page is missing")
         boosts.append("+75 contact page missing")
     if no_mobile:
         website_quality_score += 75
-        issues.append("site not mobile friendly")
+        issues.append("Mobile layout is hard to use")
         boosts.append("+75 mobile layout broken")
     if very_slow:
         website_quality_score += 8
-        issues.append("page load slow")
+        issues.append("Homepage loads slowly")
         boosts.append("+8 slow load")
     if poor_seo:
         website_quality_score += 4
@@ -847,7 +885,7 @@ def calculateWebsiteQualityScore(lead: dict) -> dict:
         boosts.append("+4 poor SEO")
     if missing_contact:
         website_quality_score += 6
-        issues.append("contact information hard to find")
+        issues.append("Contact info is hard to find")
         boosts.append("+6 missing contact info")
     if missing_online_ordering:
         website_quality_score += 24
@@ -870,7 +908,7 @@ def calculateWebsiteQualityScore(lead: dict) -> dict:
         issues.append("difficult navigation")
         boosts.append("+20 broken layout")
     if outdated_cms or outdated_design:
-        issues.append("outdated visual design")
+        issues.append("Site looks outdated")
     if very_low_text:
         issues.append("text heavy homepage")
     if missing_images:
@@ -896,13 +934,21 @@ def calculateWebsiteQualityScore(lead: dict) -> dict:
 
     website_quality_score = max(0, min(100, int(round(website_quality_score))))
     if no_website:
-        website_status = "none"
+        website_status = "no_website"
+    elif facebook_only:
+        website_status = "facebook_only"
     elif unreachable:
-        website_status = "unreachable"
-    elif website_quality_score >= 20:
-        website_status = "weak"
+        website_status = "broken_website"
+    elif no_ssl:
+        website_status = "http_only"
+    elif contact_page_missing:
+        website_status = "missing_contact_page"
+    elif no_mobile:
+        website_status = "mobile_layout_issue"
+    elif outdated_cms or outdated_design:
+        website_status = "outdated_website"
     else:
-        website_status = "healthy"
+        website_status = "unclear"
 
     result = {
         "website_status": website_status,
@@ -917,6 +963,7 @@ def calculateWebsiteQualityScore(lead: dict) -> dict:
         "outdated_cms_indicators": outdated_cms or outdated_design,
         "missing_online_ordering": missing_online_ordering,
         "missing_booking_system": missing_booking,
+        "facebook_only": facebook_only,
         "outdated_wordpress_theme": outdated_wordpress_theme,
         "builder_lock_in": builder_lock_in,
         "broken_layout": broken_layout,
@@ -974,6 +1021,108 @@ def _derive_close_probability(
     return "low"
 
 
+def _score_to_lead_bucket(score: int) -> str:
+    if score >= 90:
+        return "Easy Win"
+    if score >= 75:
+        return "High Value"
+    if score >= 60:
+        return "Good Prospect"
+    if score >= 40:
+        return "Needs Review"
+    return "Low Priority"
+
+
+def _derive_lead_assessment(case: dict) -> dict:
+    website = str(case.get("website") or "").strip().lower()
+    reasons = case.get("opportunity_reason") or []
+    reason_text = " | ".join([str(v or "").strip() for v in reasons if str(v or "").strip()]).lower()
+    website_status = str(case.get("website_status") or "").strip().lower()
+    no_website = bool(case.get("no_website")) or not bool(website)
+    broken_website = website_status == "unreachable" or "unreachable" in reason_text
+    insecure_http = website.startswith("http://") or "insecure http" in reason_text or bool(case.get("ssl_ok") is False)
+    missing_contact_page = (
+        not bool(str(case.get("contact_page") or "").strip()) and not bool(case.get("contact_form_present"))
+    ) or "contact page missing" in reason_text
+    mobile_issue = bool(case.get("viewport_ok") is False) or _as_int(case.get("mobile_score"), 100) < 55 or "mobile layout" in reason_text
+    slow_site = _as_float(case.get("homepage_load_seconds"), 0.0) > 4.0 or "loads slowly" in reason_text
+    outdated = bool(case.get("outdated_design_clues"))
+    reviews_last_30 = _as_int(case.get("reviews_last_30_days"), 0)
+    review_count = _as_int(case.get("google_review_count"), _as_int(case.get("review_count"), 0))
+    active_business = (
+        reviews_last_30 > 3
+        or review_count > 50
+        or bool(case.get("owner_post_detected"))
+        or bool(case.get("new_photos_detected"))
+        or bool(case.get("listing_recently_updated"))
+    )
+    score = _as_int(case.get("opportunity_score"), 0)
+    lead_bucket = _score_to_lead_bucket(score)
+
+    is_church = "church" in str(case.get("category") or case.get("industry") or "").lower()
+    lead_type = "Needs Review"
+    if no_website or broken_website or insecure_http or missing_contact_page:
+        lead_type = "Easy Win"
+    elif is_church and (mobile_issue or slow_site or outdated):
+        lead_type = "Church Website Opportunity"
+    elif active_business and (mobile_issue or slow_site or outdated):
+        lead_type = "Active Business, Weak Website"
+    elif score < 50:
+        lead_type = "Low Priority"
+
+    close_probability = str(case.get("close_probability") or "medium").lower()
+    if lead_type == "Easy Win":
+        close_probability = "high"
+    elif lead_type == "Low Priority":
+        close_probability = "low"
+    elif close_probability not in {"low", "medium", "high"}:
+        close_probability = "medium"
+
+    if no_website:
+        best_pitch = "Looks like you may not currently have a website."
+    elif broken_website:
+        best_pitch = "I noticed your site may not be loading correctly."
+    elif insecure_http:
+        best_pitch = "Your website appears to use insecure HTTP instead of HTTPS."
+    elif missing_contact_page:
+        best_pitch = "Your contact page appears to be missing, which can cost leads."
+    elif mobile_issue:
+        best_pitch = "Your mobile layout could make it harder for customers to contact you."
+    elif slow_site:
+        best_pitch = "Homepage loads slowly, which can reduce calls and form submissions."
+    else:
+        best_pitch = "Your business has strong reviews but the website may be holding you back."
+
+    if str(case.get("email") or "").strip():
+        best_contact_method = "email"
+    elif str(case.get("contact_page") or case.get("contact_form_url") or "").strip():
+        best_contact_method = "contact_page"
+    elif str(case.get("phone_from_site") or case.get("phone") or "").strip():
+        best_contact_method = "phone"
+    elif str(case.get("facebook_url") or case.get("facebook") or "").strip():
+        best_contact_method = "facebook"
+    else:
+        best_contact_method = "phone"
+
+    if lead_type == "Low Priority":
+        recommended_next_action = "Skip For Now"
+    elif not bool(str(case.get("email") or case.get("phone_from_site") or case.get("phone") or case.get("contact_page") or "").strip()):
+        recommended_next_action = "Review Site Manually"
+    elif str(case.get("status") or "new").strip().lower() in {"new", "new_lead"}:
+        recommended_next_action = "Send First Touch"
+    else:
+        recommended_next_action = "Generate Email"
+
+    return {
+        "lead_bucket": lead_bucket,
+        "lead_type": lead_type,
+        "close_probability": close_probability,
+        "best_contact_method": best_contact_method,
+        "best_pitch_angle": best_pitch,
+        "recommended_next_action": recommended_next_action,
+    }
+
+
 def calculateOpportunityScore(lead: dict) -> tuple[int, list[str], str, dict, list[str], str]:
     """
     Opportunity score engine (0-100).
@@ -1002,36 +1151,36 @@ def calculateOpportunityScore(lead: dict) -> tuple[int, list[str], str, dict, li
     phone_or_email_detected = bool(str(lead.get("phone") or "").strip() or str(lead.get("email") or "").strip())
     normalized_category = _normalize_industry(lead.get("category") or lead.get("industry") or "")
 
-    website_quality_subscore = max(
-        0,
-        min(
-            100,
-            int(
-                round(
-                    (website_issue_score * 0.7)
-                    + (max(0, 100 - website_grade) * 0.2)
-                    + (max(0, 100 - mobile_performance) * 0.1)
-                )
-            ),
-        ),
-    )
+    website_status = str(website_quality.get("website_status") or lead.get("website_status") or "").strip().lower()
+    business_activity_score = 0
+    if review_count >= 100:
+        business_activity_score = 40
+    elif review_count >= 50:
+        business_activity_score = 30
+    elif review_count >= 20:
+        business_activity_score = 20
+    elif review_count >= 10:
+        business_activity_score = 10
 
-    review_activity_subscore = 0
-    if review_count >= 80:
-        review_activity_subscore += 50
-    elif review_count >= 40:
-        review_activity_subscore += 35
-    elif review_count >= 15:
-        review_activity_subscore += 20
-    if rating >= 4.6:
-        review_activity_subscore += 35
-    elif rating >= 4.3:
-        review_activity_subscore += 25
-    elif rating >= 4.0:
-        review_activity_subscore += 10
-    if recent_review_detected:
-        review_activity_subscore += 15
-    review_activity_subscore = max(0, min(100, review_activity_subscore))
+    website_problem_score = 0
+    if website_status == "no_website":
+        website_problem_score = 40
+    elif website_status == "broken_website":
+        website_problem_score = 35
+    elif website_status == "facebook_only":
+        website_problem_score = 30
+    elif website_status == "http_only":
+        website_problem_score = 25
+    elif website_status == "missing_contact_page":
+        website_problem_score = 20
+    elif website_status == "mobile_layout_issue":
+        website_problem_score = 15
+    elif website_status == "outdated_website":
+        website_problem_score = 15
+    elif bool(homepage_load_seconds := lead.get("homepage_load_seconds")) and _as_float(homepage_load_seconds, 0.0) > 4:
+        website_problem_score = 10
+    elif website_issue_score >= 30:
+        website_problem_score = 10
 
     activity_score = 0
     activity_summary: list[str] = []
@@ -1052,36 +1201,17 @@ def calculateOpportunityScore(lead: dict) -> tuple[int, list[str], str, dict, li
         activity_summary.append("Listing recently updated")
     activity_score = max(0, min(100, activity_score))
 
-    review_activity_final = max(
-        0,
-        min(100, int(round((review_activity_subscore * 0.7) + (activity_score * 0.3)))),
-    )
+    contact_info_score = 0
+    if bool(str(lead.get("email") or "").strip()):
+        contact_info_score = 20
+    elif contact_page_present:
+        contact_info_score = 15
+    elif bool(str(lead.get("phone") or "").strip() or str(lead.get("phone_from_site") or "").strip()):
+        contact_info_score = 10
+    elif bool(str(lead.get("facebook") or lead.get("facebook_url") or "").strip()):
+        contact_info_score = 5
 
-    industry_subscore = 100 if normalized_category in PRIORITY_INDUSTRY_CATEGORIES else 35
-    if _industry_is_high_close_probability(normalized_category):
-        industry_subscore = max(industry_subscore, 80)
-
-    contact_info_subscore = 0
-    if phone_or_email_detected:
-        contact_info_subscore += 70
-    if contact_page_present:
-        contact_info_subscore += 30
-    contact_info_subscore = max(0, min(100, contact_info_subscore))
-
-    weighted_total = (
-        (website_quality_subscore * website_issues_weight)
-        + (review_activity_final * review_activity_weight)
-        + (industry_subscore * industry_weight)
-        + (contact_info_subscore * contact_info_weight)
-    ) / 100.0
-
-    total = max(0, min(100, int(round(weighted_total))))
-    if reviews_last_30_days > 3:
-        total = min(100, total + 10)
-        base_signals.append("+10 reviews_last_30_days > 3")
-    if review_count > 50:
-        total = min(100, total + 5)
-        base_signals.append("+5 google_review_count > 50")
+    total = max(0, min(100, int(round(business_activity_score + website_problem_score + contact_info_score))))
 
     if website_exists:
         base_signals.append("+website exists")
@@ -1095,6 +1225,9 @@ def calculateOpportunityScore(lead: dict) -> tuple[int, list[str], str, dict, li
         base_signals.append("+phone or email detected")
     if recent_review_detected:
         base_signals.append("+recent review detected")
+    base_signals.append(f"+business activity score {business_activity_score}")
+    base_signals.append(f"+website problem score {website_problem_score}")
+    base_signals.append(f"+contact availability score {contact_info_score}")
 
     score_signals = list(base_signals) + list(website_quality.get("website_boost_signals") or [])
     if total >= 80:
@@ -1135,8 +1268,8 @@ def calculateOpportunityScore(lead: dict) -> tuple[int, list[str], str, dict, li
     print(
         "opportunity score updated: "
         f"base={base_score}, website_issue_score={website_issue_score}, total={total}, "
-        f"review_activity={review_activity_final}, activity_score={activity_score}, industry={industry_subscore}, "
-        f"contact_info={contact_info_subscore}, tier={tier}, close_probability={close_probability}"
+        f"business_activity={business_activity_score}, website_problem={website_problem_score}, "
+        f"contact_availability={contact_info_score}, activity_score={activity_score}, tier={tier}, close_probability={close_probability}"
     )
     return total, score_signals, tier, website_quality, opportunity_reason, close_probability
 
@@ -1284,15 +1417,24 @@ def _build_no_website_case(place: dict, home_city: str, categories: list, index:
 
     case["email"] = None
     case["contact_page"] = None
+    case["contact_form_url"] = None
     case["phone_from_site"] = None
     case["facebook"] = None
+    case["facebook_url"] = None
     case["instagram"] = None
+    case["instagram_url"] = None
     case["linkedin"] = None
     case["social_links"] = {}
     case["emails"] = []
     case["phones"] = [place["phone"]] if place.get("phone") else []
 
-    if case["phone"]:
+    if case["email"]:
+        case["recommended_contact_method"] = "Email"
+        case["backup_contact_method"] = "Contact page"
+    elif case["contact_page"] or case["contact_form_url"]:
+        case["recommended_contact_method"] = "Contact page"
+        case["backup_contact_method"] = "Phone" if case["phone"] else None
+    elif case["phone"]:
         case["recommended_contact_method"] = "Phone"
         case["backup_contact_method"] = "Maps / visit"
     else:
@@ -1342,6 +1484,13 @@ def _build_no_website_case(place: dict, home_city: str, categories: list, index:
     case["opportunity_reason"] = opportunity_reason
     case["activity_summary"] = website_quality.get("activity_summary") or case.get("activity_summary") or []
     case["close_probability"] = close_probability
+    lead_assessment = _derive_lead_assessment(case)
+    case["lead_bucket"] = lead_assessment.get("lead_bucket")
+    case["lead_type"] = lead_assessment.get("lead_type")
+    case["close_probability"] = lead_assessment.get("close_probability")
+    case["best_contact_method"] = lead_assessment.get("best_contact_method")
+    case["best_pitch_angle"] = lead_assessment.get("best_pitch_angle")
+    case["recommended_next_action"] = lead_assessment.get("recommended_next_action")
     case["contact_matrix"] = {
         "best_contact": "phone" if case["phone"] else "visit",
         "best_contact_method": "phone" if case["phone"] else "visit",
@@ -1475,6 +1624,13 @@ def _build_weak_website_case(
             case["opportunity_reason"] = opportunity_reason
             case["activity_summary"] = website_quality.get("activity_summary") or case.get("activity_summary") or []
             case["close_probability"] = close_probability
+            lead_assessment = _derive_lead_assessment(case)
+            case["lead_bucket"] = lead_assessment.get("lead_bucket")
+            case["lead_type"] = lead_assessment.get("lead_type")
+            case["close_probability"] = lead_assessment.get("close_probability")
+            case["best_contact_method"] = lead_assessment.get("best_contact_method")
+            case["best_pitch_angle"] = lead_assessment.get("best_pitch_angle")
+            case["recommended_next_action"] = lead_assessment.get("recommended_next_action")
             base_signals = generateOpportunitySignals(case)
             merged_signals = list(dict.fromkeys(base_signals + score_signals))
             case["opportunity_signals"] = merged_signals[:8]
@@ -1515,6 +1671,13 @@ def _build_weak_website_case(
             case["opportunity_reason"] = opportunity_reason
             case["activity_summary"] = website_quality.get("activity_summary") or case.get("activity_summary") or []
             case["close_probability"] = close_probability
+            lead_assessment = _derive_lead_assessment(case)
+            case["lead_bucket"] = lead_assessment.get("lead_bucket")
+            case["lead_type"] = lead_assessment.get("lead_type")
+            case["close_probability"] = lead_assessment.get("close_probability")
+            case["best_contact_method"] = lead_assessment.get("best_contact_method")
+            case["best_pitch_angle"] = lead_assessment.get("best_pitch_angle")
+            case["recommended_next_action"] = lead_assessment.get("recommended_next_action")
             base_signals = generateOpportunitySignals(case)
             merged_signals = list(dict.fromkeys(base_signals + score_signals))
             case["opportunity_signals"] = merged_signals[:8]
@@ -1536,6 +1699,7 @@ def _build_weak_website_case(
             crawl_internal=deep_scan,
             timeout=screenshot_timeout if deep_scan else website_fetch_timeout,
             screenshot_dir=str(screenshot_dir) if screenshot_dir else None,
+            google_profile_url=str(place.get("maps_url") or place.get("maps_link") or "").strip() or None,
         )
     except Exception as e:
         log.append(f"  INVESTIGATION FAILED: {e}")
@@ -1606,9 +1770,12 @@ def _build_weak_website_case(
         social = inv.get("social") or {}
         case["email"] = emails[0] if emails else None
         case["contact_page"] = inv.get("contact_page")
+        case["contact_form_url"] = inv.get("contact_form_url")
         case["phone_from_site"] = (inv.get("phones") or [None])[0]
         case["facebook"] = social.get("facebook")
+        case["facebook_url"] = social.get("facebook")
         case["instagram"] = social.get("instagram")
+        case["instagram_url"] = social.get("instagram")
         case["linkedin"] = social.get("linkedin")
         case["social_links"] = social
         case["owner_manager_name"] = case.get("owner_name") or (case.get("owner_names") or [None])[0]
@@ -1645,15 +1812,21 @@ def _build_weak_website_case(
 
     if case["email"]:
         case["recommended_contact_method"] = "Email"
+    elif case["contact_page"] or case.get("contact_form_url"):
+        case["recommended_contact_method"] = "Contact page"
     elif case["phone"] or case["phone_from_site"]:
         case["recommended_contact_method"] = "Phone"
-    elif case["contact_page"]:
-        case["recommended_contact_method"] = "Contact form"
     elif case["facebook"] or case["instagram"]:
         case["recommended_contact_method"] = "Social DM"
     else:
         case["recommended_contact_method"] = "Website or phone"
-    case["backup_contact_method"] = "Phone" if case["email"] else "Email" if (case["phone"] or case["phone_from_site"]) else None
+    case["backup_contact_method"] = (
+        "Contact page" if case["email"] and (case["contact_page"] or case.get("contact_form_url"))
+        else "Phone" if case["email"] and (case["phone"] or case["phone_from_site"])
+        else "Phone" if (case["contact_page"] or case.get("contact_form_url")) and (case["phone"] or case["phone_from_site"])
+        else "Email" if (case["phone"] or case["phone_from_site"]) and case["email"]
+        else None
+    )
 
     # Outreach is generated on demand (case open / explicit regenerate), not during main scout run.
     case["short_email"] = None
@@ -1684,6 +1857,13 @@ def _build_weak_website_case(
     case["opportunity_reason"] = opportunity_reason
     case["activity_summary"] = website_quality.get("activity_summary") or case.get("activity_summary") or []
     case["close_probability"] = close_probability
+    lead_assessment = _derive_lead_assessment(case)
+    case["lead_bucket"] = lead_assessment.get("lead_bucket")
+    case["lead_type"] = lead_assessment.get("lead_type")
+    case["close_probability"] = lead_assessment.get("close_probability")
+    case["best_contact_method"] = lead_assessment.get("best_contact_method")
+    case["best_pitch_angle"] = lead_assessment.get("best_pitch_angle")
+    case["recommended_next_action"] = lead_assessment.get("recommended_next_action")
     base_signals = generateOpportunitySignals(case)
     merged_signals = list(dict.fromkeys(base_signals + score_signals))
     # Early exit for obviously modern, fast sites during lightweight scans.
@@ -1739,9 +1919,55 @@ def _deep_priority_rank(case: dict) -> tuple[int, float]:
     return (5, -float(case.get("opportunity_score") or 0))
 
 
+def _scan_depth_limit(depth: str | None, default_limit: int) -> int:
+    normalized = str(depth or "").strip().lower()
+    mapping = {
+        "quick": 25,
+        "normal": 100,
+        "deep": 300,
+    }
+    if normalized in mapping:
+        return int(mapping[normalized])
+    return int(default_limit)
+
+
+def _matches_issue_filters(case: dict, selected_filters: list[str]) -> bool:
+    if not selected_filters:
+        return True
+    filters = {str(v or "").strip().lower() for v in selected_filters if str(v or "").strip()}
+    website = str(case.get("website") or "").strip().lower()
+    facebook_url = str(case.get("facebook") or case.get("facebook_url") or "").strip().lower()
+    facebook_only = bool((website and "facebook.com" in website) or (not website and facebook_url))
+    no_website = bool(case.get("no_website")) or not bool(website)
+    unreachable = str(case.get("website_status") or "").strip().lower() == "unreachable" or bool(case.get("fetch_ok") is False)
+    insecure_http = website.startswith("http://") or bool(case.get("ssl_ok") is False)
+    contact_missing = not bool(str(case.get("contact_page") or "").strip()) and not bool(case.get("contact_form_present"))
+    mobile_broken = bool(case.get("viewport_ok") is False) or _as_int(case.get("mobile_score"), 100) < 50
+    easy_win = no_website or unreachable or insecure_http or contact_missing or mobile_broken
+    missing_online_ordering = bool((case.get("website_audit") or {}).get("checks", {}).get("booking_or_ordering_missing"))
+    weak_menu_contact_flow = contact_missing or bool(case.get("menu_found") is False) or bool(case.get("tap_to_call_present") is False)
+    redesign_opportunity = mobile_broken or bool(case.get("outdated_design_clues")) or _as_int(case.get("website_score"), 100) < 65
+    checks = {
+        "no website": no_website,
+        "facebook only": facebook_only,
+        "broken website": unreachable,
+        "insecure http": insecure_http,
+        "missing contact page": contact_missing,
+        "mobile layout issues": mobile_broken,
+        "mobile issues": mobile_broken,
+        "outdated website": bool(case.get("outdated_design_clues")) or _as_int(case.get("design_score"), 100) < 60,
+        "missing online ordering": missing_online_ordering,
+        "weak menu/contact flow": weak_menu_contact_flow,
+        "redesign opportunities": redesign_opportunity,
+        "easy wins only": easy_win,
+    }
+    return any(checks.get(f, False) for f in filters)
+
+
 def run(
     current_lat: float | None = None,
     current_lng: float | None = None,
+    scan_settings: dict | None = None,
     progress_callback=None,
     cancel_callback=None,
 ):
@@ -1785,6 +2011,46 @@ def run(
         pass
 
     config = load_config()
+    settings = scan_settings if isinstance(scan_settings, dict) else {}
+    scan_scope = str(settings.get("scope") or "").strip().lower()
+    selected_city = str(settings.get("single_city") or "").strip()
+    selected_region = str(settings.get("region") or "").strip().lower()
+    selected_categories = [
+        str(v or "").strip()
+        for v in (settings.get("categories") or [])
+        if str(v or "").strip()
+    ]
+    selected_issue_filters = [
+        str(v or "").strip().lower()
+        for v in (settings.get("issue_filters") or [])
+        if str(v or "").strip()
+    ]
+    selected_depth = str(settings.get("depth") or "").strip().lower()
+    if selected_categories:
+        config["categories"] = selected_categories
+    if scan_scope == "single_city" and selected_city:
+        config["multi_city_enabled"] = True
+        config["max_cities_per_run"] = 1
+        config["target_cities"] = [{"city_name": selected_city, "state": "AR"}]
+    elif scan_scope == "nearby_cities" and selected_city:
+        config["multi_city_enabled"] = True
+        config["max_cities_per_run"] = max(8, int(config.get("max_cities_per_run", 8)))
+        config["target_cities"] = [{"city_name": selected_city, "state": "AR"}]
+        config["home_city"] = selected_city
+        config["nearby_city_seed"] = selected_city
+    elif scan_scope == "arkansas_region" and selected_region:
+        region_key = selected_region.replace(" ", "_").lower()
+        if region_key in ARKANSAS_REGION_CITIES:
+            config["multi_city_enabled"] = True
+            config["target_cities"] = [{"city_name": city, "state": "AR"} for city in ARKANSAS_REGION_CITIES[region_key]]
+            config["max_cities_per_run"] = max(
+                len(ARKANSAS_REGION_CITIES[region_key]),
+                int(config.get("max_cities_per_run", len(ARKANSAS_REGION_CITIES[region_key]))),
+            )
+    elif scan_scope == "all_arkansas":
+        config["multi_city_enabled"] = True
+        config["target_cities"] = [{"city_name": city, "state": "AR"} for city in ARKANSAS_CITIES_STATEWIDE]
+        config["max_cities_per_run"] = max(len(ARKANSAS_CITIES_STATEWIDE), int(config.get("max_cities_per_run", 40)))
     home_city = config.get("home_city", "City")
     target_cities = _resolve_target_cities(config)
     radius = config.get("search_radius_miles", 25)
@@ -1800,6 +2066,7 @@ def run(
     )
     max_total_results = max(200, max_total_results)
     max_total_results = min(max_total_results, int(config.get("max_businesses_per_run", 600) or 600))
+    max_total_results = _scan_depth_limit(selected_depth, max_total_results)
     max_results_per_city = max(100, int(config.get("max_results_per_city", 250)))
     max_per = int(config.get("max_results_per_query", config.get("max_results_per_category", 60)))
     max_per = max(1, min(60, max_per))
@@ -1875,6 +2142,12 @@ def run(
     print(f"  city_expansion_threshold: {city_expansion_threshold}")
     print(f"  categories: {categories}, max_results_per_query: {max_per}, ignore_chains: {ignore_chains}")
     print(f"  discovery_max_per_run: {max_total_results}")
+    if settings:
+        print(
+            "  scan settings applied: "
+            f"scope={scan_scope or 'default'}, city={selected_city or 'n/a'}, region={selected_region or 'n/a'}, "
+            f"categories={len(selected_categories)}, issue_filters={len(selected_issue_filters)}, depth={selected_depth or 'default'}"
+        )
     print(f"  deep_scan_max_per_run: {deep_scan_max_per_run}")
     print(f"  max_concurrency: {max_concurrency}")
     print(f"  screenshot_max_per_run: {screenshot_max_per_run}")
@@ -2323,10 +2596,41 @@ def run(
                 high_score_opportunities += 1
         except Exception:
             continue
+    filtered_case_slugs = []
+    filtered_no_website_slugs = []
+    filtered_weak_website_slugs = []
+    for slug in case_slugs:
+        p = CASES_DIR / f"{slug}.json"
+        if not p.exists():
+            continue
+        try:
+            with open(p, encoding="utf-8") as f:
+                c = json.load(f)
+        except Exception:
+            continue
+        if _matches_issue_filters(c, selected_issue_filters):
+            filtered_case_slugs.append(slug)
+            if slug in no_website_slugs:
+                filtered_no_website_slugs.append(slug)
+            if slug in weak_website_slugs:
+                filtered_weak_website_slugs.append(slug)
+    case_slugs = filtered_case_slugs
+    no_website_slugs = filtered_no_website_slugs
+    weak_website_slugs = filtered_weak_website_slugs
+
     summary = f"Found {len(no_website_slugs)} no-website + {len(weak_website_slugs)} weak-website opportunities near {location_summary}."
     today = {
         "generated_at": generated_at,
         "summary": summary,
+        "scan_setup": {
+            "scope": scan_scope or "default",
+            "single_city": selected_city or None,
+            "region": selected_region or None,
+            "categories": categories,
+            "issue_filters": selected_issue_filters,
+            "depth": selected_depth or None,
+            "max_businesses_per_run": max_total_results,
+        },
         "case_slugs": case_slugs,
         "no_website_slugs": no_website_slugs,
         "weak_website_slugs": weak_website_slugs,

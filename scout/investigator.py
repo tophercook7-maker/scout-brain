@@ -65,6 +65,19 @@ def _extract_emails(html: str) -> list[str]:
     return out[:10]
 
 
+def _extract_footer_mailto_links(html: str) -> list[str]:
+    footer_emails: list[str] = []
+    seen: set[str] = set()
+    for m in re.finditer(r"<footer[^>]*>(.*?)</footer>", html or "", flags=re.I | re.S):
+        footer_html = m.group(1) or ""
+        for em in _extract_emails(footer_html):
+            val = str(em or "").strip().lower()
+            if val and val not in seen:
+                seen.add(val)
+                footer_emails.append(val)
+    return footer_emails[:5]
+
+
 def _extract_phones(html: str) -> list[str]:
     seen = set()
     out = []
@@ -114,6 +127,25 @@ def _extract_reservation_order_links(html: str, base: str) -> dict[str, str]:
         if not found.get("order") and any(x in path for x in ["order", "shop", "buy", "cart", "checkout"]):
             found["order"] = full
     return found
+
+
+def _extract_contact_form_url(html: str, base: str) -> str | None:
+    for m in re.finditer(r"<form\b[^>]*\baction=[\"']([^\"']+)[\"'][^>]*>", html or "", re.I):
+        action = (m.group(1) or "").strip()
+        if not action:
+            continue
+        if action.startswith("javascript:") or action.startswith("#"):
+            continue
+        return urljoin(base, action)
+    for m in re.finditer(r'href=["\']([^"\']+)["\']', html or "", re.I):
+        href = (m.group(1) or "").strip()
+        if not href or href.startswith("#") or href.startswith("javascript:"):
+            continue
+        full = urljoin(base, href)
+        lower = full.lower()
+        if any(k in lower for k in ["/contact", "contact-us", "get-in-touch", "/support"]):
+            return full
+    return None
 
 
 def _normalize_title(raw: str) -> str:
@@ -249,10 +281,12 @@ def _analyze_page(html: str, url: str) -> dict[str, Any]:
     lower = html.lower()
     return {
         "emails": _extract_emails(html),
+        "footer_emails": _extract_footer_mailto_links(html),
         "phones": _extract_phones(html),
         "social": _extract_social(html),
         "internal_links": _extract_internal_links(html, url),
         "reservation_order": _extract_reservation_order_links(html, url),
+        "contact_form_url": _extract_contact_form_url(html, url),
         "owner_names": _extract_owner_names(html),
         "owner_candidates": _extract_owner_candidates(html),
         "nav_items": _extract_nav_items(html),
@@ -265,6 +299,20 @@ def _analyze_page(html: str, url: str) -> dict[str, Any]:
         "directions_visibility": any(w in lower for w in ["map", "directions", "location", "find us"]),
         "title": None,
         "meta_description": None,
+    }
+
+
+def _fetch_profile_contact_hints(profile_url: str, timeout: int = 8) -> dict[str, Any]:
+    html, status, _ = _fetch(profile_url, timeout=timeout)
+    if not html or status == 0:
+        return {"emails": [], "phones": [], "social": {}, "contact_form_url": None}
+    page = _analyze_page(html, profile_url)
+    emails = list(dict.fromkeys((page.get("emails") or []) + (page.get("footer_emails") or [])))
+    return {
+        "emails": emails[:10],
+        "phones": page.get("phones") or [],
+        "social": page.get("social") or {},
+        "contact_form_url": page.get("contact_form_url"),
     }
 
 
@@ -713,6 +761,7 @@ def investigate(
     crawl_internal: bool = True,
     timeout: int = 12,
     screenshot_dir: str | None = None,
+    google_profile_url: str | None = None,
 ) -> dict[str, Any]:
     """
     Deep-investigate a website: homepage + internal pages.
@@ -805,6 +854,7 @@ def investigate(
     reservation_link: str | None = None
     order_link: str | None = None
     contact_page_url: str | None = None
+    contact_form_url: str | None = None
     discovered_pages: list[str] = []
     platform = None
     viewport_ok = False
@@ -835,6 +885,8 @@ def investigate(
 
     for e in home_result["emails"]:
         all_emails.add(e)
+    for e in home_result.get("footer_emails") or []:
+        all_emails.add(e)
     for p in home_result["phones"]:
         all_phones.add(p)
     all_social.update(home_result["social"])
@@ -855,6 +907,7 @@ def investigate(
         order_link = home_result["reservation_order"]["order"]
     if "contact" in all_internal:
         contact_page_url = all_internal["contact"]
+    contact_form_url = home_result.get("contact_form_url") or None
     homepage_contact_link_present = bool(
         re.search(r'href=["\'][^"\']*(contact|contact-us|contactus|get-in-touch)[^"\']*["\']', home_html, flags=re.I)
     )
@@ -873,6 +926,8 @@ def investigate(
                 pr = _analyze_page(html, candidate)
                 for e in pr["emails"]:
                     all_emails.add(e)
+                for e in pr.get("footer_emails") or []:
+                    all_emails.add(e)
                 for p in pr["phones"]:
                     all_phones.add(p)
                 all_social.update(pr["social"])
@@ -889,6 +944,8 @@ def investigate(
                     )
                 if not contact_page_url and path.startswith("/contact"):
                     contact_page_url = candidate
+                if not contact_form_url and pr.get("contact_form_url"):
+                    contact_form_url = pr.get("contact_form_url")
                 if not reservation_link and pr["reservation_order"].get("reservations"):
                     reservation_link = pr["reservation_order"]["reservations"]
                 if not order_link and pr["reservation_order"].get("order"):
@@ -901,6 +958,40 @@ def investigate(
                 menu_vis = menu_vis or pr["menu_visibility"]
                 hours_vis = hours_vis or pr["hours_visibility"]
                 directions_vis = directions_vis or pr["directions_visibility"]
+
+    # Google Business profile link scan (best effort) for additional contact hints.
+    if google_profile_url:
+        try:
+            debug_log.append("google profile scan started")
+            gp = _fetch_profile_contact_hints(google_profile_url, timeout=min(timeout, 8))
+            for e in gp.get("emails") or []:
+                all_emails.add(str(e))
+            for p in gp.get("phones") or []:
+                all_phones.add(str(p))
+            for key, value in (gp.get("social") or {}).items():
+                if key not in all_social and value:
+                    all_social[key] = value
+            if not contact_form_url and gp.get("contact_form_url"):
+                contact_form_url = str(gp.get("contact_form_url"))
+            debug_log.append("google profile scan completed")
+        except Exception as e:
+            debug_log.append(f"google profile scan failed: {e}")
+
+    # Facebook page scan (best effort) for public contact details.
+    facebook_url = str(all_social.get("facebook") or "").strip()
+    if facebook_url:
+        try:
+            debug_log.append("facebook page scan started")
+            fb = _fetch_profile_contact_hints(facebook_url, timeout=min(timeout, 8))
+            for e in fb.get("emails") or []:
+                all_emails.add(str(e))
+            for p in fb.get("phones") or []:
+                all_phones.add(str(p))
+            if not contact_form_url and fb.get("contact_form_url"):
+                contact_form_url = str(fb.get("contact_form_url"))
+            debug_log.append("facebook page scan completed")
+        except Exception as e:
+            debug_log.append(f"facebook page scan failed: {e}")
 
     debug_log.append(f"contact_page: {'found' if contact_page_url else 'not found'}")
     debug_log.append(f"emails: {'found (' + str(len(all_emails)) + ')' if all_emails else 'not found'}")
@@ -1001,8 +1092,8 @@ def investigate(
     )
     issues_for_pitch = list(dict.fromkeys((audit.get("audit_issues") or []) + problems))
 
-    best_contact = "email" if all_emails else "phone" if all_phones else "contact_form" if contact_form else "social" if all_social else "unknown"
-    backup_contact = "phone" if all_emails and all_phones else "email" if all_phones and not all_emails else "contact_form" if all_social else None
+    best_contact = "email" if all_emails else "contact_page" if (contact_page_url or contact_form_url) else "phone" if all_phones else "social" if all_social else "unknown"
+    backup_contact = "contact_page" if all_emails and (contact_page_url or contact_form_url) else "phone" if all_emails and all_phones else "phone" if (contact_page_url or contact_form_url) and all_phones else None
 
     contact_matrix = {
         "best_contact": best_contact,
@@ -1012,6 +1103,7 @@ def investigate(
         "email": (list(all_emails)[:1] or [None])[0],
         "phone": (list(all_phones)[:1] or [None])[0],
         "contact_page": contact_page_url,
+        "contact_form_url": contact_form_url,
         "facebook": all_social.get("facebook"),
         "instagram": all_social.get("instagram"),
         "linkedin": all_social.get("linkedin"),
@@ -1042,6 +1134,7 @@ def investigate(
         "phones": list(all_phones)[:5],
         "social": all_social,
         "contact_page": contact_page_url,
+        "contact_form_url": contact_form_url,
         "internal_links_found": all_internal,
         "important_internal_links": all_internal,
         "discovered_pages": discovered_pages[:15],
