@@ -109,10 +109,12 @@ def _env_flag(name: str, default: bool = False) -> bool:
 # Enable only when intentionally serving frontend from this process.
 SERVE_FRONTEND = _env_flag("SERVE_FRONTEND", default=False)
 ENABLE_SCHEDULED_SCOUT = _env_flag("ENABLE_SCHEDULED_SCOUT", default=True)
-SCHEDULED_SCOUT_HOUR = int(os.environ.get("SCHEDULED_SCOUT_HOUR", "7"))
+SCHEDULED_SCOUT_HOUR = int(os.environ.get("SCHEDULED_SCOUT_HOUR", "2"))
 SCHEDULED_SCOUT_TIMEZONE = (os.environ.get("SCHEDULED_SCOUT_TIMEZONE", "local") or "local").strip()
+SCHEDULED_SCOUT_JOB_NAME = (os.environ.get("SCHEDULED_SCOUT_JOB_NAME", "nightly_scout_run") or "nightly_scout_run").strip()
 SCHEDULED_SCOUT_SCOPE = (os.environ.get("SCHEDULED_SCOUT_SCOPE", "internal") or "internal").strip().lower()
 SCHEDULED_SCOUT_WORKSPACE_NAME = (os.environ.get("SCHEDULED_SCOUT_WORKSPACE_NAME", "MixedMakerShop") or "MixedMakerShop").strip()
+SCHEDULED_SCOUT_REGIONS = ["northwest", "central", "river_valley", "delta", "south", "ouachita"]
 CRM_AUTO_INTAKE_ENABLED = _env_flag("CRM_AUTO_INTAKE_ENABLED", default=True)
 CRM_INTAKE_MIN_SCORE = float(os.environ.get("CRM_INTAKE_MIN_SCORE", "80"))
 CRM_INTAKE_MAX_CANDIDATES = int(os.environ.get("CRM_INTAKE_MAX_CANDIDATES", "250"))
@@ -178,6 +180,12 @@ def _run_morning_runner(
         progress_callback=progress_callback,
         cancel_callback=cancel_callback,
     )
+
+
+def _nightly_region_for_today() -> str:
+    day_of_year = max(1, int(datetime.now().timetuple().tm_yday))
+    index = (day_of_year - 1) % len(SCHEDULED_SCOUT_REGIONS)
+    return SCHEDULED_SCOUT_REGIONS[index]
 
 
 def _load_scout_data():
@@ -801,6 +809,15 @@ def _sync_scout_to_supabase(
                         existing_by_name_city[name_city_key] = row_id
         except Exception:
             pass
+        def _reason_to_text(value) -> str | None:
+            if isinstance(value, list):
+                normalized = [str(v).strip() for v in value if str(v).strip()]
+                if not normalized:
+                    return None
+                return " | ".join(normalized[:4])
+            text = str(value or "").strip()
+            return text or None
+
         for opp_ui in opportunities_ui:
             slug = opp_ui.get("slug") or opp_ui.get("id")
             name = (opp_ui.get("name") or opp_ui.get("business_name") or "").strip()
@@ -842,7 +859,8 @@ def _sync_scout_to_supabase(
                 "lead_tier": opp_ui.get("lead_tier"),
                 "tier": opp_ui.get("tier") or opp_ui.get("lead_tier"),
                 "opportunity_signals": opp_ui.get("opportunity_signals") or [],
-                "opportunity_reason": opp_ui.get("opportunity_reason") or opp_ui.get("what_stood_out"),
+                "opportunity_reason": _reason_to_text(opp_ui.get("opportunity_reason")) or _reason_to_text(opp_ui.get("what_stood_out")),
+                "close_probability": opp_ui.get("close_probability"),
                 "priority": opp_ui.get("priority"),
                 "status": opp_ui.get("status") or "New",
             }
@@ -876,6 +894,7 @@ def _sync_scout_to_supabase(
                         "tier",
                         "opportunity_signals",
                         "opportunity_reason",
+                        "close_probability",
                         "place_id",
                         "city",
                         "state",
@@ -894,6 +913,7 @@ def _sync_scout_to_supabase(
                     legacy_opp.pop("tier", None)
                     legacy_opp.pop("opportunity_signals", None)
                     legacy_opp.pop("opportunity_reason", None)
+                    legacy_opp.pop("close_probability", None)
                     legacy_opp.pop("place_id", None)
                     legacy_opp.pop("city", None)
                     legacy_opp.pop("state", None)
@@ -979,6 +999,9 @@ def _sync_scout_to_supabase(
                     "design_score": case.get("design_score"),
                     "navigation_score": case.get("navigation_score"),
                     "conversion_score": case.get("conversion_score"),
+                    "activity_summary": case.get("activity_summary") or [],
+                    "website_audit": case.get("website_audit") or {},
+                    "website_issues": case.get("website_issues") or [],
                     "audit_issues": case.get("audit_issues") or [],
                     "high_opportunity": bool(case.get("high_opportunity")),
                     "strongest_problems": case.get("strongest_problems"),
@@ -988,6 +1011,7 @@ def _sync_scout_to_supabase(
                     "follow_up_note": case.get("follow_up_note"),
                     "desktop_screenshot_url": case.get("desktop_screenshot_url"),
                     "mobile_screenshot_url": case.get("mobile_screenshot_url"),
+                    "contact_page_screenshot_url": case.get("contact_page_screenshot_url"),
                     "internal_screenshot_url": case.get("internal_screenshot_url"),
                     "outreach_notes": case.get("outreach_notes"),
                     "follow_up_due": case.get("follow_up_due"),
@@ -1009,6 +1033,7 @@ def _sync_scout_to_supabase(
                         for k in [
                             "desktop_screenshot_url",
                             "mobile_screenshot_url",
+                            "contact_page_screenshot_url",
                             "internal_screenshot_url",
                             "owner_name",
                             "owner_title",
@@ -1018,6 +1043,9 @@ def _sync_scout_to_supabase(
                             "design_score",
                             "navigation_score",
                             "conversion_score",
+                            "activity_summary",
+                            "website_audit",
+                            "website_issues",
                             "audit_issues",
                             "high_opportunity",
                         ]
@@ -1025,6 +1053,7 @@ def _sync_scout_to_supabase(
                         legacy_cf = dict(cf_row)
                         legacy_cf.pop("desktop_screenshot_url", None)
                         legacy_cf.pop("mobile_screenshot_url", None)
+                        legacy_cf.pop("contact_page_screenshot_url", None)
                         legacy_cf.pop("internal_screenshot_url", None)
                         legacy_cf.pop("owner_name", None)
                         legacy_cf.pop("owner_title", None)
@@ -1034,6 +1063,9 @@ def _sync_scout_to_supabase(
                         legacy_cf.pop("design_score", None)
                         legacy_cf.pop("navigation_score", None)
                         legacy_cf.pop("conversion_score", None)
+                        legacy_cf.pop("activity_summary", None)
+                        legacy_cf.pop("website_audit", None)
+                        legacy_cf.pop("website_issues", None)
                         legacy_cf.pop("audit_issues", None)
                         legacy_cf.pop("high_opportunity", None)
                         try:
@@ -1117,6 +1149,7 @@ def _record_scout_run_supabase(
     workspace_id: str | None,
     today: dict | None,
     opportunities: list | None,
+    nightly_report: dict | None = None,
 ) -> None:
     if not _supabase_url or not _supabase_service_key:
         return
@@ -1143,10 +1176,17 @@ def _record_scout_run_supabase(
         analyzed_total = int((today or {}).get("processed_count") or len(opps))
         high_opportunity_total = int(strong_opportunities)
         leads_found = int((today or {}).get("leads_found") or len(opps))
+        cities_scanned = int((nightly_report or {}).get("cities_scanned") or (today or {}).get("cities_scanned") or 0)
+        industries_scanned = int((nightly_report or {}).get("industries_scanned") or (today or {}).get("industries_scanned") or 0)
+        businesses_found = int((nightly_report or {}).get("businesses_found") or (today or {}).get("businesses_found") or businesses_discovered)
+        opportunities_scored = int((nightly_report or {}).get("opportunities_scored") or len(opps))
+        leads_created = int((nightly_report or {}).get("leads_created") or 0)
+        email_drafts_generated = int((nightly_report or {}).get("email_drafts_generated") or 0)
         run_date = datetime.now().date().isoformat()
         row = {
             "user_id": user_id,
             "workspace_id": workspace_id,
+            "job_name": SCHEDULED_SCOUT_JOB_NAME,
             "run_date": run_date,
             "run_time": datetime.now(timezone.utc).isoformat(),
             "summary": summary,
@@ -1160,6 +1200,20 @@ def _record_scout_run_supabase(
             "strong_opportunities": strong_opportunities,
             "weak_websites": weak_websites_count,
             "no_website": no_website_count,
+            "cities_scanned": cities_scanned,
+            "industries_scanned": industries_scanned,
+            "businesses_found": businesses_found,
+            "opportunities_scored": opportunities_scored,
+            "leads_created": leads_created,
+            "email_drafts_generated": email_drafts_generated,
+            "nightly_report": {
+                "cities_scanned": cities_scanned,
+                "industries_scanned": industries_scanned,
+                "businesses_found": businesses_found,
+                "opportunities_scored": opportunities_scored,
+                "leads_created": leads_created,
+                "email_drafts_generated": email_drafts_generated,
+            },
         }
         try:
             _insert_with_workspace_fallback(sb, "scout_runs", row)
@@ -1177,6 +1231,14 @@ def _record_scout_run_supabase(
                     "strong_opportunities",
                     "weak_websites",
                     "no_website",
+                    "job_name",
+                    "cities_scanned",
+                    "industries_scanned",
+                    "businesses_found",
+                    "opportunities_scored",
+                    "leads_created",
+                    "email_drafts_generated",
+                    "nightly_report",
                 ]
             ):
                 legacy = dict(row)
@@ -1189,6 +1251,14 @@ def _record_scout_run_supabase(
                 legacy.pop("strong_opportunities", None)
                 legacy.pop("weak_websites", None)
                 legacy.pop("no_website", None)
+                legacy.pop("job_name", None)
+                legacy.pop("cities_scanned", None)
+                legacy.pop("industries_scanned", None)
+                legacy.pop("businesses_found", None)
+                legacy.pop("opportunities_scored", None)
+                legacy.pop("leads_created", None)
+                legacy.pop("email_drafts_generated", None)
+                legacy.pop("nightly_report", None)
                 _insert_with_workspace_fallback(sb, "scout_runs", legacy)
             else:
                 raise
@@ -1201,6 +1271,7 @@ def _record_scout_run_supabase(
 _scout_run_row_by_job_id: dict[str, str] = {}
 _scout_run_optional_columns = {
     "job_id",
+    "job_name",
     "status",
     "progress",
     "started_at",
@@ -1209,6 +1280,13 @@ _scout_run_optional_columns = {
     "case_files_count",
     "stage",
     "message",
+    "cities_scanned",
+    "industries_scanned",
+    "businesses_found",
+    "opportunities_scored",
+    "leads_created",
+    "email_drafts_generated",
+    "nightly_report",
 }
 
 
@@ -1299,6 +1377,7 @@ def _checkpoint_scout_run_supabase(
         row = {
             "user_id": user_id,
             "workspace_id": workspace_id,
+            "job_name": "manual_scout_run",
             "run_date": datetime.now().date().isoformat(),
             "run_time": datetime.now(timezone.utc).isoformat(),
             "summary": summary,
@@ -1321,6 +1400,12 @@ def _checkpoint_scout_run_supabase(
             "case_files_count": case_files_count,
             "stage": (job or {}).get("stage"),
             "message": (job or {}).get("message") or (job or {}).get("result_summary"),
+            "cities_scanned": int((today or {}).get("cities_scanned") or 0),
+            "industries_scanned": int((today or {}).get("industries_scanned") or 0),
+            "businesses_found": int((today or {}).get("businesses_found") or len(opps)),
+            "opportunities_scored": len(opps),
+            "leads_created": 0,
+            "email_drafts_generated": 0,
         }
         existing_run_id = _scout_run_row_by_job_id.get(job_id) if job_id else None
         result = _safe_write_scout_run(sb, row, existing_run_id=existing_run_id)
@@ -1769,9 +1854,19 @@ def _execute_scout_job(
         processed = int((today or {}).get("processed_count") or len(opportunities))
         saved = int((today or {}).get("saved_count") or len(opportunities))
         skipped = int((today or {}).get("skipped_count") or max(0, processed - saved))
+        scout_summary = {
+            "cities_scanned": int((today or {}).get("cities_scanned") or 0),
+            "industries_scanned": int((today or {}).get("industries_scanned") or 0),
+            "businesses_found": int((today or {}).get("businesses_found") or len(opportunities)),
+            "high_score_opportunities": int((today or {}).get("high_score_opportunities") or 0),
+            "leads_created": int((intake_stats or {}).get("created") or 0),
+        }
         summary = (
             f"Scout complete — {len(opportunities)} leads discovered. "
             f"Processed {processed}, saved {saved}, skipped {skipped}. "
+            f"Cities {scout_summary['cities_scanned']}, industries {scout_summary['industries_scanned']}, "
+            f"high score opportunities {scout_summary['high_score_opportunities']}, "
+            f"CRM leads created {scout_summary['leads_created']}. "
             f"Case files: inserted {int(sync_stats.get('inserted') or 0)}, "
             f"updated {int(sync_stats.get('updated') or 0)}, "
             f"skipped duplicates {int(sync_stats.get('duplicate_skipped') or 0)}."
@@ -1788,7 +1883,11 @@ def _execute_scout_job(
         )
         if finished:
             print("  scout job finished")
-            finished["payload"] = {**(finished.get("payload") or {}), "persistence_debug": persistence_debug}
+            finished["payload"] = {
+                **(finished.get("payload") or {}),
+                "persistence_debug": persistence_debug,
+                "scout_summary": scout_summary,
+            }
             _upsert_job_supabase(finished)
             if user_id:
                 _checkpoint_scout_run_supabase(
@@ -1944,6 +2043,7 @@ def getTopOpportunities(workspace_id: str | None):
                     "best_contact_method": r.get("recommended_contact_method") or r.get("backup_contact_method"),
                     "opportunity_signals": r.get("opportunity_signals") or [],
                     "opportunity_reason": r.get("opportunity_reason"),
+                    "close_probability": r.get("close_probability"),
                     "slug": r.get("id"),
                 }
                 for r in ranked
@@ -1988,6 +2088,7 @@ def getTopOpportunities(workspace_id: str | None):
                 "website_quality_score": r.get("website_quality_score"),
                 "opportunity_signals": r.get("opportunity_signals") or [],
                 "opportunity_reason": r.get("opportunity_reason"),
+                "close_probability": r.get("close_probability"),
                 "slug": r.get("id"),
             }
             for r in ranked
@@ -2919,7 +3020,8 @@ def _load_outreach_template_for_opportunity(
                 .select(
                     "opportunity_id,short_email,longer_email,contact_form_version,social_dm_version,follow_up_note,"
                     "owner_name,owner_manager_name,website_score,audit_issues,strongest_problems,best_service_to_offer,"
-                    "best_demo_to_show,demo_to_show,demo_url,website_status,rating,review_count"
+                    "best_demo_to_show,demo_to_show,demo_url,website_status,rating,review_count,website_audit,"
+                    "desktop_screenshot_url,mobile_screenshot_url,contact_page_screenshot_url,internal_screenshot_url,screenshot_url"
                 )
                 .eq("opportunity_id", linked_opportunity_id)
                 .eq("workspace_id", workspace_id)
@@ -2931,7 +3033,8 @@ def _load_outreach_template_for_opportunity(
                 .select(
                     "opportunity_id,short_email,longer_email,contact_form_version,social_dm_version,follow_up_note,"
                     "owner_name,owner_manager_name,website_score,audit_issues,strongest_problems,best_service_to_offer,"
-                    "best_demo_to_show,demo_to_show,demo_url,website_status,rating,review_count"
+                    "best_demo_to_show,demo_to_show,demo_url,website_status,rating,review_count,website_audit,"
+                    "desktop_screenshot_url,mobile_screenshot_url,contact_page_screenshot_url,internal_screenshot_url,screenshot_url"
                 )
                 .eq("opportunity_id", linked_opportunity_id)
                 .limit(1)
@@ -2954,7 +3057,7 @@ def _load_outreach_template_for_opportunity(
                 sb.table("opportunities")
                 .select(
                     "id,business_name,category,lane,opportunity_score,strongest_pitch_angle,best_service_to_offer,"
-                    "demo_to_show,website_score,rating,review_count,address,website"
+                    "demo_to_show,website_score,rating,review_count,address,website,close_probability"
                 )
                 .eq("id", linked_opportunity_id)
                 .eq("workspace_id", workspace_id)
@@ -2965,7 +3068,7 @@ def _load_outreach_template_for_opportunity(
                 sb.table("opportunities")
                 .select(
                     "id,business_name,category,lane,opportunity_score,strongest_pitch_angle,best_service_to_offer,"
-                    "demo_to_show,website_score,rating,review_count,address,website"
+                    "demo_to_show,website_score,rating,review_count,address,website,close_probability"
                 )
                 .eq("id", linked_opportunity_id)
                 .limit(1)
@@ -3008,6 +3111,7 @@ def _load_outreach_template_for_opportunity(
                 "category": (opp_row or {}).get("category"),
                 "lane": (opp_row or {}).get("lane"),
                 "score": (opp_row or {}).get("opportunity_score"),
+                "close_probability": (opp_row or {}).get("close_probability"),
                 "website_score": (case_row or {}).get("website_score") or (opp_row or {}).get("website_score"),
                 "audit_issues": (case_row or {}).get("audit_issues"),
                 "review_rating": (case_row or {}).get("rating") or (opp_row or {}).get("rating"),
@@ -3064,12 +3168,55 @@ def generate_outreach_email(lead: dict) -> dict:
     screenshot_url = (
         case_file.get("desktop_screenshot_url")
         or case_file.get("mobile_screenshot_url")
+        or case_file.get("contact_page_screenshot_url")
         or case_file.get("internal_screenshot_url")
         or case_file.get("screenshot_url")
     )
     screenshot_url = str(screenshot_url).strip() if screenshot_url else None
+    screenshot_count = int(
+        sum(
+            1
+            for val in [
+                case_file.get("desktop_screenshot_url"),
+                case_file.get("mobile_screenshot_url"),
+                case_file.get("contact_page_screenshot_url"),
+            ]
+            if str(val or "").strip()
+        )
+    )
 
     issue_candidates: list[str] = []
+
+    def normalize_issue_label(issue: str) -> str:
+        raw = str(issue or "").strip()
+        if not raw:
+            return ""
+        lower = raw.lower()
+        if "mobile" in lower and ("not optimized" in lower or "layout" in lower):
+            return "site not mobile friendly"
+        if "slow" in lower or "load" in lower:
+            return "page load slow"
+        if "call-to-action" in lower or "cta" in lower:
+            return "missing CTA above the fold"
+        if "text-heavy" in lower or "text heavy" in lower or "low text" in lower:
+            return "text heavy homepage"
+        if "booking" in lower or "ordering" in lower:
+            return "no booking or ordering system"
+        if "seo" in lower or "meta" in lower:
+            return "missing SEO title/description"
+        if "outdated" in lower and "wordpress" not in lower:
+            return "outdated visual design"
+        if "navigation" in lower or "menu" in lower:
+            return "difficult navigation"
+        if "contact" in lower and ("missing" in lower or "hard" in lower):
+            return "contact information hard to find"
+        if "ssl" in lower or "https" in lower or "http site" in lower:
+            return "broken SSL / http site"
+        if "image" in lower:
+            return "images not optimized"
+        if "website has visible quality issues" in lower or "web presence can be improved" in lower:
+            return ""
+        return raw
     mobile_score = case_file.get("mobile_score")
     seo_score = case_file.get("seo_score")
     performance_score = case_file.get("performance_score")
@@ -3143,9 +3290,11 @@ def generate_outreach_email(lead: dict) -> dict:
 
     issues: list[str] = []
     if opportunity_reason:
-        issues.append(opportunity_reason)
+        normalized_reason = normalize_issue_label(opportunity_reason)
+        if normalized_reason:
+            issues.append(normalized_reason)
     for candidate in issue_candidates:
-        normalized = candidate.strip()
+        normalized = normalize_issue_label(candidate)
         if not normalized:
             continue
         if normalized not in issues:
@@ -3160,7 +3309,11 @@ def generate_outreach_email(lead: dict) -> dict:
         ]
 
     lead_issue = issues[0] if issues else "something that might be affecting conversions"
-    if screenshot_url:
+    if screenshot_url and screenshot_count >= 2:
+        screenshot_line = (
+            f"I captured fresh website screenshots (desktop/mobile/contact where available):\n{screenshot_url}\n\n"
+        )
+    elif screenshot_url:
         screenshot_line = f"I grabbed a quick screenshot showing it:\n{screenshot_url}\n\n"
     else:
         screenshot_line = "I grabbed a quick screenshot showing it.\n\n"
@@ -3701,12 +3854,12 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
         (
             "id,workspace_id,business_name,category,city,lane,address,phone,website,place_id,"
             "recommended_contact_method,backup_contact_method,opportunity_score,internal_score,"
-            "opportunity_signals,opportunity_reason,status"
+            "opportunity_signals,opportunity_reason,close_probability,status"
         ),
         (
             "id,workspace_id,business_name,category,city,lane,address,phone,website,place_id,"
             "recommended_contact_method,backup_contact_method,opportunity_score,internal_score,"
-            "opportunity_reason,status"
+            "opportunity_reason,close_probability,status"
         ),
         (
             "id,workspace_id,business_name,category,city,lane,address,phone,website,place_id,"
@@ -3968,7 +4121,7 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
         issue_list = opp.get("opportunity_signals") if isinstance(opp.get("opportunity_signals"), list) else []
         if not issue_list:
             issue_list = case.get("strongest_problems") if isinstance(case.get("strongest_problems"), list) else []
-        issues_summary = ", ".join([str(i).strip() for i in issue_list if str(i).strip()][:3]) or "Website pain signals detected"
+        issues_summary = ", ".join([str(i).strip() for i in issue_list if str(i).strip()][:3]) or "No specific website issue captured yet"
         opportunity_reason = str(opp.get("opportunity_reason") or "").strip()
         if not business_name:
             stats["filtered_missing_business_name"] += 1
@@ -4008,7 +4161,7 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
             "sequence_step": 1,
             "next_follow_up_at": datetime.now(timezone.utc).isoformat() if AUTO_SEQUENCE_SEND_STEP1 else None,
             "notes": (
-                f"Auto-added from Scout-Brain (lane: {opp.get('lane') or 'unknown'}, tier: {tier}). "
+                f"Auto-added from Scout-Brain (lane: {opp.get('lane') or 'unknown'}, tier: {tier}, close_probability: {opp.get('close_probability') or 'medium'}). "
                 f"Issues: {issues_summary}. "
                 f"Reason: {opportunity_reason or issues_summary}."
             ),
@@ -4149,20 +4302,149 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
     return stats
 
 
+def _generate_outreach_drafts_for_workspace(
+    sb,
+    workspace_id: str,
+    owner_id: str,
+    *,
+    min_score: float = 80.0,
+    max_candidates: int = 120,
+) -> int:
+    draft_count = 0
+    if not workspace_id or not owner_id:
+        return draft_count
+    try:
+        leads_rows = (
+            sb.table(CRM_LEADS_TABLE)
+            .select("id,workspace_id,linked_opportunity_id,email,contact_name,opportunity_score,status")
+            .eq("owner_id", owner_id)
+            .eq("workspace_id", workspace_id)
+            .gte("opportunity_score", min_score)
+            .in_("status", ["new", "contacted", "follow_up_due"])
+            .order("opportunity_score", desc=True)
+            .limit(max_candidates)
+            .execute()
+            .data
+            or []
+        )
+    except Exception as e:
+        print(f"  [Scout] nightly draft query failed: {e}", file=sys.stderr)
+        return draft_count
+
+    for lead in leads_rows:
+        lead_id = str(lead.get("id") or "").strip()
+        linked_opportunity_id = str(lead.get("linked_opportunity_id") or "").strip()
+        contact_email = str(lead.get("email") or "").strip().lower()
+        if not lead_id or not linked_opportunity_id or not contact_email:
+            continue
+        try:
+            existing_draft = (
+                sb.table("email_messages")
+                .select("id")
+                .eq("lead_id", lead_id)
+                .eq("status", "draft")
+                .limit(1)
+                .execute()
+                .data
+                or []
+            )
+            if existing_draft:
+                continue
+        except Exception:
+            pass
+
+        template = _load_outreach_template_for_opportunity(
+            linked_opportunity_id,
+            workspace_id=workspace_id,
+        )
+        if not template:
+            continue
+
+        subject = str(template.get("subject") or "quick question about your website").strip()
+        body = (
+            str(template.get("short_email") or "").strip()
+            or str(template.get("longer_email") or "").strip()
+            or str(template.get("follow_up_note") or "").strip()
+        )
+        if not body:
+            continue
+
+        thread = _upsert_email_thread(
+            sb,
+            workspace_id=workspace_id,
+            lead_id=lead_id,
+            contact_email=contact_email,
+            subject=subject,
+            provider_thread_id=None,
+            owner_id=owner_id,
+        )
+        thread_id = str((thread or {}).get("id") or "").strip() or None
+        inserted = _insert_email_message(
+            sb,
+            {
+                "thread_id": thread_id,
+                "lead_id": lead_id,
+                "direction": "outbound",
+                "provider_message_id": None,
+                "subject": subject,
+                "body": body,
+                "delivery_status": "queued",
+                "status": "draft",
+                "generated_by": "scout-brain",
+                "sent_at": None,
+                "received_at": None,
+                "owner_id": owner_id,
+            },
+        )
+        if inserted:
+            draft_count += 1
+    return draft_count
+
+
+def _build_nightly_report(
+    today: dict | None,
+    opportunities: list | None,
+    intake_stats: dict | None,
+    email_drafts_generated: int,
+) -> dict:
+    opps = opportunities or []
+    return {
+        "cities_scanned": int((today or {}).get("cities_scanned") or 0),
+        "industries_scanned": int((today or {}).get("industries_scanned") or 0),
+        "businesses_found": int((today or {}).get("businesses_found") or len(opps)),
+        "opportunities_scored": int(len(opps)),
+        "leads_created": int((intake_stats or {}).get("created") or 0),
+        "email_drafts_generated": int(email_drafts_generated or 0),
+    }
+
+
 def daily_scout_job():
     if not _daily_scout_lock.acquire(blocking=False):
         print("  [Scout] daily scout already running, skipping duplicate trigger")
         return
     try:
-        print("  daily scout started")
+        print("  nightly scout started")
         if not _supabase_url or not _supabase_service_key:
             print("  [Scout] scheduled scout skipped: Supabase env not configured", file=sys.stderr)
             return
         from supabase import create_client
         sb = create_client(_supabase_url, _supabase_service_key)
-        _run_morning_runner()
+        region = _nightly_region_for_today()
+        print(f"  nightly region selected: {region}")
+        previous_region = os.environ.get("SCOUT_REGION_OVERRIDE")
+        os.environ["SCOUT_REGION_OVERRIDE"] = region
+        try:
+            _run_morning_runner()
+        finally:
+            if previous_region is None:
+                os.environ.pop("SCOUT_REGION_OVERRIDE", None)
+            else:
+                os.environ["SCOUT_REGION_OVERRIDE"] = previous_region
         print("  discovery completed")
         print("  analysis completed")
+        data = _load_scout_data()
+        today = data.get("today") or {}
+        opportunities = data.get("opportunities") or []
 
         workspaces = sb.table("workspaces").select("id,name,owner_user_id,plan").execute().data or []
         if SCHEDULED_SCOUT_SCOPE == "internal":
@@ -4176,11 +4458,38 @@ def daily_scout_job():
             owner_id = ws.get("owner_user_id")
             if not owner_id:
                 continue
-            _sync_scout_to_supabase(owner_id, workspace_id=ws.get("id"))
-            data = _load_scout_data()
-            _record_scout_run_supabase(owner_id, ws.get("id"), data.get("today"), data.get("opportunities"))
-            _run_workspace_crm_intake(sb, ws, owner_id)
+            ws_id = str(ws.get("id") or "").strip()
+            _sync_scout_to_supabase(owner_id, workspace_id=ws_id)
+            intake_stats = _run_workspace_crm_intake(sb, ws, owner_id)
+            email_drafts_generated = _generate_outreach_drafts_for_workspace(
+                sb,
+                ws_id,
+                owner_id,
+                min_score=80.0,
+            )
+            nightly_report = _build_nightly_report(
+                today,
+                opportunities,
+                intake_stats,
+                email_drafts_generated,
+            )
+            _record_scout_run_supabase(
+                owner_id,
+                ws_id,
+                today,
+                opportunities,
+                nightly_report=nightly_report,
+            )
             _process_workspace_outreach_sequences(str(ws.get("id") or ""), owner_id)
+            print(
+                f"  nightly report ({ws_id}): "
+                f"cities={nightly_report['cities_scanned']}, "
+                f"industries={nightly_report['industries_scanned']}, "
+                f"found={nightly_report['businesses_found']}, "
+                f"scored={nightly_report['opportunities_scored']}, "
+                f"leads={nightly_report['leads_created']}, "
+                f"drafts={nightly_report['email_drafts_generated']}"
+            )
             user_rows = (
                 sb.table("profiles")
                 .select("id,email,display_name")
@@ -4193,7 +4502,7 @@ def daily_scout_job():
             if user_rows:
                 _send_workspace_briefing_if_enabled(sb, user_rows[0], ws)
 
-        print("  morning intake complete")
+        print("  nightly intake complete")
         print("  scheduled scout finished")
     except Exception as e:
         print(f"  [Scout] daily scout error: {e}", file=sys.stderr)
@@ -4556,6 +4865,7 @@ def get_job_status(request: Request, job_id: str):
         "started_at": job.get("started_at"),
         "finished_at": job.get("finished_at"),
         "persistence_debug": (job.get("payload") or {}).get("persistence_debug"),
+        "scout_summary": (job.get("payload") or {}).get("scout_summary"),
     }
 
 
@@ -4632,6 +4942,7 @@ def get_active_job(request: Request):
                                 "started_at": active_for_ws.get("started_at"),
                                 "finished_at": active_for_ws.get("finished_at"),
                                 "persistence_debug": (active_for_ws.get("payload") or {}).get("persistence_debug"),
+                                "scout_summary": (active_for_ws.get("payload") or {}).get("scout_summary"),
                             }
                         }
         except Exception:
@@ -4654,6 +4965,7 @@ def get_active_job(request: Request):
             "started_at": active.get("started_at"),
             "finished_at": active.get("finished_at"),
             "persistence_debug": (active.get("payload") or {}).get("persistence_debug"),
+            "scout_summary": (active.get("payload") or {}).get("scout_summary"),
         }
     }
 
@@ -4664,14 +4976,16 @@ def post_scheduled_scout():
         return {
             "ok": True,
             "started": False,
-            "message": "Daily scout is already running",
+            "job_name": SCHEDULED_SCOUT_JOB_NAME,
+            "message": "Nightly scout is already running",
         }
     worker = threading.Thread(target=daily_scout_job, daemon=True)
     worker.start()
     return {
         "ok": True,
         "started": True,
-        "message": "Daily scout started",
+        "job_name": SCHEDULED_SCOUT_JOB_NAME,
+        "message": "Nightly scout started",
     }
 
 
@@ -5173,7 +5487,7 @@ def post_outreach_generate_email(request: Request, body: OutreachGenerateEmailBo
                 sb.table("opportunities")
                 .select(
                     "id,business_name,category,city,address,website,opportunity_score,website_status,"
-                    "website_speed,mobile_ready,seo_score,website_quality_score,opportunity_reason"
+                    "website_speed,mobile_ready,seo_score,website_quality_score,opportunity_reason,close_probability"
                 )
                 .eq("id", linked_opportunity_id)
                 .eq("workspace_id", workspace_id)
@@ -5184,7 +5498,7 @@ def post_outreach_generate_email(request: Request, body: OutreachGenerateEmailBo
                 sb.table("opportunities")
                 .select(
                     "id,business_name,category,city,address,website,opportunity_score,website_status,"
-                    "website_speed,mobile_ready,seo_score,website_quality_score,opportunity_reason"
+                    "website_speed,mobile_ready,seo_score,website_quality_score,opportunity_reason,close_probability"
                 )
                 .eq("id", linked_opportunity_id)
                 .limit(1)
@@ -5207,7 +5521,7 @@ def post_outreach_generate_email(request: Request, body: OutreachGenerateEmailBo
                 .select(
                     "opportunity_id,mobile_score,performance_score,seo_score,missing_ssl,slow_load,mobile_layout_issue,"
                     "website_speed,homepage_load_seconds,mobile_ready,ssl_ok,missing_meta_title,missing_meta_description,"
-                    "audit_issues,audit_results,contact_form_present,phone_from_site,outdated_design_clues,desktop_screenshot_url,mobile_screenshot_url,internal_screenshot_url,"
+                    "audit_issues,audit_results,contact_form_present,phone_from_site,outdated_design_clues,desktop_screenshot_url,mobile_screenshot_url,contact_page_screenshot_url,internal_screenshot_url,"
                     "screenshot_url"
                 )
                 .eq("opportunity_id", linked_opportunity_id)
@@ -5220,7 +5534,7 @@ def post_outreach_generate_email(request: Request, body: OutreachGenerateEmailBo
                 .select(
                     "opportunity_id,mobile_score,performance_score,seo_score,missing_ssl,slow_load,mobile_layout_issue,"
                     "website_speed,homepage_load_seconds,mobile_ready,ssl_ok,missing_meta_title,missing_meta_description,"
-                    "audit_issues,audit_results,contact_form_present,phone_from_site,outdated_design_clues,desktop_screenshot_url,mobile_screenshot_url,internal_screenshot_url,"
+                    "audit_issues,audit_results,contact_form_present,phone_from_site,outdated_design_clues,desktop_screenshot_url,mobile_screenshot_url,contact_page_screenshot_url,internal_screenshot_url,"
                     "screenshot_url"
                 )
                 .eq("opportunity_id", linked_opportunity_id)
@@ -5232,7 +5546,7 @@ def post_outreach_generate_email(request: Request, body: OutreachGenerateEmailBo
                 .select(
                     "opportunity_id,mobile_score,performance_score,seo_score,missing_ssl,slow_load,mobile_layout_issue,"
                     "website_speed,homepage_load_seconds,mobile_ready,ssl_ok,missing_meta_title,missing_meta_description,"
-                    "audit_issues,outdated_design_clues,desktop_screenshot_url,mobile_screenshot_url,internal_screenshot_url,"
+                    "audit_issues,outdated_design_clues,desktop_screenshot_url,mobile_screenshot_url,contact_page_screenshot_url,internal_screenshot_url,"
                     "screenshot_url"
                 )
                 .eq("opportunity_id", linked_opportunity_id)
@@ -5721,6 +6035,7 @@ def _screenshot_file_for_case(slug: str, kind: str) -> Path | None:
     mapping = {
         "desktop_homepage": "desktop.png",
         "mobile_homepage": "mobile.png",
+        "contact_page": "internal.png",
         "key_internal_page": "internal.png",
     }
     filename = mapping.get(kind)
@@ -5912,11 +6227,14 @@ def _start_scheduler():
         _scheduler.add_job(
             daily_scout_job,
             trigger,
-            id="scheduled-scout-daily",
+            id=SCHEDULED_SCOUT_JOB_NAME,
             replace_existing=True,
         )
         _scheduler.start()
-        print(f"  Scheduled scout enabled at {SCHEDULED_SCOUT_HOUR:02d}:00 {tz_label}")
+        print(
+            f"  Scheduled scout '{SCHEDULED_SCOUT_JOB_NAME}' enabled at "
+            f"{SCHEDULED_SCOUT_HOUR:02d}:00 {tz_label}"
+        )
     except Exception as e:
         print(f"  [Scout] scheduler start failed: {e}", file=sys.stderr)
         _scheduler = None
@@ -5957,6 +6275,7 @@ def main():
     print(f"  App running at:  http://0.0.0.0:{port}")
     print(f"  FRONTEND_SERVING: {'enabled' if SERVE_FRONTEND else 'disabled (api-only)'}")
     print(f"  SCHEDULED_SCOUT: {'enabled' if ENABLE_SCHEDULED_SCOUT else 'disabled'}")
+    print(f"  SCHEDULED_SCOUT_JOB_NAME: {SCHEDULED_SCOUT_JOB_NAME}")
     print(f"  SCHEDULED_SCOUT_HOUR: {SCHEDULED_SCOUT_HOUR:02d}:00")
     print(f"  SCHEDULED_SCOUT_TIMEZONE: {SCHEDULED_SCOUT_TIMEZONE}")
     print(f"  SCHEDULED_SCOUT_SCOPE: {SCHEDULED_SCOUT_SCOPE}")

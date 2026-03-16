@@ -39,20 +39,139 @@ CHAIN_CLUES = ["mcdonald", "starbucks", "subway", "dunkin", "walmart", "target",
 # Template-like prefixes from mock data; skip these (not real Places results)
 WEAK_NAME_PREFIXES = ("family ", "main street ", "local ", "downtown ")
 DEFAULT_TARGET_INDUSTRIES = (
-    "restaurant,cafe,auto repair,mechanic,body shop,tire shop,plumber,electrician,roofing,"
-    "landscaping,cleaning service,pressure washing,boutique,florist,bakery,dentist,chiropractor,church"
+    "restaurant,cafe,dentist,chiropractor,church,plumber,hvac,roofing,landscaping,"
+    "auto repair,salon,gym,lawyer,med spa"
 )
-HOT_SPRINGS_NEARBY_CITIES = [
+DEFAULT_DISCOVERY_CATEGORIES = [
+    "restaurant",
+    "cafe",
+    "dentist",
+    "chiropractor",
+    "church",
+    "plumber",
+    "HVAC",
+    "roofing",
+    "landscaping",
+    "auto repair",
+    "salon",
+    "gym",
+    "lawyer",
+    "med spa",
+]
+DEFAULT_MULTI_CITY_SEQUENCE = [
+    "Hot Springs",
     "Hot Springs Village",
+    "Malvern",
     "Benton",
     "Bryant",
     "Little Rock",
-    "North Little Rock",
     "Arkadelphia",
-    "Malvern",
     "Sheridan",
-    "Mena",
-    "Glenwood",
+]
+ARKANSAS_CITIES_STATEWIDE = [
+    "Little Rock",
+    "Fort Smith",
+    "Fayetteville",
+    "Springdale",
+    "Rogers",
+    "Conway",
+    "Jonesboro",
+    "North Little Rock",
+    "Bentonville",
+    "Pine Bluff",
+    "Hot Springs",
+    "Texarkana",
+    "Benton",
+    "Sherwood",
+    "Jacksonville",
+    "Russellville",
+    "Bryant",
+    "Cabot",
+    "Van Buren",
+    "Searcy",
+    "Hot Springs Village",
+    "Malvern",
+    "Arkadelphia",
+    "El Dorado",
+    "Magnolia",
+    "Mountain Home",
+    "Harrison",
+    "Batesville",
+    "Forrest City",
+    "Paragould",
+    "West Memphis",
+    "Stuttgart",
+    "Camden",
+    "Hope",
+    "Clarksville",
+    "Monticello",
+    "Helena",
+    "Dumas",
+    "Morrilton",
+    "Greenwood",
+]
+ARKANSAS_REGION_CITIES = {
+    "northwest": [
+        "Fayetteville",
+        "Springdale",
+        "Rogers",
+        "Bentonville",
+        "Harrison",
+        "Mountain Home",
+    ],
+    "central": [
+        "Little Rock",
+        "North Little Rock",
+        "Conway",
+        "Benton",
+        "Sherwood",
+        "Jacksonville",
+        "Bryant",
+        "Cabot",
+        "Searcy",
+        "Morrilton",
+    ],
+    "river_valley": [
+        "Fort Smith",
+        "Van Buren",
+        "Russellville",
+        "Clarksville",
+        "Greenwood",
+    ],
+    "delta": [
+        "Jonesboro",
+        "Forrest City",
+        "Paragould",
+        "West Memphis",
+        "Helena",
+        "Stuttgart",
+    ],
+    "south": [
+        "Pine Bluff",
+        "Texarkana",
+        "El Dorado",
+        "Magnolia",
+        "Camden",
+        "Hope",
+        "Monticello",
+        "Dumas",
+    ],
+    "ouachita": [
+        "Hot Springs",
+        "Hot Springs Village",
+        "Malvern",
+        "Arkadelphia",
+        "Batesville",
+    ],
+}
+HOT_SPRINGS_NEARBY_CITIES = [
+    "Hot Springs Village",
+    "Malvern",
+    "Benton",
+    "Bryant",
+    "Little Rock",
+    "Arkadelphia",
+    "Sheridan",
 ]
 
 LOW_PRIORITY_INDUSTRIES = {
@@ -61,6 +180,41 @@ LOW_PRIORITY_INDUSTRIES = {
     "software companies",
     "consultants",
     "large franchises",
+}
+
+HIGH_CLOSE_CATEGORIES = {
+    "dentists",
+    "chiropractors",
+    "restaurants",
+    "cafes",
+    "gyms",
+    "hair salons",
+    "auto repair",
+    "mechanics",
+    "body shops",
+    "tire shops",
+    "plumbers",
+    "roofing",
+    "electricians",
+    "landscaping",
+    "cleaning services",
+    "pressure washing",
+    "contractors",
+}
+PRIORITY_INDUSTRY_CATEGORIES = {
+    "dentists",
+    "chiropractors",
+    "law firms",
+    "med spa",
+    "contractors",
+    "roofing",
+    "hvac",
+    "plumbers",
+    "churches",
+    "restaurants",
+    "gyms",
+    "auto repair",
+    "mechanics",
 }
 
 
@@ -139,6 +293,11 @@ def _normalize_industry(value: str) -> str:
         "bakeries": "bakeries",
         "plumber": "plumbers",
         "plumbers": "plumbers",
+        "hvac": "hvac",
+        "hvac service": "hvac",
+        "hvac contractor": "hvac",
+        "heating and air": "hvac",
+        "heating and cooling": "hvac",
         "electrician": "electricians",
         "electricians": "electricians",
         "roofing contractor": "roofing",
@@ -172,6 +331,10 @@ def _normalize_industry(value: str) -> str:
         "small law firm": "law firms",
         "lawyer": "law firms",
         "law firms": "law firms",
+        "med spa": "med spa",
+        "medical spa": "med spa",
+        "med spas": "med spa",
+        "medical spas": "med spa",
         "marketing agency": "marketing agencies",
         "marketing agencies": "marketing agencies",
         "software company": "software companies",
@@ -202,22 +365,15 @@ def _industry_is_lower_priority(value: str) -> bool:
     return normalized in {_normalize_industry(v) for v in LOW_PRIORITY_INDUSTRIES}
 
 
+def _industry_is_high_close_probability(value: str) -> bool:
+    normalized = _normalize_industry(value)
+    if normalized in HIGH_CLOSE_CATEGORIES:
+        return True
+    return "contractor" in normalized
+
+
 def _resolve_discovery_categories(config: dict) -> list[str]:
-    configured = config.get("categories", [
-        "restaurant",
-        "cafe",
-        "bakery",
-        "auto repair",
-        "dentist",
-        "plumber",
-        "lawyer",
-        "gym",
-        "church",
-        "salon",
-        "barber shop",
-        "chiropractor",
-        "contractor",
-    ])
+    configured = config.get("categories", DEFAULT_DISCOVERY_CATEGORIES)
     configured_list = [str(c).strip() for c in configured if str(c).strip()]
     preferred = [term for term in _preferred_industry_terms() if term]
     ordered: list[str] = []
@@ -334,6 +490,15 @@ def _resolve_target_cities(config: dict) -> list[dict]:
     city_radius = float(os.environ.get("SCOUT_CITY_RADIUS", "80") or "80")
 
     explicit_targets = config.get("target_cities") or []
+    requested_region = str(os.environ.get("SCOUT_REGION_OVERRIDE", "") or "").strip().lower()
+    if requested_region == "all_arkansas":
+        explicit_targets = [{"city_name": city, "state": "AR"} for city in ARKANSAS_CITIES_STATEWIDE]
+    elif requested_region in ARKANSAS_REGION_CITIES:
+        explicit_targets = [
+            {"city_name": city, "state": "AR"} for city in ARKANSAS_REGION_CITIES.get(requested_region, [])
+        ]
+    if not explicit_targets and bool(config.get("scan_statewide_arkansas", False)):
+        explicit_targets = [{"city_name": city, "state": "AR"} for city in ARKANSAS_CITIES_STATEWIDE]
     selected = []
     dataset_by_key = {
         f"{r['city_name'].lower()}|{r['state'].lower()}": r for r in dataset
@@ -351,6 +516,20 @@ def _resolve_target_cities(config: dict) -> list[dict]:
             continue
         row = dataset_by_key.get(f"{city_name.lower()}|{state.lower()}")
         selected.append(row or {"city_name": city_name, "state": state, "latitude": None, "longitude": None, "population": 0})
+
+    if not selected and home_city.strip().lower().startswith("hot springs"):
+        for city_name in DEFAULT_MULTI_CITY_SEQUENCE:
+            row = next((r for r in dataset if str(r.get("city_name") or "").strip().lower() == city_name.lower()), None)
+            selected.append(
+                row
+                or {
+                    "city_name": city_name,
+                    "state": "AR",
+                    "latitude": None,
+                    "longitude": None,
+                    "population": 0,
+                }
+            )
 
     if not selected:
         max_cities = max(1, int(config.get("max_cities_per_run", 5)))
@@ -469,12 +648,18 @@ def _calculate_base_business_score(lead: dict) -> tuple[int, list[str]]:
     review_count = _as_int(lead.get("review_count"), 0)
     business_closed = str(lead.get("business_status") or "").strip().lower() in {"closed", "permanently_closed"}
 
-    if rating >= 4.2:
+    if rating > 4.3:
+        score += 16
+        signals.append("+16 rating above 4.3")
+    elif rating >= 4.2:
         score += 12
         signals.append("+12 strong review rating")
-    if review_count >= 50:
-        score += 12
-        signals.append("+12 high review volume")
+    if review_count >= 80:
+        score += 18
+        signals.append("+18 very strong review volume")
+    elif review_count > 40:
+        score += 14
+        signals.append("+14 reviews above 40")
     elif review_count >= 20:
         score += 6
         signals.append("+6 moderate review volume")
@@ -485,6 +670,9 @@ def _calculate_base_business_score(lead: dict) -> tuple[int, list[str]]:
     if _industry_is_preferred(industry_value):
         score += 20
         signals.append("+20 preferred industry")
+    if _industry_is_high_close_probability(industry_value):
+        score += 18
+        signals.append("+18 category depends on new customers")
     if _industry_is_lower_priority(industry_value):
         score -= 20
         signals.append("-20 lower-priority industry")
@@ -586,7 +774,7 @@ def calculateWebsiteQualityScore(lead: dict) -> dict:
 
     if no_website:
         website_quality_score += 100
-        issues.append("no website")
+        issues.append("no website present")
         boosts.append("+100 no website")
     if unreachable:
         website_quality_score += 90
@@ -594,31 +782,31 @@ def calculateWebsiteQualityScore(lead: dict) -> dict:
         boosts.append("+90 website unreachable")
     if very_slow:
         website_quality_score += 40
-        issues.append("website very slow")
+        issues.append("page load slow")
         boosts.append("+40 slow load")
     if no_mobile:
         website_quality_score += 40
-        issues.append("no mobile optimization")
+        issues.append("site not mobile friendly")
         boosts.append("+40 mobile issues")
     if no_ssl:
         website_quality_score += 30
-        issues.append("no SSL")
+        issues.append("broken SSL / http site")
         boosts.append("+30 missing HTTPS")
     if poor_seo:
         website_quality_score += 25
-        issues.append("poor SEO signals")
+        issues.append("missing SEO title/description")
         boosts.append("+25 poor SEO")
     if missing_contact:
         website_quality_score += 20
-        issues.append("missing contact information")
+        issues.append("contact information hard to find")
         boosts.append("+20 missing contact info")
     if missing_online_ordering:
         website_quality_score += 24
-        issues.append("missing online ordering")
+        issues.append("no booking or ordering system")
         boosts.append("+24 missing online ordering")
     if missing_booking:
         website_quality_score += 22
-        issues.append("missing booking system")
+        issues.append("no booking or ordering system")
         boosts.append("+22 missing booking")
     if outdated_wordpress_theme:
         website_quality_score += 18
@@ -630,14 +818,14 @@ def calculateWebsiteQualityScore(lead: dict) -> dict:
         boosts.append("+14 builder lock-in")
     if broken_layout:
         website_quality_score += 20
-        issues.append("broken layout")
+        issues.append("difficult navigation")
         boosts.append("+20 broken layout")
     if outdated_cms or outdated_design:
-        issues.append("outdated CMS/design indicators")
+        issues.append("outdated visual design")
     if very_low_text:
-        issues.append("very low text content")
+        issues.append("text heavy homepage")
     if missing_images:
-        issues.append("missing images")
+        issues.append("images not optimized")
     if broken_links:
         issues.append("broken links detected")
 
@@ -690,43 +878,210 @@ def calculateWebsiteQualityScore(lead: dict) -> dict:
     return result
 
 
-def _derive_opportunity_reason(website_quality: dict, lead: dict) -> str:
+def _derive_opportunity_reason(website_quality: dict, lead: dict) -> list[str]:
+    reasons: list[str] = []
     issues = [str(i).strip().lower() for i in (website_quality.get("website_issues") or []) if str(i).strip()]
-    if "missing online ordering" in issues:
-        return "Missing online ordering"
-    if "missing booking system" in issues:
-        return "Missing booking system"
-    if "website very slow" in issues:
-        return "Slow mobile speed"
-    if "no mobile optimization" in issues:
-        return "No mobile optimization"
-    if "outdated wordpress theme" in issues:
-        return "Outdated WordPress theme"
-    if "wix or godaddy builder" in issues:
-        return "Wix or GoDaddy builder limitations"
-    if "broken layout" in issues:
-        return "Broken layout"
-    if "no ssl" in issues:
-        return "No SSL"
-    if "website unreachable" in issues:
-        return "Website unreachable"
-    if "no website" in issues:
-        return "No website"
-    if "outdated cms/design indicators" in issues:
-        return "Outdated design"
-    return "Outdated design"
+    review_count = _as_int(lead.get("review_count"), 0)
+    rating = _as_float(lead.get("rating"), 0.0)
+    reviews_last_30 = _as_int(lead.get("reviews_last_30_days"), 0)
+    recent_review_detected = reviews_last_30 > 0
+    website_exists = bool(str(lead.get("website") or "").strip()) and not bool(lead.get("no_website"))
+    website_score = _as_int(lead.get("website_score"), 100)
+    mobile_performance = _as_int(lead.get("mobile_score"), 100)
+    cta_missing = bool(lead.get("missing_call_to_action"))
+    booking_missing = bool(lead.get("booking_or_ordering_missing")) or bool(website_quality.get("missing_online_ordering"))
+    outdated_design = bool(lead.get("outdated_layout_signals")) or bool(website_quality.get("outdated_cms_indicators"))
+    contact_depth = _as_int(lead.get("contact_link_depth"), 1)
+    category = _normalize_industry(lead.get("category") or lead.get("industry") or "")
+    slow_or_mobile = (
+        any(token in issues for token in ["page load slow", "mobile pagespeed score below 50", "missing viewport meta"])
+        or mobile_performance < 65
+        or website_score < 70
+    )
+    if not website_exists:
+        reasons.append("No website present and immediate redesign opportunity")
+    if slow_or_mobile and cta_missing:
+        reasons.append("Slow mobile performance and no clear CTA")
+    elif booking_missing and outdated_design:
+        reasons.append("Missing online ordering/booking and outdated design")
+    elif booking_missing:
+        reasons.append("Missing online ordering/booking flow")
+    elif slow_or_mobile:
+        reasons.append("Mobile performance and usability issues detected")
+    elif contact_depth >= 3:
+        reasons.append("Contact path is hard to find from homepage")
+    if review_count >= 40 or rating >= 4.3 or recent_review_detected:
+        if slow_or_mobile or cta_missing or booking_missing or outdated_design:
+            reasons.append("Active business with good reviews but weak website")
+        else:
+            reasons.append("Active business with many reviews and growth potential")
+    if category in PRIORITY_INDUSTRY_CATEGORIES or _industry_is_high_close_probability(category):
+        reasons.append("High-value industry with strong website ROI")
+    if reviews_last_30 > 3:
+        reasons.append("Recent review activity suggests strong buying momentum")
+    if not reasons:
+        reasons.append("Clear website conversion opportunity identified")
+    return reasons[:4]
 
 
-def calculateOpportunityScore(lead: dict) -> tuple[int, list[str], str, dict, str]:
+def _derive_close_probability(
+    total_score: int,
+    website_quality: dict,
+    lead: dict,
+) -> str:
+    rating = _as_float(lead.get("rating"), 0.0)
+    review_count = _as_int(lead.get("review_count"), 0)
+    industry_value = lead.get("category") or lead.get("industry") or ""
+    weak_design = bool(lead.get("outdated_design_clues")) or bool(website_quality.get("website_status") == "weak")
+    missing_capture = bool(
+        website_quality.get("missing_online_ordering")
+        or website_quality.get("missing_booking_system")
+        or not bool(lead.get("contact_form_present"))
+        or not bool(lead.get("order_link"))
+    )
+    strong_reviews = review_count > 40
+    strong_rating = rating > 4.3
+    high_close_category = _industry_is_high_close_probability(industry_value)
+
+    buyer_signals = sum(
+        [
+            1 if weak_design else 0,
+            1 if high_close_category else 0,
+            1 if strong_reviews else 0,
+            1 if strong_rating else 0,
+            1 if missing_capture else 0,
+            1 if bool(lead.get("outdated_design_clues")) else 0,
+        ]
+    )
+    if total_score >= 85 or buyer_signals >= 4:
+        return "high"
+    if total_score >= 60 or buyer_signals >= 2:
+        return "medium"
+    return "low"
+
+
+def calculateOpportunityScore(lead: dict) -> tuple[int, list[str], str, dict, list[str], str]:
     """
     Opportunity score engine (0-100).
-    Returns: (score, scoring_signals, lead_tier, website_quality_payload, opportunity_reason).
+    Returns: (score, scoring_signals, lead_tier, website_quality_payload, opportunity_reason_list, close_probability).
     """
     base_score, base_signals = _calculate_base_business_score(lead)
     website_quality = calculateWebsiteQualityScore(lead)
-    website_score = int(website_quality.get("website_quality_score") or 0)
-    # Prioritize website pain first; base business score is secondary context only.
-    total = max(0, min(100, int(round(website_score + min(10, max(0, base_score // 10))))))
+    website_issue_score = int(website_quality.get("website_quality_score") or 0)
+    # Weighted scoring model requested by product requirements.
+    website_issues_weight = 40
+    review_activity_weight = 30
+    industry_weight = 20
+    contact_info_weight = 10
+
+    review_count = _as_int(lead.get("google_review_count"), _as_int(lead.get("review_count"), 0))
+    rating = _as_float(lead.get("rating"), 0.0)
+    reviews_last_30_days = _as_int(lead.get("reviews_last_30_days"), 0)
+    recent_review_detected = reviews_last_30_days > 0
+    owner_post_detected = bool(lead.get("owner_post_detected"))
+    new_photos_detected = bool(lead.get("new_photos_detected"))
+    listing_recently_updated = bool(lead.get("listing_recently_updated"))
+    website_exists = bool(str(lead.get("website") or "").strip()) and not bool(lead.get("no_website"))
+    website_grade = _as_int(lead.get("website_score"), 100)
+    mobile_performance = _as_int(lead.get("mobile_score"), 100)
+    contact_page_present = bool(str(lead.get("contact_page") or "").strip()) or bool(lead.get("contact_form_present"))
+    phone_or_email_detected = bool(str(lead.get("phone") or "").strip() or str(lead.get("email") or "").strip())
+    normalized_category = _normalize_industry(lead.get("category") or lead.get("industry") or "")
+
+    website_quality_subscore = max(
+        0,
+        min(
+            100,
+            int(
+                round(
+                    (website_issue_score * 0.7)
+                    + (max(0, 100 - website_grade) * 0.2)
+                    + (max(0, 100 - mobile_performance) * 0.1)
+                )
+            ),
+        ),
+    )
+
+    review_activity_subscore = 0
+    if review_count >= 80:
+        review_activity_subscore += 50
+    elif review_count >= 40:
+        review_activity_subscore += 35
+    elif review_count >= 15:
+        review_activity_subscore += 20
+    if rating >= 4.6:
+        review_activity_subscore += 35
+    elif rating >= 4.3:
+        review_activity_subscore += 25
+    elif rating >= 4.0:
+        review_activity_subscore += 10
+    if recent_review_detected:
+        review_activity_subscore += 15
+    review_activity_subscore = max(0, min(100, review_activity_subscore))
+
+    activity_score = 0
+    activity_summary: list[str] = []
+    if reviews_last_30_days > 3:
+        activity_score += 30
+        activity_summary.append(f"{reviews_last_30_days} new reviews this month")
+    elif reviews_last_30_days > 0:
+        activity_score += 12
+        activity_summary.append(f"{reviews_last_30_days} new reviews this month")
+    if owner_post_detected:
+        activity_score += 20
+        activity_summary.append("Owner posted update recently")
+    if new_photos_detected:
+        activity_score += 15
+        activity_summary.append("New photos detected")
+    if listing_recently_updated:
+        activity_score += 20
+        activity_summary.append("Listing recently updated")
+    activity_score = max(0, min(100, activity_score))
+
+    review_activity_final = max(
+        0,
+        min(100, int(round((review_activity_subscore * 0.7) + (activity_score * 0.3)))),
+    )
+
+    industry_subscore = 100 if normalized_category in PRIORITY_INDUSTRY_CATEGORIES else 35
+    if _industry_is_high_close_probability(normalized_category):
+        industry_subscore = max(industry_subscore, 80)
+
+    contact_info_subscore = 0
+    if phone_or_email_detected:
+        contact_info_subscore += 70
+    if contact_page_present:
+        contact_info_subscore += 30
+    contact_info_subscore = max(0, min(100, contact_info_subscore))
+
+    weighted_total = (
+        (website_quality_subscore * website_issues_weight)
+        + (review_activity_final * review_activity_weight)
+        + (industry_subscore * industry_weight)
+        + (contact_info_subscore * contact_info_weight)
+    ) / 100.0
+
+    total = max(0, min(100, int(round(weighted_total))))
+    if reviews_last_30_days > 3:
+        total = min(100, total + 10)
+        base_signals.append("+10 reviews_last_30_days > 3")
+    if review_count > 50:
+        total = min(100, total + 5)
+        base_signals.append("+5 google_review_count > 50")
+
+    if website_exists:
+        base_signals.append("+website exists")
+    if website_exists and website_grade < 70:
+        base_signals.append("+weak website quality")
+    if mobile_performance < 65:
+        base_signals.append("+mobile performance issues")
+    if contact_page_present:
+        base_signals.append("+contact page present")
+    if phone_or_email_detected:
+        base_signals.append("+phone or email detected")
+    if recent_review_detected:
+        base_signals.append("+recent review detected")
+
     score_signals = list(base_signals) + list(website_quality.get("website_boost_signals") or [])
     if total >= 80:
         tier = "hot_lead"
@@ -735,8 +1090,25 @@ def calculateOpportunityScore(lead: dict) -> tuple[int, list[str], str, dict, st
     else:
         tier = "low_priority"
     opportunity_reason = _derive_opportunity_reason(website_quality, lead)
-    print(f"opportunity score updated: base={base_score}, website={website_score}, total={total}, tier={tier}")
-    return total, score_signals, tier, website_quality, opportunity_reason
+    print(f"opportunity_reason generated: {' | '.join(opportunity_reason)}")
+    if activity_summary:
+        website_quality["activity_summary"] = list(dict.fromkeys(activity_summary))[:4]
+    else:
+        website_quality["activity_summary"] = []
+    website_quality["activity_score"] = activity_score
+    website_quality["reviews_last_30_days"] = reviews_last_30_days
+    website_quality["google_review_count"] = review_count
+    website_quality["owner_post_detected"] = owner_post_detected
+    website_quality["new_photos_detected"] = new_photos_detected
+    website_quality["listing_recently_updated"] = listing_recently_updated
+    close_probability = _derive_close_probability(total, website_quality, lead)
+    print(
+        "opportunity score updated: "
+        f"base={base_score}, website_issue_score={website_issue_score}, total={total}, "
+        f"review_activity={review_activity_final}, activity_score={activity_score}, industry={industry_subscore}, "
+        f"contact_info={contact_info_subscore}, tier={tier}, close_probability={close_probability}"
+    )
+    return total, score_signals, tier, website_quality, opportunity_reason, close_probability
 
 
 def generateOpportunitySignals(caseData: dict) -> list[str]:
@@ -776,6 +1148,13 @@ def generateOpportunitySignals(caseData: dict) -> list[str]:
         rating = None
     if rating is not None and rating >= 4.2 and review_count > 10:
         signals.append("Strong review reputation")
+    reviews_last_30_days = _as_int(caseData.get("reviews_last_30_days"), 0)
+    if reviews_last_30_days > 0:
+        signals.append(f"{reviews_last_30_days} recent reviews")
+    if bool(caseData.get("owner_post_detected")):
+        signals.append("Owner posted update recently")
+    if bool(caseData.get("new_photos_detected")):
+        signals.append("New photos detected")
 
     distance = caseData.get("distance_miles")
     try:
@@ -863,6 +1242,12 @@ def _build_no_website_case(place: dict, home_city: str, categories: list, index:
     case["hours"] = place.get("hours")
     case["rating"] = place.get("rating")
     case["review_count"] = place.get("review_count")
+    case["google_review_count"] = place.get("google_review_count") or place.get("review_count")
+    case["reviews_last_30_days"] = int(place.get("reviews_last_30_days") or 0)
+    case["owner_post_detected"] = bool(place.get("owner_post_detected"))
+    case["new_photos_detected"] = bool(place.get("new_photos_detected"))
+    case["listing_recently_updated"] = bool(place.get("listing_recently_updated"))
+    case["activity_summary"] = list(place.get("activity_summary") or [])
     case["business_status"] = place.get("business_status")
     case["review_snippets"] = place.get("review_snippets") or []
     case["review_themes"] = place.get("review_themes") or []
@@ -885,6 +1270,12 @@ def _build_no_website_case(place: dict, home_city: str, categories: list, index:
         case["backup_contact_method"] = None
 
     case["strongest_problems"] = ["No website — missing online presence"]
+    case["website_issues"] = [
+        {
+            "category": "Site Structure",
+            "issue": "No website present",
+        }
+    ]
     case["website_score"] = 0
     case["fetch_ok"] = False
     case["website_status"] = "none"
@@ -907,7 +1298,7 @@ def _build_no_website_case(place: dict, home_city: str, categories: list, index:
     case["what_stood_out"] = "No website"
     case["next_action"] = "Call or visit with short pitch"
     case["follow_up_suggestion"] = "Follow up in 3–5 days"
-    score, score_signals, lead_tier, website_quality, opportunity_reason = calculateOpportunityScore(case)
+    score, score_signals, lead_tier, website_quality, opportunity_reason, close_probability = calculateOpportunityScore(case)
     case["opportunity_score"] = score
     case["internal_score"] = score
     case["lead_tier"] = lead_tier
@@ -919,6 +1310,8 @@ def _build_no_website_case(place: dict, home_city: str, categories: list, index:
     case["website_quality_score"] = website_quality.get("website_quality_score")
     case["priority"] = "high" if score >= 70 else "medium" if score >= 50 else "low"
     case["opportunity_reason"] = opportunity_reason
+    case["activity_summary"] = website_quality.get("activity_summary") or case.get("activity_summary") or []
+    case["close_probability"] = close_probability
     case["contact_matrix"] = {
         "best_contact": "phone" if case["phone"] else "visit",
         "best_contact_method": "phone" if case["phone"] else "visit",
@@ -1008,6 +1401,12 @@ def _build_weak_website_case(
     case["hours"] = place.get("hours")
     case["rating"] = place.get("rating")
     case["review_count"] = place.get("review_count")
+    case["google_review_count"] = place.get("google_review_count") or place.get("review_count")
+    case["reviews_last_30_days"] = int(place.get("reviews_last_30_days") or 0)
+    case["owner_post_detected"] = bool(place.get("owner_post_detected"))
+    case["new_photos_detected"] = bool(place.get("new_photos_detected"))
+    case["listing_recently_updated"] = bool(place.get("listing_recently_updated"))
+    case["activity_summary"] = list(place.get("activity_summary") or [])
     case["business_status"] = place.get("business_status")
     case["review_snippets"] = place.get("review_snippets") or []
     case["review_themes"] = place.get("review_themes") or []
@@ -1021,10 +1420,16 @@ def _build_weak_website_case(
             case["fetch_ok"] = False
             case["website_status"] = "unreachable"
             case["strongest_problems"] = ["Website appears unreachable"]
+            case["website_issues"] = [
+                {
+                    "category": "Site Structure",
+                    "issue": "Website unreachable",
+                }
+            ]
             case["audit_issues"] = ["Website appears unreachable"]
             case["strongest_pitch_angle"] = "Fix reliability and get the site loading for customers"
             case["best_service_to_offer"] = "Stability and performance recovery plan"
-            score, score_signals, lead_tier, website_quality, opportunity_reason = calculateOpportunityScore(case)
+            score, score_signals, lead_tier, website_quality, opportunity_reason, close_probability = calculateOpportunityScore(case)
             score = max(score, 90)
             case["opportunity_score"] = score
             case["internal_score"] = score
@@ -1038,6 +1443,8 @@ def _build_weak_website_case(
             case["website_quality_score"] = website_quality.get("website_quality_score")
             case["priority"] = "high" if score >= 70 else "medium" if score >= 50 else "low"
             case["opportunity_reason"] = opportunity_reason
+            case["activity_summary"] = website_quality.get("activity_summary") or case.get("activity_summary") or []
+            case["close_probability"] = close_probability
             base_signals = generateOpportunitySignals(case)
             merged_signals = list(dict.fromkeys(base_signals + score_signals))
             case["opportunity_signals"] = merged_signals[:8]
@@ -1053,10 +1460,16 @@ def _build_weak_website_case(
             case["missing_ssl"] = True
             case["ssl_ok"] = False
             case["strongest_problems"] = ["Website uses HTTP instead of HTTPS"]
+            case["website_issues"] = [
+                {
+                    "category": "Site Structure",
+                    "issue": "Broken SSL / HTTP site",
+                }
+            ]
             case["audit_issues"] = ["Website uses HTTP instead of HTTPS"]
             case["strongest_pitch_angle"] = "Secure the site with HTTPS to improve trust and conversions"
             case["best_service_to_offer"] = "HTTPS/security and conversion-focused refresh"
-            score, score_signals, lead_tier, website_quality, opportunity_reason = calculateOpportunityScore(case)
+            score, score_signals, lead_tier, website_quality, opportunity_reason, close_probability = calculateOpportunityScore(case)
             score = max(score, 80)
             case["opportunity_score"] = score
             case["internal_score"] = score
@@ -1070,6 +1483,8 @@ def _build_weak_website_case(
             case["website_quality_score"] = website_quality.get("website_quality_score")
             case["priority"] = "high" if score >= 70 else "medium" if score >= 50 else "low"
             case["opportunity_reason"] = opportunity_reason
+            case["activity_summary"] = website_quality.get("activity_summary") or case.get("activity_summary") or []
+            case["close_probability"] = close_probability
             base_signals = generateOpportunitySignals(case)
             merged_signals = list(dict.fromkeys(base_signals + score_signals))
             case["opportunity_signals"] = merged_signals[:8]
@@ -1123,7 +1538,9 @@ def _build_weak_website_case(
         case["design_score"] = inv.get("design_score")
         case["navigation_score"] = inv.get("navigation_score")
         case["conversion_score"] = inv.get("conversion_score")
+        case["website_audit"] = inv.get("website_audit") or {}
         case["audit_issues"] = inv.get("audit_issues") or inv.get("detected_issues") or []
+        case["website_issues"] = inv.get("website_issues") or []
         case["ssl_ok"] = inv.get("ssl_ok")
         case["internal_links_found"] = inv.get("internal_links_found") or {}
         case["important_internal_links"] = inv.get("important_internal_links") or inv.get("internal_links_found") or {}
@@ -1141,10 +1558,19 @@ def _build_weak_website_case(
         case["order_link"] = inv.get("order_link")
         case["desktop_screenshot_path"] = inv.get("desktop_homepage_path")
         case["mobile_screenshot_path"] = inv.get("mobile_homepage_path")
+        case["contact_page_screenshot_path"] = inv.get("contact_page_path")
         case["internal_screenshot_path"] = inv.get("internal_page_path")
         case["desktop_screenshot_url"] = f"/case/{slug}/screenshot/desktop_homepage" if inv.get("desktop_homepage_path") else None
         case["mobile_screenshot_url"] = f"/case/{slug}/screenshot/mobile_homepage" if inv.get("mobile_homepage_path") else None
-        case["internal_screenshot_url"] = f"/case/{slug}/screenshot/key_internal_page" if inv.get("internal_page_path") else None
+        case["contact_page_screenshot_url"] = f"/case/{slug}/screenshot/contact_page" if inv.get("contact_page_path") else None
+        # Keep legacy field populated for backward compatibility.
+        case["internal_screenshot_url"] = (
+            f"/case/{slug}/screenshot/contact_page"
+            if inv.get("contact_page_path")
+            else f"/case/{slug}/screenshot/key_internal_page"
+            if inv.get("internal_page_path")
+            else None
+        )
 
         emails = inv.get("emails") or []
         social = inv.get("social") or {}
@@ -1170,6 +1596,16 @@ def _build_weak_website_case(
     case["strongest_problems"] = problems
     if not case.get("audit_issues"):
         case["audit_issues"] = list(problems) if isinstance(problems, list) else [str(problems)]
+    if not case.get("website_issues"):
+        fallback_structured = []
+        for issue in case.get("audit_issues") or []:
+            text = str(issue or "").strip()
+            if not text:
+                continue
+            fallback_structured.append({"category": "Website", "issue": text})
+        case["website_issues"] = fallback_structured
+    if not isinstance(case.get("website_audit"), dict):
+        case["website_audit"] = {}
     website_score = case.get("website_score")
     case["high_opportunity"] = bool((case.get("rating") or 0) >= 4.2 and (website_score if website_score is not None else 100) <= 60)
     case["strongest_pitch_angle"] = pitch_lines[0] if pitch_lines else None
@@ -1203,7 +1639,7 @@ def _build_weak_website_case(
     case["what_stood_out"] = problems[0] if problems else None
     case["next_action"] = "Send short email or try contact form"
     case["follow_up_suggestion"] = "Follow up in 5–7 days"
-    score, score_signals, lead_tier, website_quality, opportunity_reason = calculateOpportunityScore(case)
+    score, score_signals, lead_tier, website_quality, opportunity_reason, close_probability = calculateOpportunityScore(case)
     case["opportunity_score"] = score
     case["internal_score"] = score
     case["lead_tier"] = lead_tier
@@ -1216,6 +1652,8 @@ def _build_weak_website_case(
     case["performance_score"] = case.get("website_score")
     case["priority"] = "high" if score >= 70 else "medium" if score >= 50 else "low"
     case["opportunity_reason"] = opportunity_reason
+    case["activity_summary"] = website_quality.get("activity_summary") or case.get("activity_summary") or []
+    case["close_probability"] = close_probability
     base_signals = generateOpportunitySignals(case)
     merged_signals = list(dict.fromkeys(base_signals + score_signals))
     # Early exit for obviously modern, fast sites during lightweight scans.
@@ -1228,6 +1666,7 @@ def _build_weak_website_case(
         case["internal_score"] = case["opportunity_score"]
         case["lead_tier"] = "low_priority"
         case["tier"] = "low_priority"
+        case["close_probability"] = "low"
         merged_signals.append("Early exit: modern fast site")
         case["priority"] = "low"
     case["opportunity_signals"] = merged_signals[:8]
@@ -1307,14 +1746,20 @@ def run(
     target_cities = _resolve_target_cities(config)
     radius = config.get("search_radius_miles", 25)
     categories = _resolve_discovery_categories(config)
-    radii_miles = config.get("search_radii_miles", [2, 5, 10, 15])
+    base_radii_miles = config.get("search_radii_miles", [10])
+    expansion_radii_miles = config.get("expansion_radii_miles", [10, 25, 50])
+    city_expansion_threshold = max(1, int(config.get("city_expansion_threshold", 100)))
     max_total_results = int(
         config.get(
             "DISCOVERY_MAX_PER_RUN",
-            config.get("discovery_max_per_run", config.get("max_total_results_per_run", 60)),
+            config.get("discovery_max_per_run", config.get("max_total_results_per_run", 600)),
         )
     )
-    max_per = max(1, config.get("max_results_per_category", 5))
+    max_total_results = max(200, max_total_results)
+    max_total_results = min(max_total_results, int(config.get("max_businesses_per_run", 600) or 600))
+    max_results_per_city = max(100, int(config.get("max_results_per_city", 250)))
+    max_per = int(config.get("max_results_per_query", config.get("max_results_per_category", 60)))
+    max_per = max(1, min(60, max_per))
     ignore_chains = config.get("ignore_chains", True)
     deep_scan_max_per_run = max(
         1, int(config.get("DEEP_SCAN_MAX_PER_RUN", config.get("deep_scan_max_per_run", 15)))
@@ -1379,8 +1824,13 @@ def run(
     print("Morning Runner — automated local client finder")
     print(f"  home_city: {home_city}, radius: {radius} mi")
     print(f"  target cities: {len(target_cities)}")
-    print(f"  search_radii_miles: {radii_miles}")
-    print(f"  categories: {categories}, max_per: {max_per}, ignore_chains: {ignore_chains}")
+    active_region = str(os.environ.get("SCOUT_REGION_OVERRIDE", "") or "").strip().lower()
+    if active_region:
+        print(f"  active region override: {active_region}")
+    print(f"  search_radii_miles: {base_radii_miles}")
+    print(f"  expansion_radii_miles: {expansion_radii_miles}")
+    print(f"  city_expansion_threshold: {city_expansion_threshold}")
+    print(f"  categories: {categories}, max_results_per_query: {max_per}, ignore_chains: {ignore_chains}")
     print(f"  discovery_max_per_run: {max_total_results}")
     print(f"  deep_scan_max_per_run: {deep_scan_max_per_run}")
     print(f"  max_concurrency: {max_concurrency}")
@@ -1413,6 +1863,7 @@ def run(
     places = []
     seen_place_ids: set[str] = set()
     total_duplicates_skipped = 0
+    cities_scanned_count = 0
     try:
         total_cities = max(1, len(target_cities))
         for city_idx, target in enumerate(target_cities, start=1):
@@ -1432,9 +1883,36 @@ def run(
                 radius,
                 current_lat=scan_lat,
                 current_lng=scan_lng,
-                radii_miles=radii_miles,
-                max_total_results=max_total_results,
+                radii_miles=base_radii_miles,
+                max_total_results=max_results_per_city,
             )
+            if len(city_places) < city_expansion_threshold:
+                print(
+                    f"  city under threshold ({len(city_places)}<{city_expansion_threshold}), "
+                    "expanding radius tiers"
+                )
+                expanded_places = _fetch_places(
+                    city_label,
+                    categories,
+                    max_per,
+                    radius,
+                    current_lat=scan_lat,
+                    current_lng=scan_lng,
+                    radii_miles=expansion_radii_miles,
+                    max_total_results=max_results_per_city,
+                )
+                expanded_existing_ids = {
+                    str(p.get("place_id") or "").strip() for p in city_places if str(p.get("place_id") or "").strip()
+                }
+                for p in expanded_places:
+                    pid = str(p.get("place_id") or "").strip()
+                    if pid and pid in expanded_existing_ids:
+                        continue
+                    city_places.append(p)
+                    if pid:
+                        expanded_existing_ids.add(pid)
+                    if len(city_places) >= max_results_per_city:
+                        break
             city_added = 0
             city_dupes = 0
             for p in city_places:
@@ -1451,6 +1929,7 @@ def run(
                 city_added += 1
                 if len(places) >= max_total_results:
                     break
+            cities_scanned_count += 1
             print(f"  businesses discovered: {city_added}")
             print(f"  duplicates skipped: {city_dupes}")
             discovery_progress = 10 + int((city_idx / total_cities) * 15)
@@ -1459,7 +1938,7 @@ def run(
                 discovery_progress,
                 f"Discovered {len(places)} businesses ({city_idx}/{total_cities} cities scanned)",
                 discovered_count=len(places),
-                cities_scanned=city_idx,
+                cities_scanned=cities_scanned_count,
                 total_cities=total_cities,
             )
             if len(places) >= max_total_results:
@@ -1664,8 +2143,8 @@ def run(
         screenshot_candidate_slugs = [
             c.get("slug")
             for c in deep_candidates
-            if not bool(c.get("no_website")) and float(c.get("opportunity_score") or 0) >= screenshot_score_threshold
-        ][:screenshot_max_per_run]
+            if not bool(c.get("no_website"))
+        ]
         screenshot_candidate_set = {str(s) for s in screenshot_candidate_slugs if s}
 
         def _run_deep(case_slug: str, position: int):
@@ -1675,8 +2154,6 @@ def run(
             capture = str(case_slug or "") in screenshot_candidate_set
             if capture:
                 print(f"  screenshot capture started: {case_slug}")
-            else:
-                print(f"  screenshot skipped for lower-priority lead: {case_slug}")
             deep_case = _build_weak_website_case(
                 place,
                 home_city,
@@ -1772,6 +2249,18 @@ def run(
 
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     location_summary = f"{current_lat:.4f},{current_lng:.4f}" if (current_lat is not None and current_lng is not None) else home_city
+    high_score_opportunities = 0
+    for slug in case_slugs:
+        p = CASES_DIR / f"{slug}.json"
+        if not p.exists():
+            continue
+        try:
+            with open(p, encoding="utf-8") as f:
+                c = json.load(f)
+            if int(c.get("opportunity_score") or 0) >= 80:
+                high_score_opportunities += 1
+        except Exception:
+            continue
     summary = f"Found {len(no_website_slugs)} no-website + {len(weak_website_slugs)} weak-website opportunities near {location_summary}."
     today = {
         "generated_at": generated_at,
@@ -1789,6 +2278,11 @@ def run(
         "processed_count": processed,
         "saved_count": saved,
         "skipped_count": skipped,
+        "cities_scanned": cities_scanned_count,
+        "industries_scanned": len(categories),
+        "businesses_found": len(places),
+        "high_score_opportunities": high_score_opportunities,
+        "leads_created": len(case_slugs),
     }
     with open(TODAY_PATH, "w", encoding="utf-8") as f:
         json.dump(today, f, indent=2)
@@ -1831,6 +2325,11 @@ def _write_empty(summary: str | None = None):
         "no_website_slugs": [],
         "weak_website_slugs": [],
         "top_opportunities": [],
+        "cities_scanned": 0,
+        "industries_scanned": 0,
+        "businesses_found": 0,
+        "high_score_opportunities": 0,
+        "leads_created": 0,
     }
     with open(SCRIPT_DIR / "today.json", "w", encoding="utf-8") as f:
         json.dump(today, f, indent=2)

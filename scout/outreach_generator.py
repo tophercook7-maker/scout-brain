@@ -35,6 +35,38 @@ def _log(logger: Callable[[str], None] | None, message: str) -> None:
         print(message)
 
 
+def _normalize_issue_label(issue: str) -> str:
+    raw = str(issue or "").strip()
+    if not raw:
+        return ""
+    lower = raw.lower()
+    if "mobile" in lower and ("not optimized" in lower or "layout" in lower):
+        return "site not mobile friendly"
+    if "slow" in lower or "load" in lower:
+        return "page load slow"
+    if "call-to-action" in lower or "cta" in lower:
+        return "missing CTA above the fold"
+    if "text-heavy" in lower or "text heavy" in lower or "low text" in lower:
+        return "text heavy homepage"
+    if "booking" in lower or "ordering" in lower:
+        return "no booking or ordering system"
+    if "seo" in lower or "meta" in lower:
+        return "missing SEO title/description"
+    if "outdated" in lower and "wordpress" not in lower:
+        return "outdated visual design"
+    if "navigation" in lower or "menu" in lower or "layout" in lower:
+        return "difficult navigation"
+    if "contact" in lower and ("missing" in lower or "hard" in lower):
+        return "contact information hard to find"
+    if "ssl" in lower or "https" in lower or "http site" in lower:
+        return "broken SSL / http site"
+    if "image" in lower:
+        return "images not optimized"
+    if "website has visible quality issues" in lower or "web presence can be improved" in lower:
+        return ""
+    return raw
+
+
 def generate_outreach_pack(
     case: dict[str, Any],
     *,
@@ -74,8 +106,18 @@ def generate_outreach_pack(
         (case.get("website_analysis") or {}).get("issues")
     )
     audit_issues = _as_list(case.get("audit_issues"))
+    website_audit = case.get("website_audit") if isinstance(case.get("website_audit"), dict) else {}
+    audit_structured_issues = _as_list((website_audit or {}).get("issues"))
+    audit_checks = (website_audit or {}).get("checks") if isinstance((website_audit or {}).get("checks"), dict) else {}
     opportunity_reason = _first(case.get("opportunity_reason"), case.get("main_issue_observed"))
-    issue_pool = list(dict.fromkeys([*( [opportunity_reason] if opportunity_reason else [] ), *strongest_problems, *audit_issues]))
+    issue_pool_raw = list(
+        dict.fromkeys([*([opportunity_reason] if opportunity_reason else []), *audit_structured_issues, *strongest_problems, *audit_issues])
+    )
+    issue_pool: list[str] = []
+    for raw_issue in issue_pool_raw:
+        normalized = _normalize_issue_label(raw_issue)
+        if normalized and normalized not in issue_pool:
+            issue_pool.append(normalized)
 
     issue_fallback = None
     if lane == "no_website":
@@ -140,15 +182,29 @@ def generate_outreach_pack(
     )
 
     issue_hint = _first(main_issue, (issue_pool or [None])[0], "something that might be affecting conversions")
+    screenshot_count = int(
+        sum(
+            1
+            for key in ["desktop_screenshot_url", "mobile_screenshot_url", "contact_page_screenshot_url", "internal_screenshot_url", "screenshot_url"]
+            if _first(case.get(key))
+        )
+    )
+    screenshot_note = (
+        "I captured screenshots while reviewing it."
+        if screenshot_count >= 2
+        else "I grabbed a quick screenshot while reviewing it."
+    )
     issue_line = (
         f"I was looking at your website and noticed: {issue_hint}."
         if issue_hint
         else "I was looking at your website and noticed something that might be affecting conversions."
     )
+    if audit_checks.get("booking_or_ordering_missing") is True and "booking" not in issue_line.lower():
+        issue_line = f"{issue_line} It also looks like online booking/ordering is missing."
     short_email = (
         "Hi,\n\n"
         f"{issue_line}\n\n"
-        "I grabbed a quick screenshot showing it.\n\n"
+        f"{screenshot_note}\n\n"
         "Would you like me to send it over?\n\n"
         "– Topher"
     )

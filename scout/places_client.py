@@ -7,6 +7,8 @@ Backend only.
 import json
 import math
 import os
+import time
+from datetime import datetime, timedelta, timezone
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -160,11 +162,16 @@ def _place_from_new_api(p: dict, center_lat: float, center_lng: float) -> dict:
     }
 
 
-def _extract_review_intelligence(reviews: list[dict] | None) -> tuple[list[str], list[str]]:
+def _extract_review_intelligence(reviews: list[dict] | None) -> tuple[list[str], list[str], dict[str, Any]]:
     snippets: list[str] = []
     themes: dict[str, int] = {}
+    activity = {
+        "reviews_last_30_days": 0,
+        "owner_post_detected": False,
+        "activity_summary": [],
+    }
     if not reviews:
-        return snippets, []
+        return snippets, [], activity
 
     keyword_map = {
         "service": ["service", "staff", "friendly", "rude", "slow"],
@@ -175,6 +182,7 @@ def _extract_review_intelligence(reviews: list[dict] | None) -> tuple[list[str],
         "website_or_ordering": ["website", "online", "order", "booking", "reservation"],
     }
 
+    now_utc = datetime.now(timezone.utc)
     for r in reviews[:5]:
         text = (r.get("text") or {}).get("text") if isinstance(r.get("text"), dict) else r.get("text")
         if not text:
@@ -187,10 +195,26 @@ def _extract_review_intelligence(reviews: list[dict] | None) -> tuple[list[str],
         for theme, keywords in keyword_map.items():
             if any(k in lower for k in keywords):
                 themes[theme] = themes.get(theme, 0) + 1
+        publish_time = str(r.get("publishTime") or "").strip()
+        if publish_time:
+            try:
+                parsed = datetime.fromisoformat(publish_time.replace("Z", "+00:00"))
+                if parsed >= now_utc - timedelta(days=30):
+                    activity["reviews_last_30_days"] = int(activity.get("reviews_last_30_days") or 0) + 1
+            except Exception:
+                pass
+        if r.get("reviewReply"):
+            activity["owner_post_detected"] = True
 
     top_themes = sorted(themes.items(), key=lambda x: x[1], reverse=True)
     themed = [f"{name} ({count})" for name, count in top_themes[:4]]
-    return snippets[:3], themed
+    if int(activity.get("reviews_last_30_days") or 0) > 0:
+        activity["activity_summary"].append(
+            f"{int(activity.get('reviews_last_30_days') or 0)} new reviews this month"
+        )
+    if bool(activity.get("owner_post_detected")):
+        activity["activity_summary"].append("Owner posted update recently")
+    return snippets[:3], themed, activity
 
 
 def place_details_new(place_id: str, center_lat: float, center_lng: float, log: Callable[[str], None] | None = None) -> dict | None:
@@ -211,9 +235,25 @@ def place_details_new(place_id: str, center_lat: float, center_lng: float, log: 
         with urllib.request.urlopen(req, timeout=15) as resp:
             raw = json.loads(resp.read().decode("utf-8"))
         mapped = _place_from_new_api(raw, center_lat, center_lng)
-        snippets, themes = _extract_review_intelligence(raw.get("reviews"))
+        snippets, themes, activity = _extract_review_intelligence(raw.get("reviews"))
         mapped["review_snippets"] = snippets
         mapped["review_themes"] = themes
+        mapped["google_review_count"] = mapped.get("review_count")
+        mapped["reviews_last_30_days"] = int(activity.get("reviews_last_30_days") or 0)
+        mapped["owner_post_detected"] = bool(activity.get("owner_post_detected"))
+        photos = raw.get("photos") or []
+        mapped["new_photos_detected"] = bool(isinstance(photos, list) and len(photos) > 0)
+        mapped["listing_recently_updated"] = bool(
+            mapped.get("reviews_last_30_days")
+            or mapped.get("owner_post_detected")
+            or mapped.get("new_photos_detected")
+        )
+        activity_summary = list(activity.get("activity_summary") or [])
+        if mapped.get("new_photos_detected"):
+            activity_summary.append("New photos detected on listing")
+        if mapped.get("listing_recently_updated"):
+            activity_summary.append("Listing recently updated")
+        mapped["activity_summary"] = list(dict.fromkeys(activity_summary))[:4]
         return mapped
     except Exception as e:
         if log:
@@ -248,34 +288,55 @@ def text_search_new(
     Returns list of place dicts in our internal format.
     """
     radius = min(50000.0, max(1.0, radius_meters))
-    body = {
-        "textQuery": text_query,
-        "locationBias": {
-            "circle": {
-                "center": {"latitude": lat, "longitude": lng},
-                "radius": radius,
-            }
-        },
-        "pageSize": min(20, max(1, max_results)),
-    }
-    data = _places_post(TEXT_SEARCH_URL, body, TEXT_SEARCH_FIELDS, log=log)
-
-    places_raw = data.get("places") or []
+    requested = max(1, min(60, int(max_results or 1)))
     out = []
-    for p in places_raw:
-        pid = p.get("id")
-        if not pid:
-            continue
-        mapped = _place_from_new_api(p, lat, lng)
-        mapped["place_id"] = pid
-        out.append(mapped)
+    next_token = None
+    pages_fetched = 0
+
+    while len(out) < requested:
+        pages_fetched += 1
+        if pages_fetched > 12:
+            break
+        body = {
+            "textQuery": text_query,
+            "locationBias": {
+                "circle": {
+                    "center": {"latitude": lat, "longitude": lng},
+                    "radius": radius,
+                }
+            },
+            "pageSize": min(20, max(1, requested - len(out))),
+        }
+        if next_token:
+            body["pageToken"] = next_token
+
+        data = _places_post(TEXT_SEARCH_URL, body, TEXT_SEARCH_FIELDS, log=log)
+        places_raw = data.get("places") or []
+        if not places_raw:
+            break
+        for p in places_raw:
+            if len(out) >= requested:
+                break
+            pid = p.get("id")
+            if not pid:
+                continue
+            mapped = _place_from_new_api(p, lat, lng)
+            mapped["place_id"] = pid
+            out.append(mapped)
+
+        next_token = data.get("nextPageToken")
+        if not next_token or len(out) >= requested:
+            break
+        # nextPageToken can take a moment to become valid.
+        time.sleep(1.0)
+
     return out
 
 
 def search_places(
     city: str,
     categories: list[str],
-    max_per_category: int = 5,
+    max_per_category: int = 60,
     radius_miles: float | list[float] = 25,
     current_lat: float | None = None,
     current_lng: float | None = None,

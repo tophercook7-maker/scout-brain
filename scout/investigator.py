@@ -295,6 +295,53 @@ def _count_images(html: str) -> int:
     return len(re.findall(r"<img\b", html or "", flags=re.I))
 
 
+def _extract_image_urls(html: str, base_url: str, max_images: int = 10) -> list[str]:
+    urls: list[str] = []
+    for m in re.finditer(r"<img\b[^>]*\bsrc=[\"']([^\"']+)[\"'][^>]*>", html or "", flags=re.I):
+        src = (m.group(1) or "").strip()
+        if not src or src.startswith("data:") or src.startswith("blob:"):
+            continue
+        full = urljoin(base_url, src)
+        if full not in urls:
+            urls.append(full)
+        if len(urls) >= max_images:
+            break
+    return urls
+
+
+def _count_large_images_over_300kb(html: str, base_url: str, timeout: int = 6, max_checks: int = 8) -> int:
+    candidates = _extract_image_urls(html, base_url, max_images=max_checks)
+    large_count = 0
+    for image_url in candidates:
+        size_bytes: int | None = None
+        try:
+            req = urllib.request.Request(
+                image_url,
+                headers={"User-Agent": USER_AGENT},
+                method="HEAD",
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw_len = resp.headers.get("Content-Length")
+                if raw_len is not None:
+                    size_bytes = int(raw_len)
+        except Exception:
+            try:
+                req = urllib.request.Request(
+                    image_url,
+                    headers={"User-Agent": USER_AGENT},
+                    method="GET",
+                )
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    raw_len = resp.headers.get("Content-Length")
+                    if raw_len is not None:
+                        size_bytes = int(raw_len)
+            except Exception:
+                continue
+        if size_bytes is not None and size_bytes > (300 * 1024):
+            large_count += 1
+    return large_count
+
+
 def _count_broken_links_from_html(html: str, base_url: str, timeout: int = 6, max_checks: int = 6) -> int:
     candidates: list[str] = []
     for m in re.finditer(r'href=["\']([^"\']+)["\']', html or "", re.I):
@@ -324,7 +371,27 @@ def auditWebsite(html: str, metadata: dict[str, Any], screenshots: dict[str, str
     Returns category scores (0-100), overall website_score, and audit issues.
     """
     lower = (html or "").lower()
+    debug_log = metadata.get("debug_log")
+    if isinstance(debug_log, list):
+        debug_log.append("website audit started")
     issues: list[str] = []
+    structured_issues: list[dict[str, str]] = []
+
+    def add_issue(label: str, category: str | None = None) -> None:
+        text = str(label or "").strip()
+        if not text:
+            return
+        if text not in issues:
+            issues.append(text)
+        cat = str(category or "").strip()
+        if cat:
+            key = (cat.lower(), text.lower())
+            existing_keys = {
+                (str(i.get("category") or "").strip().lower(), str(i.get("issue") or "").strip().lower())
+                for i in structured_issues
+            }
+            if key not in existing_keys:
+                structured_issues.append({"category": cat, "issue": text})
 
     viewport_ok = metadata.get("viewport_ok") is True
     tap_to_call = metadata.get("tap_to_call_present") is True
@@ -337,7 +404,60 @@ def auditWebsite(html: str, metadata: dict[str, Any], screenshots: dict[str, str
     has_contact_page = bool(metadata.get("contact_page"))
     has_ordering_or_booking = bool(metadata.get("order_link")) or bool(metadata.get("reservation_link"))
     nav_items = metadata.get("navigation_items") or metadata.get("page_navigation_items") or []
-    cta_present = ("book" in lower or "order" in lower or "call now" in lower or "get quote" in lower)
+    cta_patterns = [
+        r"\bbook now\b",
+        r"\bcall now\b",
+        r"\bget quote\b",
+        r"\brequest (?:a )?quote\b",
+        r"\bschedule (?:now|today)\b",
+        r"\bcontact us\b",
+        r"\bstart now\b",
+        r"\bget started\b",
+    ]
+    cta_present = bool(any(re.search(pat, lower) for pat in cta_patterns))
+    homepage_phone_present = bool(metadata.get("homepage_phone_present"))
+    homepage_load_seconds = metadata.get("homepage_load_seconds")
+    missing_meta_title = bool(metadata.get("missing_meta_title"))
+    missing_meta_description = bool(metadata.get("missing_meta_description"))
+    ssl_ok = metadata.get("ssl_ok")
+    image_count = metadata.get("image_count")
+    broken_links_count = int(metadata.get("broken_links_count") or 0)
+    large_images_over_300kb = int(metadata.get("large_images_over_300kb") or 0)
+    contact_link_depth = int(metadata.get("contact_link_depth") or (1 if has_contact_page else 3))
+    h1_count = len(re.findall(r"<h1\b", html or "", flags=re.I))
+    img_without_alt_count = len(
+        re.findall(r"<img\b(?![^>]*\balt=)[^>]*>", html or "", flags=re.I)
+    )
+    inline_style_count = len(re.findall(r"\sstyle\s*=", html or "", flags=re.I))
+    small_text_detected = (
+        bool(metadata.get("text_heavy_clues"))
+        or bool(re.search(r"font-size\\s*:\\s*(?:[0-9]|1[0-1])px", lower))
+    )
+    duplicate_title_signals = bool(re.search(r"<title>\s*([^<]+?)\s*[|\-]\s*\1\s*</title>", html or "", flags=re.I))
+    render_blocking_scripts = len(
+        re.findall(r"<script\b(?![^>]*\b(?:defer|async)\b)[^>]*>", html or "", flags=re.I)
+    )
+    image_optimization_issues = (
+        img_without_alt_count > 0
+        or bool(re.search(r"<img\\b(?![^>]*\\bloading=)[^>]*>", html or "", flags=re.I))
+        or large_images_over_300kb > 0
+    )
+    mobile_pagespeed_score = max(
+        0,
+        min(
+            100,
+            int(
+                round(
+                    100
+                    - (12 if homepage_load_seconds and float(homepage_load_seconds) > 2.5 else 0)
+                    - (20 if homepage_load_seconds and float(homepage_load_seconds) > 4.0 else 0)
+                    - (16 if render_blocking_scripts >= 4 else 0)
+                    - (12 if image_optimization_issues else 0)
+                    - (18 if not viewport_ok else 0)
+                )
+            ),
+        ),
+    )
 
     desktop_shot = bool(screenshots.get("desktop_homepage_path"))
     mobile_shot = bool(screenshots.get("mobile_homepage_path"))
@@ -345,41 +465,87 @@ def auditWebsite(html: str, metadata: dict[str, Any], screenshots: dict[str, str
     mobile_score = 85.0
     if not viewport_ok:
         mobile_score -= 35
-        issues.append("poor mobile layout")
+        add_issue("Missing viewport meta", "Mobile UX")
     if not tap_to_call:
         mobile_score -= 10
+        add_issue("Missing mobile call button", "Conversion")
     if not mobile_shot:
         mobile_score -= 5
+    if small_text_detected:
+        mobile_score -= 10
+        add_issue("Small text detected", "Mobile UX")
 
     design_score = 80.0
     if outdated_design:
         design_score -= 25
-        issues.append("outdated design")
+        add_issue("Outdated layout signals detected", "Site Structure")
     if text_heavy:
         design_score -= 20
-        issues.append("text-heavy homepage")
+        add_issue("Text heavy homepage", "Mobile UX")
     if not desktop_shot:
         design_score -= 5
+    if inline_style_count > 25:
+        design_score -= 10
+        add_issue("Excessive inline styles detected", "Site Structure")
 
     navigation_score = 80.0
     if not menu_visibility:
         navigation_score -= 20
-        issues.append("menu difficult to find")
+        add_issue("Difficult navigation", "Site Structure")
     if len(nav_items) < 3:
         navigation_score -= 15
     if not has_contact_page:
         navigation_score -= 10
+        add_issue("Contact link depth is too high", "Conversion")
 
     conversion_score = 82.0
     if not cta_present:
         conversion_score -= 20
-        issues.append("missing call-to-action")
+        add_issue("Missing call to action above the fold", "Conversion")
+    if not homepage_phone_present:
+        conversion_score -= 8
+        add_issue("Homepage phone number not clearly visible", "Conversion")
     if not contact_form_present and not has_email and not has_phone:
         conversion_score -= 20
-        issues.append("missing contact information")
+        add_issue("Contact information hard to find", "Conversion")
     if not has_ordering_or_booking:
         conversion_score -= 15
-        issues.append("no online ordering/booking")
+        add_issue("No booking or ordering system", "Conversion")
+    if not tap_to_call:
+        conversion_score -= 8
+    if len(re.findall(r"(button|btn|cta)", lower)) >= 6 and re.search(r"(button|btn|cta).{0,24}(button|btn|cta)", lower):
+        add_issue("Buttons too close for mobile taps", "Mobile UX")
+
+    try:
+        if homepage_load_seconds is not None and float(homepage_load_seconds) > 3.0:
+            add_issue("Page load slow", "Mobile Performance")
+    except Exception:
+        pass
+    if missing_meta_title:
+        add_issue("Duplicate or weak page title signals", "SEO")
+    if missing_meta_description:
+        add_issue("Missing meta description", "SEO")
+    if h1_count == 0:
+        add_issue("Missing H1", "SEO")
+    if img_without_alt_count > 0:
+        add_issue("Missing alt tags on images", "SEO")
+    if duplicate_title_signals:
+        add_issue("Duplicate titles detected", "SEO")
+    if ssl_ok is False:
+        add_issue("Broken SSL / HTTP site", "Site Structure")
+    if large_images_over_300kb > 0:
+        add_issue("Images not optimized", "Mobile Performance")
+    try:
+        if image_count is not None and int(image_count) < 3:
+            add_issue("Image optimization issues detected", "Mobile Performance")
+    except Exception:
+        pass
+    if render_blocking_scripts >= 4:
+        add_issue("Render-blocking scripts detected", "Mobile Performance")
+    if broken_links_count > 0:
+        add_issue("Broken links detected", "Site Structure")
+    if mobile_pagespeed_score < 50:
+        add_issue("Mobile PageSpeed score below 50", "Mobile Performance")
 
     mobile_score_i = _clamp_score(mobile_score)
     design_score_i = _clamp_score(design_score)
@@ -390,20 +556,91 @@ def auditWebsite(html: str, metadata: dict[str, Any], screenshots: dict[str, str
     )
 
     deduped_issues = list(dict.fromkeys(issues))
+    website_audit = {
+        "mobile_score": mobile_pagespeed_score,
+        "load_time": homepage_load_seconds,
+        "issues": deduped_issues[:12],
+        "checks": {
+            "mobile_pagespeed_score": mobile_pagespeed_score,
+            "load_time_seconds": homepage_load_seconds,
+            "large_images_detected": bool(large_images_over_300kb > 0),
+            "large_images_over_300kb": large_images_over_300kb,
+            "render_blocking_scripts_detected": bool(render_blocking_scripts >= 4),
+            "missing_meta_description": bool(missing_meta_description),
+            "missing_h1": bool(h1_count == 0),
+            "missing_alt_tags": bool(img_without_alt_count > 0),
+            "duplicate_title_detected": bool(duplicate_title_signals),
+            "missing_call_to_action": bool(not cta_present),
+            "cta_present": bool(cta_present),
+            "homepage_phone_visible": bool(homepage_phone_present),
+            "missing_viewport_meta": bool(not viewport_ok),
+            "small_text_detected": bool(small_text_detected),
+            "buttons_too_close_detected": bool(
+                any(
+                    str(item.get("issue") or "").strip().lower() == "buttons too close for mobile taps"
+                    for item in structured_issues
+                )
+            ),
+            "layout_not_responsive": bool(not viewport_ok or small_text_detected),
+            "booking_or_ordering_missing": bool(not has_ordering_or_booking),
+            "contact_page_present": bool(has_contact_page),
+            "contact_click_depth": int(contact_link_depth),
+            "broken_links_count": int(broken_links_count),
+            "outdated_layout_signals": bool(outdated_design or inline_style_count > 25),
+            "excessive_inline_styles": bool(inline_style_count > 25),
+            # Backward-compatible aliases
+            "homepage_phone_present": bool(homepage_phone_present),
+            "small_text_or_crowded_buttons": bool(
+                small_text_detected
+                or any(
+                    str(item.get("issue") or "").strip().lower() == "buttons too close for mobile taps"
+                    for item in structured_issues
+                )
+            ),
+            "broken_internal_links_count": int(broken_links_count),
+        },
+    }
+    if isinstance(debug_log, list):
+        debug_log.append("website audit completed")
     return {
         "website_score": website_score,
         "mobile_score": mobile_score_i,
         "design_score": design_score_i,
         "navigation_score": navigation_score_i,
         "conversion_score": conversion_score_i,
+        "mobile_pagespeed_score": mobile_pagespeed_score,
+        "load_time": homepage_load_seconds,
+        "image_optimization_issues": bool(image_optimization_issues),
+        "large_images_over_300kb": int(large_images_over_300kb),
+        "render_blocking_scripts": int(render_blocking_scripts),
+        "missing_call_to_action": bool(not cta_present),
+        "homepage_phone_present": bool(homepage_phone_present),
+        "contact_link_depth": int(contact_link_depth),
+        "missing_mobile_call_button": bool(not tap_to_call),
+        "missing_viewport_meta": bool(not viewport_ok),
+        "small_text_detected": bool(small_text_detected),
+        "buttons_too_close": bool(
+            any(
+                str(item.get("issue") or "").strip().lower() == "buttons too close for mobile taps"
+                for item in structured_issues
+            )
+        ),
+        "missing_h1": bool(h1_count == 0),
+        "missing_alt_tags": bool(img_without_alt_count > 0),
+        "duplicate_titles": bool(duplicate_title_signals),
+        "outdated_layout_signals": bool(outdated_design or inline_style_count > 25),
+        "broken_links": bool(broken_links_count > 0),
+        "excessive_inline_styles": bool(inline_style_count > 25),
+        "website_issues": structured_issues,
         "audit_issues": deduped_issues,
         "detected_issues": deduped_issues,
+        "website_audit": website_audit,
     }
 
 
 def _capture_website_screenshots(
     homepage_url: str,
-    internal_url: str | None,
+    contact_url: str | None,
     output_dir: Path,
     timeout: int,
     debug_log: list[str],
@@ -411,13 +648,15 @@ def _capture_website_screenshots(
     screenshots = {
         "desktop_homepage_path": None,
         "mobile_homepage_path": None,
+        "contact_page_path": None,
+        # Backward-compatible alias used in older callsites.
         "internal_page_path": None,
     }
     debug_log.append("screenshot capture started")
     try:
         from playwright.sync_api import sync_playwright
     except Exception as e:
-        debug_log.append(f"screenshot failed: playwright unavailable ({e})")
+        debug_log.append(f"screenshot capture failed: playwright unavailable ({e})")
         return screenshots
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -433,7 +672,7 @@ def _capture_website_screenshots(
             page.goto(homepage_url, wait_until="networkidle", timeout=timeout * 1000)
             page.screenshot(path=str(desktop_path), full_page=True)
             screenshots["desktop_homepage_path"] = str(desktop_path)
-            debug_log.append("screenshot captured: desktop_homepage")
+            debug_log.append("desktop screenshot saved")
             context.close()
 
             mobile_context = browser.new_context(
@@ -448,21 +687,23 @@ def _capture_website_screenshots(
             mobile_page.goto(homepage_url, wait_until="networkidle", timeout=timeout * 1000)
             mobile_page.screenshot(path=str(mobile_path), full_page=True)
             screenshots["mobile_homepage_path"] = str(mobile_path)
-            debug_log.append("screenshot captured: mobile_homepage")
+            debug_log.append("mobile screenshot saved")
             mobile_context.close()
 
-            if internal_url:
+            if contact_url:
                 internal_context = browser.new_context(viewport={"width": 1280, "height": 800})
                 internal_page = internal_context.new_page()
-                internal_page.goto(internal_url, wait_until="networkidle", timeout=timeout * 1000)
+                internal_page.goto(contact_url, wait_until="networkidle", timeout=timeout * 1000)
                 internal_page.screenshot(path=str(internal_path), full_page=True)
+                screenshots["contact_page_path"] = str(internal_path)
                 screenshots["internal_page_path"] = str(internal_path)
-                debug_log.append("screenshot captured: key_internal_page")
+                debug_log.append("contact screenshot saved")
                 internal_context.close()
 
             browser.close()
+        debug_log.append("screenshot capture completed")
     except Exception as e:
-        debug_log.append(f"screenshot failed: {e}")
+        debug_log.append(f"screenshot capture failed: {e}")
 
     return screenshots
 
@@ -518,7 +759,27 @@ def investigate(
             "design_score": None,
             "navigation_score": None,
             "conversion_score": None,
+            "website_issues": [],
             "audit_issues": [],
+            "website_audit": {
+                "mobile_score": None,
+                "load_time": homepage_load_seconds,
+                "issues": ["Website could not be fetched"],
+                "checks": {
+                    "mobile_pagespeed_score": None,
+                    "load_time_seconds": homepage_load_seconds,
+                    "large_images_over_300kb": 0,
+                    "missing_meta_description": None,
+                    "missing_h1": None,
+                    "cta_present": None,
+                    "homepage_phone_present": None,
+                    "missing_viewport_meta": None,
+                    "small_text_or_crowded_buttons": None,
+                    "contact_page_present": None,
+                    "contact_click_depth": None,
+                    "broken_internal_links_count": None,
+                },
+            },
             "homepage_http_status": status,
             "homepage_load_seconds": homepage_load_seconds,
             "missing_meta_title": None,
@@ -561,6 +822,7 @@ def investigate(
     missing_meta_description = not bool((meta or "").strip())
     text_content_length = _estimate_text_content_length(home_html)
     image_count = _count_images(home_html)
+    large_images_over_300kb = _count_large_images_over_300kb(home_html, url, timeout=min(timeout, 8), max_checks=8)
     broken_links_count = _count_broken_links_from_html(home_html, url, timeout=min(timeout, 8))
     platform = home_result["platform"]
     viewport_ok = home_result["viewport_ok"]
@@ -593,6 +855,10 @@ def investigate(
         order_link = home_result["reservation_order"]["order"]
     if "contact" in all_internal:
         contact_page_url = all_internal["contact"]
+    homepage_contact_link_present = bool(
+        re.search(r'href=["\'][^"\']*(contact|contact-us|contactus|get-in-touch)[^"\']*["\']', home_html, flags=re.I)
+    )
+    homepage_phone_present = bool(home_result["phones"])
 
     # Crawl internal pages
     if crawl_internal:
@@ -688,23 +954,18 @@ def investigate(
     deduped_owner_hits.sort(key=lambda h: owner_priority.get(str(h.get("title") or "").lower(), 99))
     selected_owner = deduped_owner_hits[0] if deduped_owner_hits else None
 
-    internal_screenshot_url = None
-    for key in INTERNAL_SCREENSHOT_PRIORITY:
-        if all_internal.get(key):
-            internal_screenshot_url = all_internal.get(key)
-            break
-    if not internal_screenshot_url and discovered_pages:
-        internal_screenshot_url = discovered_pages[0]
+    contact_screenshot_url = contact_page_url
 
     shot_paths = {
         "desktop_homepage_path": None,
         "mobile_homepage_path": None,
+        "contact_page_path": None,
         "internal_page_path": None,
     }
     if screenshot_dir:
         shot_paths = _capture_website_screenshots(
             homepage_url=url,
-            internal_url=internal_screenshot_url,
+            contact_url=contact_screenshot_url,
             output_dir=Path(screenshot_dir),
             timeout=timeout,
             debug_log=debug_log,
@@ -725,6 +986,16 @@ def investigate(
             "order_link": order_link,
             "reservation_link": reservation_link,
             "navigation_items": page_nav_items,
+            "homepage_load_seconds": homepage_load_seconds,
+            "missing_meta_title": missing_meta_title,
+            "missing_meta_description": missing_meta_description,
+            "ssl_ok": ssl_ok,
+            "image_count": image_count,
+            "broken_links_count": broken_links_count,
+            "large_images_over_300kb": large_images_over_300kb,
+            "homepage_phone_present": homepage_phone_present,
+            "contact_link_depth": 1 if homepage_contact_link_present else 2 if contact_page_url else 3,
+            "debug_log": debug_log,
         },
         shot_paths,
     )
@@ -794,16 +1065,20 @@ def investigate(
         "design_score": audit.get("design_score"),
         "navigation_score": audit.get("navigation_score"),
         "conversion_score": audit.get("conversion_score"),
+        "website_issues": audit.get("website_issues") or [],
         "audit_issues": audit.get("audit_issues") or [],
         "detected_issues": audit.get("detected_issues") or [],
+        "website_audit": audit.get("website_audit") or {},
         "homepage_http_status": status,
         "homepage_load_seconds": homepage_load_seconds,
         "missing_meta_title": missing_meta_title,
         "missing_meta_description": missing_meta_description,
         "text_content_length": text_content_length,
         "image_count": image_count,
+        "large_images_over_300kb": large_images_over_300kb,
         "broken_links_count": broken_links_count,
         "desktop_homepage_path": shot_paths.get("desktop_homepage_path"),
         "mobile_homepage_path": shot_paths.get("mobile_homepage_path"),
+        "contact_page_path": shot_paths.get("contact_page_path"),
         "internal_page_path": shot_paths.get("internal_page_path"),
     }
