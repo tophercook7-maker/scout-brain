@@ -3300,7 +3300,7 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
             sb.table("opportunities")
             .select(
                 "id,workspace_id,business_name,category,city,lane,address,phone,website,place_id,"
-                "recommended_contact_method,backup_contact_method,opportunity_score,score,tier,lead_tier,"
+                "recommended_contact_method,backup_contact_method,opportunity_score,tier,lead_tier,"
                 "opportunity_signals,opportunity_reason,status"
             )
             .eq("workspace_id", workspace_id)
@@ -3314,11 +3314,11 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
             sb.table("opportunities")
             .select(
                 "id,workspace_id,business_name,category,city,lane,address,phone,website,place_id,"
-                "recommended_contact_method,backup_contact_method,opportunity_score,score,tier,lead_tier,"
+                "recommended_contact_method,backup_contact_method,opportunity_score,tier,lead_tier,"
                 "opportunity_signals,opportunity_reason,status"
             )
             .eq("workspace_id", workspace_id)
-            .order("score", desc=True)
+            .order("created_at", desc=True)
             .limit(CRM_INTAKE_MAX_CANDIDATES)
             .execute()
             .data
@@ -3373,7 +3373,7 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
     for opp in opportunities:
         stats["evaluated"] += 1
         case = case_by_opp.get(str(opp.get("id"))) or {}
-        score = float(opp.get("opportunity_score") or opp.get("score") or 0)
+        score = float(opp.get("opportunity_score") or 0)
         opp_id = str(opp.get("id") or "").strip()
         business_name = str(opp.get("business_name") or "").strip()
         display_name = business_name or "(missing)"
@@ -3475,7 +3475,7 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
         opp = item["opp"]
         case = item["case"] or {}
         opp_id = str(opp.get("id") or "").strip()
-        score = float(opp.get("opportunity_score") or opp.get("score") or 0)
+        score = float(opp.get("opportunity_score") or 0)
         business_name = str(opp.get("business_name") or "").strip() or "(missing)"
         stats["eligible"] += 1
 
