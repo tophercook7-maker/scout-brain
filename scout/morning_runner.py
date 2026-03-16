@@ -780,6 +780,13 @@ def calculateWebsiteQualityScore(lead: dict) -> dict:
     website_quality_score = 0
 
     website = str(lead.get("website") or "").strip()
+    facebook_url = str(lead.get("facebook_url") or lead.get("facebook") or "").strip()
+    instagram_url = str(lead.get("instagram_url") or lead.get("instagram") or "").strip()
+    contact_page = str(lead.get("contact_page") or "").strip()
+    email = str(lead.get("email") or "").strip()
+    phone = str(lead.get("phone") or "").strip()
+    if not facebook_url:
+        print("facebook_url missing, continuing without social link")
     has_website = bool(website) and not bool(lead.get("no_website"))
     fetch_ok = lead.get("fetch_ok")
     ssl_ok = lead.get("ssl_ok")
@@ -796,11 +803,13 @@ def calculateWebsiteQualityScore(lead: dict) -> dict:
     platform_used = str(lead.get("platform_used") or "").strip().lower()
     category = _normalize_industry(lead.get("category") or lead.get("industry") or "")
     has_contact_path = bool(
-        str(lead.get("phone") or "").strip()
-        or str(lead.get("email") or "").strip()
-        or str(lead.get("contact_page") or "").strip()
+        phone
+        or email
+        or contact_page
         or bool(lead.get("tap_to_call_present"))
         or bool(lead.get("contact_form_present"))
+        or facebook_url
+        or instagram_url
     )
 
     facebook_only = bool((has_website and "facebook.com" in website.lower()) or ((not has_website) and facebook_url))
@@ -812,7 +821,7 @@ def calculateWebsiteQualityScore(lead: dict) -> dict:
     missing_seo_basics = missing_meta_title or missing_meta_description
     poor_seo = missing_seo_basics or broken_links_count > 0 or bool(text_content_length is not None and text_content_length < 300)
     missing_contact = not has_contact_path
-    contact_page_missing = not bool(str(lead.get("contact_page") or "").strip()) and not bool(lead.get("contact_form_present"))
+    contact_page_missing = not bool(contact_page) and not bool(lead.get("contact_form_present"))
     outdated_cms = any(token in platform_used for token in ["weebly", "editmysite", "joomla", "drupal 7", "magento 1"])
     outdated_design = bool(lead.get("outdated_design_clues"))
     outdated_wordpress_theme = bool("wordpress" in platform_used and outdated_design)
