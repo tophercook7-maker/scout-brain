@@ -39,24 +39,20 @@ CHAIN_CLUES = ["mcdonald", "starbucks", "subway", "dunkin", "walmart", "target",
 # Template-like prefixes from mock data; skip these (not real Places results)
 WEAK_NAME_PREFIXES = ("family ", "main street ", "local ", "downtown ")
 DEFAULT_TARGET_INDUSTRIES = (
-    "restaurant,cafe,dentist,chiropractor,church,plumber,hvac,roofing,landscaping,"
-    "auto repair,salon,gym,lawyer,med spa"
+    "plumber,roofing,hvac,electrician,landscaping,cleaning service,pressure washing,"
+    "auto repair,church,small restaurant"
 )
 DEFAULT_DISCOVERY_CATEGORIES = [
-    "restaurant",
-    "cafe",
-    "dentist",
-    "chiropractor",
-    "church",
+    "small restaurant",
     "plumber",
     "HVAC",
     "roofing",
+    "electrician",
     "landscaping",
+    "cleaning service",
+    "pressure washing",
     "auto repair",
-    "salon",
-    "gym",
-    "lawyer",
-    "med spa",
+    "church",
 ]
 DEFAULT_MULTI_CITY_SEQUENCE = [
     "Hot Springs",
@@ -202,19 +198,31 @@ HIGH_CLOSE_CATEGORIES = {
     "contractors",
 }
 PRIORITY_INDUSTRY_CATEGORIES = {
-    "dentists",
-    "chiropractors",
-    "law firms",
-    "med spa",
-    "contractors",
     "roofing",
     "hvac",
+    "electricians",
     "plumbers",
-    "churches",
-    "restaurants",
-    "gyms",
+    "landscaping",
+    "cleaning services",
+    "pressure washing",
     "auto repair",
     "mechanics",
+    "churches",
+    "restaurants",
+}
+EASY_CLOSE_CATEGORIES = {
+    "plumbers",
+    "roofing",
+    "hvac",
+    "electricians",
+    "landscaping",
+    "cleaning services",
+    "pressure washing",
+    "auto repair",
+    "mechanics",
+    "churches",
+    "restaurants",
+    "cafes",
 }
 
 
@@ -302,6 +310,7 @@ def _normalize_industry(value: str) -> str:
         "electricians": "electricians",
         "roofing contractor": "roofing",
         "roofing contractors": "roofing",
+        "roofer": "roofing",
         "roofing": "roofing",
         "auto repair": "auto repair",
         "mechanic": "mechanics",
@@ -346,6 +355,7 @@ def _normalize_industry(value: str) -> str:
         "large franchises": "large franchises",
         "church": "churches",
         "churches": "churches",
+        "small restaurant": "restaurants",
         "local retail shops": "local retail shops",
         "retail": "local retail shops",
     }
@@ -370,6 +380,40 @@ def _industry_is_high_close_probability(value: str) -> bool:
     if normalized in HIGH_CLOSE_CATEGORIES:
         return True
     return "contractor" in normalized
+
+
+def _is_easy_close_category(value: str) -> bool:
+    normalized = _normalize_industry(value)
+    if not normalized:
+        return False
+    return normalized in EASY_CLOSE_CATEGORIES
+
+
+def _derive_easy_target_reasons(lead: dict, website_quality: dict | None = None) -> list[str]:
+    website_quality = website_quality or {}
+    website = str(lead.get("website") or "").strip()
+    has_website = bool(website) and not bool(lead.get("no_website"))
+    fetch_ok = lead.get("fetch_ok")
+    ssl_ok = lead.get("ssl_ok")
+    viewport_ok = lead.get("viewport_ok")
+    mobile_score = _as_int(lead.get("mobile_score"), 100)
+    contact_page = str(lead.get("contact_page") or "").strip()
+    contact_form_present = bool(lead.get("contact_form_present"))
+    contact_page_present = bool(contact_page or contact_form_present)
+    contact_depth = _as_int(lead.get("contact_link_depth"), 1)
+    website_status = str(website_quality.get("website_status") or lead.get("website_status") or "").strip().lower()
+    reasons: list[str] = []
+    if not has_website:
+        reasons.append("No website found")
+    if has_website and (fetch_ok is False or website_status == "unreachable"):
+        reasons.append("Website unreachable")
+    if has_website and (website.lower().startswith("http://") or ssl_ok is False):
+        reasons.append("Website uses insecure HTTP")
+    if has_website and (not contact_page_present or contact_depth >= 3):
+        reasons.append("Contact page missing")
+    if has_website and (viewport_ok is False or mobile_score < 50):
+        reasons.append("Mobile layout broken")
+    return list(dict.fromkeys(reasons))
 
 
 def _resolve_discovery_categories(config: dict) -> list[str]:
@@ -734,6 +778,7 @@ def calculateWebsiteQualityScore(lead: dict) -> dict:
     missing_seo_basics = missing_meta_title or missing_meta_description
     poor_seo = missing_seo_basics or broken_links_count > 0 or bool(text_content_length is not None and text_content_length < 300)
     missing_contact = not has_contact_path
+    contact_page_missing = not bool(str(lead.get("contact_page") or "").strip()) and not bool(lead.get("contact_form_present"))
     outdated_cms = any(token in platform_used for token in ["weebly", "editmysite", "joomla", "drupal 7", "magento 1"])
     outdated_design = bool(lead.get("outdated_design_clues"))
     outdated_wordpress_theme = bool("wordpress" in platform_used and outdated_design)
@@ -777,29 +822,33 @@ def calculateWebsiteQualityScore(lead: dict) -> dict:
         issues.append("no website present")
         boosts.append("+100 no website")
     if unreachable:
-        website_quality_score += 90
+        website_quality_score += 95
         issues.append("website unreachable")
-        boosts.append("+90 website unreachable")
-    if very_slow:
-        website_quality_score += 40
-        issues.append("page load slow")
-        boosts.append("+40 slow load")
-    if no_mobile:
-        website_quality_score += 40
-        issues.append("site not mobile friendly")
-        boosts.append("+40 mobile issues")
+        boosts.append("+95 website unreachable")
     if no_ssl:
-        website_quality_score += 30
+        website_quality_score += 85
         issues.append("broken SSL / http site")
-        boosts.append("+30 missing HTTPS")
+        boosts.append("+85 missing HTTPS")
+    if contact_page_missing:
+        website_quality_score += 75
+        issues.append("contact page missing")
+        boosts.append("+75 contact page missing")
+    if no_mobile:
+        website_quality_score += 75
+        issues.append("site not mobile friendly")
+        boosts.append("+75 mobile layout broken")
+    if very_slow:
+        website_quality_score += 8
+        issues.append("page load slow")
+        boosts.append("+8 slow load")
     if poor_seo:
-        website_quality_score += 25
+        website_quality_score += 4
         issues.append("missing SEO title/description")
-        boosts.append("+25 poor SEO")
+        boosts.append("+4 poor SEO")
     if missing_contact:
-        website_quality_score += 20
+        website_quality_score += 6
         issues.append("contact information hard to find")
-        boosts.append("+20 missing contact info")
+        boosts.append("+6 missing contact info")
     if missing_online_ordering:
         website_quality_score += 24
         issues.append("no booking or ordering system")
@@ -864,6 +913,7 @@ def calculateWebsiteQualityScore(lead: dict) -> dict:
         "website_issues": issues,
         "website_boost_signals": boosts,
         "missing_contact_info": missing_contact,
+        "contact_page_missing": contact_page_missing,
         "outdated_cms_indicators": outdated_cms or outdated_design,
         "missing_online_ordering": missing_online_ordering,
         "missing_booking_system": missing_booking,
@@ -871,57 +921,21 @@ def calculateWebsiteQualityScore(lead: dict) -> dict:
         "builder_lock_in": builder_lock_in,
         "broken_layout": broken_layout,
     }
+    easy_target_reasons = _derive_easy_target_reasons(lead, result)
+    result["easy_target_reasons"] = easy_target_reasons
+    result["easy_target"] = bool(easy_target_reasons)
     print(
         "website scoring applied: "
-        f"status={website_status}, quality={website_quality_score}, seo={seo_score}"
+        f"status={website_status}, quality={website_quality_score}, seo={seo_score}, easy_target={bool(easy_target_reasons)}"
     )
     return result
 
 
 def _derive_opportunity_reason(website_quality: dict, lead: dict) -> list[str]:
-    reasons: list[str] = []
-    issues = [str(i).strip().lower() for i in (website_quality.get("website_issues") or []) if str(i).strip()]
-    review_count = _as_int(lead.get("review_count"), 0)
-    rating = _as_float(lead.get("rating"), 0.0)
-    reviews_last_30 = _as_int(lead.get("reviews_last_30_days"), 0)
-    recent_review_detected = reviews_last_30 > 0
-    website_exists = bool(str(lead.get("website") or "").strip()) and not bool(lead.get("no_website"))
-    website_score = _as_int(lead.get("website_score"), 100)
-    mobile_performance = _as_int(lead.get("mobile_score"), 100)
-    cta_missing = bool(lead.get("missing_call_to_action"))
-    booking_missing = bool(lead.get("booking_or_ordering_missing")) or bool(website_quality.get("missing_online_ordering"))
-    outdated_design = bool(lead.get("outdated_layout_signals")) or bool(website_quality.get("outdated_cms_indicators"))
-    contact_depth = _as_int(lead.get("contact_link_depth"), 1)
-    category = _normalize_industry(lead.get("category") or lead.get("industry") or "")
-    slow_or_mobile = (
-        any(token in issues for token in ["page load slow", "mobile pagespeed score below 50", "missing viewport meta"])
-        or mobile_performance < 65
-        or website_score < 70
-    )
-    if not website_exists:
-        reasons.append("No website present and immediate redesign opportunity")
-    if slow_or_mobile and cta_missing:
-        reasons.append("Slow mobile performance and no clear CTA")
-    elif booking_missing and outdated_design:
-        reasons.append("Missing online ordering/booking and outdated design")
-    elif booking_missing:
-        reasons.append("Missing online ordering/booking flow")
-    elif slow_or_mobile:
-        reasons.append("Mobile performance and usability issues detected")
-    elif contact_depth >= 3:
-        reasons.append("Contact path is hard to find from homepage")
-    if review_count >= 40 or rating >= 4.3 or recent_review_detected:
-        if slow_or_mobile or cta_missing or booking_missing or outdated_design:
-            reasons.append("Active business with good reviews but weak website")
-        else:
-            reasons.append("Active business with many reviews and growth potential")
-    if category in PRIORITY_INDUSTRY_CATEGORIES or _industry_is_high_close_probability(category):
-        reasons.append("High-value industry with strong website ROI")
-    if reviews_last_30 > 3:
-        reasons.append("Recent review activity suggests strong buying momentum")
-    if not reasons:
-        reasons.append("Clear website conversion opportunity identified")
-    return reasons[:4]
+    easy_reasons = _derive_easy_target_reasons(lead, website_quality)
+    if easy_reasons:
+        return easy_reasons[:3]
+    return ["No immediate breakage detected"]
 
 
 def _derive_close_probability(
@@ -1091,6 +1105,10 @@ def calculateOpportunityScore(lead: dict) -> tuple[int, list[str], str, dict, li
         tier = "low_priority"
     opportunity_reason = _derive_opportunity_reason(website_quality, lead)
     print(f"opportunity_reason generated: {' | '.join(opportunity_reason)}")
+    easy_target_reasons = _derive_easy_target_reasons(lead, website_quality)
+    is_easy_target = bool(easy_target_reasons)
+    website_quality["easy_target"] = is_easy_target
+    website_quality["easy_target_reasons"] = easy_target_reasons
     if activity_summary:
         website_quality["activity_summary"] = list(dict.fromkeys(activity_summary))[:4]
     else:
@@ -1102,6 +1120,18 @@ def calculateOpportunityScore(lead: dict) -> tuple[int, list[str], str, dict, li
     website_quality["new_photos_detected"] = new_photos_detected
     website_quality["listing_recently_updated"] = listing_recently_updated
     close_probability = _derive_close_probability(total, website_quality, lead)
+    if not is_easy_target:
+        total = min(total, 59)
+        close_probability = "low"
+        base_signals.append("downranked: non-easy target")
+    else:
+        total = max(total, 80)
+    if total >= 80:
+        tier = "hot_lead"
+    elif total >= 60:
+        tier = "warm_lead"
+    else:
+        tier = "low_priority"
     print(
         "opportunity score updated: "
         f"base={base_score}, website_issue_score={website_issue_score}, total={total}, "
@@ -1681,6 +1711,19 @@ def _build_weak_website_case(
 
 
 def _deep_priority_rank(case: dict) -> tuple[int, float]:
+    easy_reasons = _derive_easy_target_reasons(case, case.get("website_quality") if isinstance(case.get("website_quality"), dict) else {})
+    if easy_reasons:
+        first = str(easy_reasons[0]).lower()
+        if "no website found" in first:
+            return (0, -float(case.get("opportunity_score") or 0))
+        if "website unreachable" in first:
+            return (1, -float(case.get("opportunity_score") or 0))
+        if "insecure http" in first:
+            return (2, -float(case.get("opportunity_score") or 0))
+        if "contact page missing" in first:
+            return (3, -float(case.get("opportunity_score") or 0))
+        if "mobile layout broken" in first:
+            return (4, -float(case.get("opportunity_score") or 0))
     lane = str(case.get("lane") or "").strip().lower()
     if lane == "no_website" or bool(case.get("no_website")):
         return (0, -float(case.get("opportunity_score") or 0))
@@ -1693,7 +1736,7 @@ def _deep_priority_rank(case: dict) -> tuple[int, float]:
         return (2, -float(case.get("opportunity_score") or 0))
     if outdated:
         return (3, -float(case.get("opportunity_score") or 0))
-    return (4, -float(case.get("opportunity_score") or 0))
+    return (5, -float(case.get("opportunity_score") or 0))
 
 
 def run(
@@ -1981,6 +2024,25 @@ def run(
     if ignore_chains:
         places = [p for p in places if not _is_chain(p.get("name") or "")]
         print(f"  Filtered chains: {len(places)} remaining")
+
+    # Focus on easy-close local service models for now.
+    places = [
+        p for p in places
+        if _is_easy_close_category(p.get("category") or p.get("industry") or "")
+    ]
+    print(f"  Filtered to easy-close categories: {len(places)} remaining")
+    if not places:
+        _write_empty("No businesses matched easy-close category focus.")
+        return
+
+    # Prioritize businesses with visible phone/contact and simple service model.
+    def _place_priority(place: dict) -> tuple[int, int, int]:
+        has_phone = 1 if str(place.get("phone") or "").strip() else 0
+        has_contact_hint = 1 if str(place.get("website") or "").strip() or has_phone else 0
+        simple_service = 1 if _is_easy_close_category(place.get("category") or place.get("industry") or "") else 0
+        return (-has_phone, -has_contact_hint, -simple_service)
+
+    places = sorted(places, key=_place_priority)
 
     no_website = [p for p in places if not (p.get("website") or "").strip()]
     weak_website = [p for p in places if (p.get("website") or "").strip()]

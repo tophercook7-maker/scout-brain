@@ -194,11 +194,23 @@ def generate_outreach_pack(
         if screenshot_count >= 2
         else "I grabbed a quick screenshot while reviewing it."
     )
-    issue_line = (
-        f"I was looking at your website and noticed: {issue_hint}."
-        if issue_hint
-        else "I was looking at your website and noticed something that might be affecting conversions."
-    )
+    reason_text = str(opportunity_reason or issue_hint or "").strip().lower()
+    if "no website found" in reason_text or lane == "no_website":
+        issue_line = "Looks like you may not currently have a website."
+    elif "website unreachable" in reason_text:
+        issue_line = "I tried visiting your website and it may not be loading correctly."
+    elif "insecure http" in reason_text or "broken ssl" in reason_text:
+        issue_line = "I noticed your website may not be fully secure."
+    elif "contact page missing" in reason_text:
+        issue_line = "I noticed your contact page may be missing or hard to find."
+    elif "mobile layout broken" in reason_text:
+        issue_line = "I noticed the mobile layout on your website may be broken."
+    else:
+        issue_line = (
+            f"I was looking at your website and noticed: {issue_hint}."
+            if issue_hint
+            else "I was looking at your website and noticed a simple improvement opportunity."
+        )
     if audit_checks.get("booking_or_ordering_missing") is True and "booking" not in issue_line.lower():
         issue_line = f"{issue_line} It also looks like online booking/ordering is missing."
     short_email = (
