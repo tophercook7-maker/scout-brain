@@ -3300,7 +3300,7 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
             sb.table("opportunities")
             .select(
                 "id,workspace_id,business_name,category,city,lane,address,phone,website,place_id,"
-                "recommended_contact_method,backup_contact_method,opportunity_score,tier,lead_tier,"
+                "recommended_contact_method,backup_contact_method,opportunity_score,"
                 "opportunity_signals,opportunity_reason,status"
             )
             .eq("workspace_id", workspace_id)
@@ -3314,7 +3314,7 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
             sb.table("opportunities")
             .select(
                 "id,workspace_id,business_name,category,city,lane,address,phone,website,place_id,"
-                "recommended_contact_method,backup_contact_method,opportunity_score,tier,lead_tier,"
+                "recommended_contact_method,backup_contact_method,opportunity_score,"
                 "opportunity_signals,opportunity_reason,status"
             )
             .eq("workspace_id", workspace_id)
@@ -3541,7 +3541,11 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
             or str(opp.get("backup_contact_method") or "").strip()
             or "website"
         )
-        tier = str(opp.get("tier") or opp.get("lead_tier") or "").strip() or "low_priority"
+        tier = (
+            "hot_lead" if score >= 80 else
+            "warm_lead" if score >= 60 else
+            "low_priority"
+        )
         issue_list = opp.get("opportunity_signals") if isinstance(opp.get("opportunity_signals"), list) else []
         if not issue_list:
             issue_list = case.get("strongest_problems") if isinstance(case.get("strongest_problems"), list) else []
