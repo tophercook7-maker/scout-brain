@@ -18,6 +18,7 @@ USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) MassiveBrainInvest
 CRAWL_PATHS = [
     "/contact", "/contact-us", "/contactus", "/get-in-touch",
     "/get-a-quote", "/request-quote", "/quote", "/estimate",
+    "/request-service",
     "/about", "/about-us", "/aboutus",
     "/menu", "/our-menu", "/food", "/food-menu", "/menus",
     "/location", "/locations", "/find-us",
@@ -63,6 +64,31 @@ def _extract_emails(html: str) -> list[str]:
         if e and e not in seen and "example" not in e and "sentry" not in e and "wix" not in e:
             seen.add(e)
             out.append(e)
+    # Obfuscated email patterns like "info [at] business [dot] com".
+    for m in re.finditer(
+        r"\b([a-zA-Z0-9._%+-]+)\s*(?:\[|\()?\s*at\s*(?:\]|\))?\s*([a-zA-Z0-9.-]+)\s*(?:\[|\()?\s*dot\s*(?:\]|\))?\s*([a-zA-Z]{2,})\b",
+        html or "",
+        re.I,
+    ):
+        local = str(m.group(1) or "").strip().lower()
+        domain = str(m.group(2) or "").strip().lower().strip(".")
+        tld = str(m.group(3) or "").strip().lower()
+        e = f"{local}@{domain}.{tld}"
+        if e and e not in seen and "example" not in e and "sentry" not in e and "wix" not in e:
+            seen.add(e)
+            out.append(e)
+    for m in re.finditer(
+        r"\b([a-zA-Z0-9._%+-]+)\s+at\s+([a-zA-Z0-9.-]+)\s+dot\s+([a-zA-Z]{2,})\b",
+        html or "",
+        re.I,
+    ):
+        local = str(m.group(1) or "").strip().lower()
+        domain = str(m.group(2) or "").strip().lower().strip(".")
+        tld = str(m.group(3) or "").strip().lower()
+        e = f"{local}@{domain}.{tld}"
+        if e and e not in seen and "example" not in e and "sentry" not in e and "wix" not in e:
+            seen.add(e)
+            out.append(e)
     return out[:10]
 
 
@@ -71,35 +97,41 @@ def _email_quality_rank(email: str) -> tuple[int, int]:
     if not value or "@" not in value:
         return (99, 99)
     local = value.split("@", 1)[0]
-    generic_tokens = [
+    preferred_tokens = [
+        "info",
+        "contact",
+        "office",
+    ]
+    weak_tokens = [
         "noreply",
         "no-reply",
         "donotreply",
         "do-not-reply",
-        "support",
-        "info",
-        "hello",
-        "admin",
-        "contact",
+        "mailer-daemon",
+        "postmaster",
     ]
-    generic_penalty = 1 if any(token in local for token in generic_tokens) else 0
+    preferred_bonus = -1 if any(local.startswith(token) for token in preferred_tokens) else 0
+    weak_penalty = 2 if any(token in local for token in weak_tokens) else 0
+    neutral_penalty = 1 if any(token in local for token in ["support", "admin", "hello"]) else 0
     length_penalty = 1 if len(local) <= 3 else 0
-    return (generic_penalty, length_penalty)
+    return (preferred_bonus + weak_penalty + neutral_penalty, length_penalty)
 
 
 def _preferred_email_source_order(source: str) -> int:
     normalized = str(source or "").strip().lower()
     if normalized == "contact_page":
         return 0
-    if normalized == "footer":
+    if normalized == "header":
         return 1
-    if normalized == "homepage":
+    if normalized == "footer":
         return 2
-    if normalized == "listing":
+    if normalized == "homepage":
         return 3
-    if normalized == "facebook":
+    if normalized == "listing":
         return 4
-    return 5
+    if normalized == "facebook":
+        return 5
+    return 6
 
 
 def _select_primary_email(email_hits: list[tuple[str, str]]) -> tuple[str | None, str]:
@@ -128,6 +160,19 @@ def _extract_footer_mailto_links(html: str) -> list[str]:
                 seen.add(val)
                 footer_emails.append(val)
     return footer_emails[:5]
+
+
+def _extract_header_emails(html: str) -> list[str]:
+    header_emails: list[str] = []
+    seen: set[str] = set()
+    for m in re.finditer(r"<header[^>]*>(.*?)</header>", html or "", flags=re.I | re.S):
+        header_html = m.group(1) or ""
+        for em in _extract_emails(header_html):
+            val = str(em or "").strip().lower()
+            if val and val not in seen:
+                seen.add(val)
+                header_emails.append(val)
+    return header_emails[:5]
 
 
 def _extract_phones(html: str) -> list[str]:
@@ -334,6 +379,7 @@ def _analyze_page(html: str, url: str) -> dict[str, Any]:
     return {
         "emails": _extract_emails(html),
         "footer_emails": _extract_footer_mailto_links(html),
+        "header_emails": _extract_header_emails(html),
         "phones": _extract_phones(html),
         "social": _extract_social(html),
         "internal_links": _extract_internal_links(html, url),
@@ -359,7 +405,13 @@ def _fetch_profile_contact_hints(profile_url: str, timeout: int = 8) -> dict[str
     if not html or status == 0:
         return {"emails": [], "phones": [], "social": {}, "contact_form_url": None}
     page = _analyze_page(html, profile_url)
-    emails = list(dict.fromkeys((page.get("emails") or []) + (page.get("footer_emails") or [])))
+    emails = list(
+        dict.fromkeys(
+            (page.get("emails") or [])
+            + (page.get("footer_emails") or [])
+            + (page.get("header_emails") or [])
+        )
+    )
     return {
         "emails": emails[:10],
         "phones": page.get("phones") or [],
@@ -939,6 +991,9 @@ def investigate(
     for e in home_result["emails"]:
         all_emails.add(e)
         email_hits.append((str(e), "homepage"))
+    for e in home_result.get("header_emails") or []:
+        all_emails.add(e)
+        email_hits.append((str(e), "header"))
     for e in home_result.get("footer_emails") or []:
         all_emails.add(e)
         email_hits.append((str(e), "footer"))
@@ -986,12 +1041,26 @@ def investigate(
                 pr = _analyze_page(html, candidate)
                 source_hint = (
                     "contact_page"
-                    if any(token in candidate.lower() for token in ["/contact", "contact-us", "get-a-quote", "request-quote", "/quote", "/estimate"])
+                    if any(
+                        token in candidate.lower()
+                        for token in [
+                            "/contact",
+                            "contact-us",
+                            "get-a-quote",
+                            "request-quote",
+                            "/quote",
+                            "/estimate",
+                            "request-service",
+                        ]
+                    )
                     else "homepage"
                 )
                 for e in pr["emails"]:
                     all_emails.add(e)
                     email_hits.append((str(e), source_hint))
+                for e in pr.get("header_emails") or []:
+                    all_emails.add(e)
+                    email_hits.append((str(e), "header"))
                 for e in pr.get("footer_emails") or []:
                     all_emails.add(e)
                     email_hits.append((str(e), "footer"))
@@ -1058,6 +1127,17 @@ def investigate(
                 all_phones.add(str(p))
             if not contact_form_url and fb.get("contact_form_url"):
                 contact_form_url = str(fb.get("contact_form_url"))
+            fb_about_candidates = [
+                urljoin(facebook_url.rstrip("/") + "/", "about"),
+                urljoin(facebook_url.rstrip("/") + "/", "about_contact_and_basic_info"),
+            ]
+            for fb_about_url in fb_about_candidates:
+                fb_about = _fetch_profile_contact_hints(fb_about_url, timeout=min(timeout, 8))
+                for e in fb_about.get("emails") or []:
+                    all_emails.add(str(e))
+                    email_hits.append((str(e), "facebook"))
+                for p in fb_about.get("phones") or []:
+                    all_phones.add(str(p))
             debug_log.append("facebook page scan completed")
         except Exception as e:
             debug_log.append(f"facebook page scan failed: {e}")

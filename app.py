@@ -4192,24 +4192,34 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
             continue
 
         lead_email_candidate = str(case.get("email") or "").strip()
-        if not lead_email_candidate:
-            stats["filtered_missing_email"] += 1
+        has_contact_available = bool(
+            str(case.get("contact_page") or case.get("contact_form_url") or "").strip()
+            or str(case.get("facebook_url") or case.get("facebook") or "").strip()
+        )
+        if not lead_email_candidate and not has_contact_available:
+            stats["filtered_missing_contact_path"] += 1
             stats["leads_skipped_due_no_email"] += 1
             _append_exclusion(
                 business_name,
                 score,
-                "missing email",
+                "no email and no contact page/form/facebook",
             )
             _append_decision(
                 opp_id,
                 business_name,
                 score,
                 "filtered",
-                "missing email",
+                "no email and no contact page/form/facebook",
             )
             continue
 
-        candidates.append({"opp": opp, "case": case})
+        candidates.append(
+            {
+                "opp": opp,
+                "case": case,
+                "lead_tier": "actionable_email" if lead_email_candidate else "contact_available",
+            }
+        )
 
     candidates.sort(
         key=lambda item: (
@@ -4221,6 +4231,7 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
     for item in candidates:
         opp = item["opp"]
         case = item["case"] or {}
+        lead_tier = str(item.get("lead_tier") or "").strip() or "contact_available"
         opp_id = str(opp.get("id") or "").strip()
         score = float(opp.get("opportunity_score") or 0)
         business_name = str(opp.get("business_name") or "").strip() or "(missing)"
@@ -4310,6 +4321,8 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
         )
         opportunity_reason = str(opp.get("opportunity_reason") or "").strip()
         actionable_email_ready = bool(business_name and workspace_id and lead_email)
+        if not actionable_email_ready:
+            lead_bucket = "Needs Review"
         issue_list = opp.get("opportunity_signals") if isinstance(opp.get("opportunity_signals"), list) else []
         if not issue_list:
             issue_list = case.get("strongest_problems") if isinstance(case.get("strongest_problems"), list) else []
@@ -4343,6 +4356,7 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
                 f"Issues: {issues_summary}. "
                 f"Reason: {opportunity_reason or issues_summary}. "
                 f"email_source: {lead_email_source}. "
+                f"lead_tier: {lead_tier}. "
                 f"actionable_email_ready: {'yes' if actionable_email_ready else 'no'}."
             ),
         }
@@ -4364,6 +4378,9 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
             if has_email:
                 stats["leads_with_email"] += 1
                 stats["actionable_email_leads_created"] += 1
+            elif has_contact_page or has_facebook:
+                # Tier 2 leads are intentionally kept for contact-page/social workflows.
+                pass
             if has_phone:
                 stats["leads_with_phone"] += 1
             if has_contact_page:
