@@ -1134,20 +1134,25 @@ def _derive_lead_assessment(case: dict) -> dict:
     else:
         best_pitch = "Your business has strong reviews but the website may be holding you back."
 
-    if str(case.get("email") or "").strip():
+    has_email = bool(str(case.get("email") or "").strip())
+    has_contact_page = bool(str(case.get("contact_page") or case.get("contact_form_url") or "").strip())
+    has_phone = bool(str(case.get("phone_from_site") or case.get("phone") or "").strip())
+    has_facebook = bool(str(case.get("facebook_url") or case.get("facebook") or "").strip())
+    has_contact_path = bool(has_email or has_contact_page or has_phone or has_facebook)
+    if has_email:
         best_contact_method = "email"
-    elif str(case.get("contact_page") or case.get("contact_form_url") or "").strip():
+    elif has_contact_page:
         best_contact_method = "contact_page"
-    elif str(case.get("phone_from_site") or case.get("phone") or "").strip():
+    elif has_phone:
         best_contact_method = "phone"
-    elif str(case.get("facebook_url") or case.get("facebook") or "").strip():
+    elif has_facebook:
         best_contact_method = "facebook"
     else:
-        best_contact_method = "facebook" if str(case.get("facebook_url") or case.get("facebook") or "").strip() else "contact_page"
+        best_contact_method = "none"
 
     if lead_type == "Low Priority":
         recommended_next_action = "Skip For Now"
-    elif not bool(str(case.get("email") or case.get("phone_from_site") or case.get("phone") or case.get("contact_page") or case.get("contact_form_url") or "").strip()):
+    elif not has_contact_path:
         recommended_next_action = "Review Website"
     elif str(case.get("status") or "new").strip().lower() in {"new", "new_lead"}:
         recommended_next_action = "Send First Touch"
@@ -1159,6 +1164,7 @@ def _derive_lead_assessment(case: dict) -> dict:
         "lead_type": lead_type,
         "close_probability": close_probability,
         "best_contact_method": best_contact_method,
+        "has_contact_path": has_contact_path,
         "best_pitch_angle": best_pitch,
         "recommended_next_action": recommended_next_action,
     }
@@ -1530,6 +1536,7 @@ def _build_no_website_case(place: dict, home_city: str, categories: list, index:
     case["lead_type"] = lead_assessment.get("lead_type")
     case["close_probability"] = lead_assessment.get("close_probability")
     case["best_contact_method"] = lead_assessment.get("best_contact_method")
+    case["has_contact_path"] = bool(lead_assessment.get("has_contact_path"))
     case["best_pitch_angle"] = lead_assessment.get("best_pitch_angle")
     case["recommended_next_action"] = lead_assessment.get("recommended_next_action")
     case["contact_matrix"] = {
@@ -1670,6 +1677,7 @@ def _build_weak_website_case(
             case["lead_type"] = lead_assessment.get("lead_type")
             case["close_probability"] = lead_assessment.get("close_probability")
             case["best_contact_method"] = lead_assessment.get("best_contact_method")
+            case["has_contact_path"] = bool(lead_assessment.get("has_contact_path"))
             case["best_pitch_angle"] = lead_assessment.get("best_pitch_angle")
             case["recommended_next_action"] = lead_assessment.get("recommended_next_action")
             base_signals = generateOpportunitySignals(case)
@@ -1717,6 +1725,7 @@ def _build_weak_website_case(
             case["lead_type"] = lead_assessment.get("lead_type")
             case["close_probability"] = lead_assessment.get("close_probability")
             case["best_contact_method"] = lead_assessment.get("best_contact_method")
+            case["has_contact_path"] = bool(lead_assessment.get("has_contact_path"))
             case["best_pitch_angle"] = lead_assessment.get("best_pitch_angle")
             case["recommended_next_action"] = lead_assessment.get("recommended_next_action")
             base_signals = generateOpportunitySignals(case)
@@ -1903,6 +1912,7 @@ def _build_weak_website_case(
     case["lead_type"] = lead_assessment.get("lead_type")
     case["close_probability"] = lead_assessment.get("close_probability")
     case["best_contact_method"] = lead_assessment.get("best_contact_method")
+    case["has_contact_path"] = bool(lead_assessment.get("has_contact_path"))
     case["best_pitch_angle"] = lead_assessment.get("best_pitch_angle")
     case["recommended_next_action"] = lead_assessment.get("recommended_next_action")
     base_signals = generateOpportunitySignals(case)

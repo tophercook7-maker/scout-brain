@@ -1909,6 +1909,11 @@ def _execute_scout_job(
                     "duplicate_by_phone": int((intake_stats or {}).get("duplicate_by_phone") or 0),
                     "duplicate_by_business_name_city": int((intake_stats or {}).get("duplicate_by_business_name_city") or 0),
                     "reason_counts": (intake_stats or {}).get("reason_counts") or {},
+                    "leads_with_email": int((intake_stats or {}).get("leads_with_email") or 0),
+                    "leads_with_phone": int((intake_stats or {}).get("leads_with_phone") or 0),
+                    "leads_with_contact_page": int((intake_stats or {}).get("leads_with_contact_page") or 0),
+                    "leads_with_facebook": int((intake_stats or {}).get("leads_with_facebook") or 0),
+                    "leads_with_no_contact_path": int((intake_stats or {}).get("leads_with_no_contact_path") or 0),
                     "query_error": (intake_stats or {}).get("query_error"),
                     "intake_threshold_used": (intake_stats or {}).get("intake_threshold_used"),
                 }
@@ -3892,6 +3897,11 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
         "insert_attempted": 0,
         "insert_succeeded": 0,
         "insert_failed": 0,
+        "leads_with_email": 0,
+        "leads_with_phone": 0,
+        "leads_with_contact_page": 0,
+        "leads_with_facebook": 0,
+        "leads_with_no_contact_path": 0,
         "sequence_started": 0,
         "sequence_send_failed": 0,
         "sequence_stopped": 0,
@@ -4283,11 +4293,20 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
             )
             continue
 
-        best_contact = (
-            str(opp.get("recommended_contact_method") or "").strip()
-            or str(opp.get("backup_contact_method") or "").strip()
-            or "website"
-        )
+        lead_email = str(case.get("email") or "").strip()
+        lead_phone = str(opp.get("phone") or case.get("phone_from_site") or "").strip()
+        lead_contact_page = str(case.get("contact_page") or case.get("contact_form_url") or "").strip()
+        lead_facebook = str(case.get("facebook_url") or case.get("facebook") or "").strip()
+        if lead_email:
+            best_contact = "email"
+        elif lead_contact_page:
+            best_contact = "contact_page"
+        elif lead_phone:
+            best_contact = "phone"
+        elif lead_facebook:
+            best_contact = "facebook"
+        else:
+            best_contact = "none"
         lead_bucket = (
             "Easy Win" if score >= 90 else
             "High Value" if score >= 75 else
@@ -4306,10 +4325,10 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
             "linked_opportunity_id": opp.get("id"),
             "business_name": business_name,
             "contact_name": None,
-            "email": case.get("email"),
-            "phone": opp.get("phone") or case.get("phone_from_site"),
+            "email": lead_email or None,
+            "phone": lead_phone or None,
             "website": opp.get("website"),
-            "contact_page": case.get("contact_page") or case.get("contact_form_url"),
+            "contact_page": lead_contact_page or None,
             "category": opp.get("category"),
             "industry": opp.get("category"),
             "lead_source": "scout-brain",
@@ -4341,6 +4360,20 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
             stats["insert_succeeded"] += 1
             stats["created"] += 1
             stats["leads_created"] += 1
+            has_email = bool(lead_email)
+            has_phone = bool(lead_phone)
+            has_contact_page = bool(lead_contact_page)
+            has_facebook = bool(lead_facebook)
+            if has_email:
+                stats["leads_with_email"] += 1
+            if has_phone:
+                stats["leads_with_phone"] += 1
+            if has_contact_page:
+                stats["leads_with_contact_page"] += 1
+            if has_facebook:
+                stats["leads_with_facebook"] += 1
+            if not (has_email or has_phone or has_contact_page or has_facebook):
+                stats["leads_with_no_contact_path"] += 1
             print(
                 f"  crm lead created from scout opportunity "
                 f"(opp_id={opp_id or '(missing)'}, mode={insert_result.get('mode')})"
@@ -4459,6 +4492,9 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
         f"sequence_started={stats['sequence_started']}, sequence_send_failed={stats['sequence_send_failed']}, "
         f"sequence_stopped={stats['sequence_stopped']}, "
         f"filtered_low_score={stats['filtered_low_score']}, filtered_missing_contact_path={stats['filtered_missing_contact_path']}, "
+        f"leads_with_email={stats['leads_with_email']}, leads_with_phone={stats['leads_with_phone']}, "
+        f"leads_with_contact_page={stats['leads_with_contact_page']}, leads_with_facebook={stats['leads_with_facebook']}, "
+        f"leads_with_no_contact_path={stats['leads_with_no_contact_path']}, "
         f"filtered_closed_or_dnc={stats['filtered_closed_or_dnc']})"
     )
     _log_write_stage(
@@ -5252,7 +5288,12 @@ def post_crm_intake_backfill(request: Request, body: IntakeBackfillBody | None =
                 f"leads_created={int(stats.get('leads_created') or 0)}, "
                 f"duplicates_skipped={int(stats.get('duplicates_skipped') or 0)}, "
                 f"insert_failed={int(stats.get('insert_failed') or 0)}, "
-                f"filtered_out={int(stats.get('filtered_out') or 0)}."
+                f"filtered_out={int(stats.get('filtered_out') or 0)}, "
+                f"leads_with_email={int(stats.get('leads_with_email') or 0)}, "
+                f"leads_with_phone={int(stats.get('leads_with_phone') or 0)}, "
+                f"leads_with_contact_page={int(stats.get('leads_with_contact_page') or 0)}, "
+                f"leads_with_facebook={int(stats.get('leads_with_facebook') or 0)}, "
+                f"leads_with_no_contact_path={int(stats.get('leads_with_no_contact_path') or 0)}."
             ),
         }
     except HTTPException:

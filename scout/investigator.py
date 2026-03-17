@@ -17,6 +17,7 @@ USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) MassiveBrainInvest
 # Paths to probe for contact, menu, staff, etc.
 CRAWL_PATHS = [
     "/contact", "/contact-us", "/contactus", "/get-in-touch",
+    "/get-a-quote", "/request-quote", "/quote", "/estimate",
     "/about", "/about-us", "/aboutus",
     "/menu", "/our-menu", "/food", "/food-menu", "/menus",
     "/location", "/locations", "/find-us",
@@ -143,7 +144,7 @@ def _extract_contact_form_url(html: str, base: str) -> str | None:
             continue
         full = urljoin(base, href)
         lower = full.lower()
-        if any(k in lower for k in ["/contact", "contact-us", "get-in-touch", "/support"]):
+        if any(k in lower for k in ["/contact", "contact-us", "get-in-touch", "/support", "/quote", "request-quote", "get-a-quote", "/estimate", "/about"]):
             return full
     return None
 
@@ -225,7 +226,7 @@ def _extract_internal_links(html: str, base: str) -> dict[str, str]:
     path_hints = {
         "menu": ["menu", "our-menu", "food", "food-menu"],
         "about": ["about", "about-us"],
-        "contact": ["contact", "contact-us", "get-in-touch"],
+        "contact": ["contact", "contact-us", "get-in-touch", "quote", "request-quote", "get-a-quote", "estimate"],
         "order": ["order", "order-online", "shop"],
         "reservations": ["reservations", "book", "reserve"],
         "events": ["events", "calendar"],
@@ -907,6 +908,11 @@ def investigate(
         order_link = home_result["reservation_order"]["order"]
     if "contact" in all_internal:
         contact_page_url = all_internal["contact"]
+    if not contact_page_url:
+        for key in ["about", "location"]:
+            if all_internal.get(key):
+                contact_page_url = all_internal[key]
+                break
     contact_form_url = home_result.get("contact_form_url") or None
     homepage_contact_link_present = bool(
         re.search(r'href=["\'][^"\']*(contact|contact-us|contactus|get-in-touch)[^"\']*["\']', home_html, flags=re.I)
