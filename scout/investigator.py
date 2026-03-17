@@ -1092,8 +1092,30 @@ def investigate(
     )
     issues_for_pitch = list(dict.fromkeys((audit.get("audit_issues") or []) + problems))
 
-    best_contact = "email" if all_emails else "contact_page" if (contact_page_url or contact_form_url) else "phone" if all_phones else "social" if all_social else "unknown"
-    backup_contact = "contact_page" if all_emails and (contact_page_url or contact_form_url) else "phone" if all_emails and all_phones else "phone" if (contact_page_url or contact_form_url) and all_phones else None
+    best_contact = (
+        "email"
+        if all_emails
+        else "contact_page"
+        if (contact_page_url or contact_form_url)
+        else "phone"
+        if all_phones
+        else "facebook"
+        if all_social.get("facebook")
+        else "facebook"
+        if all_social
+        else "contact_page"
+    )
+    backup_contact = (
+        "contact_page"
+        if all_emails and (contact_page_url or contact_form_url)
+        else "phone"
+        if all_emails and all_phones
+        else "phone"
+        if (contact_page_url or contact_form_url) and all_phones
+        else "facebook"
+        if (contact_page_url or contact_form_url) and all_social.get("facebook")
+        else None
+    )
 
     contact_matrix = {
         "best_contact": best_contact,

@@ -2111,9 +2111,12 @@ def getTopOpportunities(workspace_id: str | None):
             )[:5]
             leads = [
                 {
+                    "id": r.get("id"),
                     "business_name": r.get("business_name"),
                     "category": r.get("category"),
+                    "website": r.get("website"),
                     "distance": r.get("distance_miles"),
+                    "opportunity_score": r.get("opportunity_score") if r.get("opportunity_score") is not None else r.get("internal_score"),
                     "score": r.get("opportunity_score") if r.get("opportunity_score") is not None else r.get("internal_score"),
                     "lead_bucket": (
                         r.get("lead_bucket")
@@ -2125,10 +2128,15 @@ def getTopOpportunities(workspace_id: str | None):
                     ),
                     "rating": r.get("rating"),
                     "review_count": r.get("review_count"),
-                    "lead_tier": r.get("tier") or r.get("lead_tier"),
                     "city": r.get("city") or r.get("address"),
                     "lane": "no_website" if r.get("no_website") else (r.get("lane") or "weak_website"),
-                    "best_contact_method": r.get("recommended_contact_method") or r.get("backup_contact_method"),
+                    "best_contact_method": (
+                        r.get("best_contact_method")
+                        or r.get("recommended_contact_method")
+                        or r.get("backup_contact_method")
+                    ),
+                    "best_pitch_angle": r.get("best_pitch_angle"),
+                    "recommended_next_action": r.get("recommended_next_action"),
                     "opportunity_signals": r.get("opportunity_signals") or [],
                     "opportunity_reason": r.get("opportunity_reason"),
                     "close_probability": r.get("close_probability"),
@@ -2159,9 +2167,12 @@ def getTopOpportunities(workspace_id: str | None):
         )[:5]
         leads = [
             {
+                "id": r.get("id"),
                 "business_name": r.get("business_name"),
                 "category": r.get("category"),
+                "website": r.get("website"),
                 "distance": r.get("distance_miles"),
+                "opportunity_score": r.get("opportunity_score") if r.get("opportunity_score") is not None else r.get("internal_score"),
                 "score": r.get("opportunity_score") if r.get("opportunity_score") is not None else r.get("internal_score"),
                 "lead_bucket": (
                     r.get("lead_bucket")
@@ -2173,10 +2184,15 @@ def getTopOpportunities(workspace_id: str | None):
                 ),
                 "rating": r.get("rating"),
                 "review_count": r.get("review_count"),
-                "lead_tier": r.get("tier") or r.get("lead_tier"),
                 "city": r.get("city") or r.get("address"),
                 "lane": "no_website" if r.get("no_website") else (r.get("lane") or "weak_website"),
-                "best_contact_method": r.get("recommended_contact_method") or r.get("backup_contact_method"),
+                "best_contact_method": (
+                    r.get("best_contact_method")
+                    or r.get("recommended_contact_method")
+                    or r.get("backup_contact_method")
+                ),
+                "best_pitch_angle": r.get("best_pitch_angle"),
+                "recommended_next_action": r.get("recommended_next_action"),
                 "website_status": r.get("website_status"),
                 "website_speed": r.get("website_speed"),
                 "mobile_ready": r.get("mobile_ready"),
@@ -4209,15 +4225,17 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
             or str(opp.get("backup_contact_method") or "").strip()
             or "website"
         )
-        tier = (
-            "hot_lead" if score >= 80 else
-            "warm_lead" if score >= 60 else
-            "low_priority"
+        lead_bucket = (
+            "Easy Win" if score >= 90 else
+            "High Value" if score >= 75 else
+            "Good Prospect" if score >= 60 else
+            "Needs Review" if score >= 40 else
+            "Low Priority"
         )
         issue_list = opp.get("opportunity_signals") if isinstance(opp.get("opportunity_signals"), list) else []
         if not issue_list:
             issue_list = case.get("strongest_problems") if isinstance(case.get("strongest_problems"), list) else []
-        issues_summary = ", ".join([str(i).strip() for i in issue_list if str(i).strip()][:3]) or "No specific website issue captured yet"
+        issues_summary = ", ".join([str(i).strip() for i in issue_list if str(i).strip()][:3]) or "Contact info is hard to find"
         opportunity_reason = str(opp.get("opportunity_reason") or "").strip()
         if not business_name:
             stats["filtered_missing_business_name"] += 1
@@ -4257,7 +4275,7 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
             "sequence_step": 1,
             "next_follow_up_at": datetime.now(timezone.utc).isoformat() if AUTO_SEQUENCE_SEND_STEP1 else None,
             "notes": (
-                f"Auto-added from Scout-Brain (lane: {opp.get('lane') or 'unknown'}, tier: {tier}, close_probability: {opp.get('close_probability') or 'medium'}). "
+                f"Auto-added from Scout-Brain (lane: {opp.get('lane') or 'unknown'}, lead_bucket: {lead_bucket}, close_probability: {opp.get('close_probability') or 'medium'}). "
                 f"Issues: {issues_summary}. "
                 f"Reason: {opportunity_reason or issues_summary}."
             ),

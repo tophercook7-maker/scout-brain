@@ -1143,12 +1143,12 @@ def _derive_lead_assessment(case: dict) -> dict:
     elif str(case.get("facebook_url") or case.get("facebook") or "").strip():
         best_contact_method = "facebook"
     else:
-        best_contact_method = "phone"
+        best_contact_method = "facebook" if str(case.get("facebook_url") or case.get("facebook") or "").strip() else "contact_page"
 
     if lead_type == "Low Priority":
         recommended_next_action = "Skip For Now"
-    elif not bool(str(case.get("email") or case.get("phone_from_site") or case.get("phone") or case.get("contact_page") or "").strip()):
-        recommended_next_action = "Review Site Manually"
+    elif not bool(str(case.get("email") or case.get("phone_from_site") or case.get("phone") or case.get("contact_page") or case.get("contact_form_url") or "").strip()):
+        recommended_next_action = "Review Website"
     elif str(case.get("status") or "new").strip().lower() in {"new", "new_lead"}:
         recommended_next_action = "Send First Touch"
     else:
