@@ -5785,6 +5785,27 @@ def post_outreach_generate_email(request: Request, body: OutreachGenerateEmailBo
                 .limit(1)
                 .execute()
             ),
+            lambda: (
+                sb.table("opportunities")
+                .select(
+                    "id,business_name,category,city,address,website,opportunity_score,website_status,"
+                    "website_speed,mobile_ready,seo_score,website_quality_score,lead_bucket,close_probability"
+                )
+                .eq("id", linked_opportunity_id)
+                .eq("workspace_id", workspace_id)
+                .limit(1)
+                .execute()
+            ),
+            lambda: (
+                sb.table("opportunities")
+                .select(
+                    "id,business_name,category,city,address,website,opportunity_score,website_status,"
+                    "website_speed,mobile_ready,seo_score,website_quality_score,lead_bucket,close_probability"
+                )
+                .eq("id", linked_opportunity_id)
+                .limit(1)
+                .execute()
+            ),
         ]
         for q in opp_queries:
             try:
