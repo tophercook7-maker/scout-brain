@@ -1020,10 +1020,36 @@ def calculateWebsiteQualityScore(lead: dict) -> dict:
 
 
 def _derive_opportunity_reason(website_quality: dict, lead: dict) -> list[str]:
+    reasons: list[str] = []
+    website_status = str(
+        website_quality.get("website_status") or lead.get("website_status") or ""
+    ).strip().lower()
+    audit_issues = website_quality.get("audit_issues") or lead.get("audit_issues") or []
+    if isinstance(audit_issues, list):
+        for issue in audit_issues:
+            text = str(issue or "").strip()
+            if text and text not in reasons:
+                reasons.append(text)
+            if len(reasons) >= 3:
+                break
+    if website_status == "no_website":
+        return ["No website found for this business"]
+    if website_status == "broken_website":
+        return ["Website does not load reliably for customers"]
+    if website_status == "outdated_website":
+        return ["Website design looks outdated and may hurt trust"]
+    if website_status == "missing_contact_page":
+        return ["Contact information is hard to find on the website"]
+    if website_status == "mobile_layout_issue":
+        return ["Website is not mobile-friendly"]
+    if website_status == "http_only":
+        return ["Website uses insecure HTTP instead of HTTPS"]
     easy_reasons = _derive_easy_target_reasons(lead, website_quality)
     if easy_reasons:
-        return easy_reasons[:3]
-    return ["No immediate breakage detected"]
+        return [str(v) for v in easy_reasons[:3]]
+    if reasons:
+        return reasons[:3]
+    return ["Website needs improvement to convert visitors into customers"]
 
 
 def _derive_close_probability(
@@ -1141,17 +1167,27 @@ def _derive_lead_assessment(case: dict) -> dict:
     has_contact_path = bool(has_email or has_contact_page or has_phone or has_facebook)
     if has_email:
         best_contact_method = "email"
+    elif has_contact_page:
+        best_contact_method = "contact_page"
+    elif has_phone:
+        best_contact_method = "phone"
+    elif has_facebook:
+        best_contact_method = "facebook"
     else:
         best_contact_method = "none"
 
     if lead_type == "Low Priority":
         recommended_next_action = "Skip For Now"
-    elif not has_email:
-        recommended_next_action = "Research Later"
-    elif str(case.get("status") or "new").strip().lower() in {"new", "new_lead"}:
-        recommended_next_action = "Send First Touch"
-    else:
-        recommended_next_action = "Generate Email"
+    elif not has_contact_path:
+        recommended_next_action = "Save for Door-to-Door"
+    elif has_email:
+        recommended_next_action = "Send First Touch" if str(case.get("status") or "new").strip().lower() in {"new", "new_lead"} else "Generate Email"
+    elif has_contact_page:
+        recommended_next_action = "Open Contact Path"
+    elif has_phone:
+        recommended_next_action = "Text Outreach"
+    elif has_facebook:
+        recommended_next_action = "Open Contact Path"
 
     return {
         "lead_bucket": lead_bucket,

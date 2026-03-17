@@ -4192,32 +4192,25 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
             continue
 
         lead_email_candidate = str(case.get("email") or "").strip()
+        lead_phone_candidate = str(opp.get("phone") or case.get("phone_from_site") or "").strip()
         has_contact_available = bool(
-            str(case.get("contact_page") or case.get("contact_form_url") or "").strip()
+            lead_email_candidate
+            or lead_phone_candidate
+            or str(case.get("contact_page") or case.get("contact_form_url") or "").strip()
             or str(case.get("facebook_url") or case.get("facebook") or "").strip()
         )
-        if not lead_email_candidate and not has_contact_available:
-            stats["filtered_missing_contact_path"] += 1
-            stats["leads_skipped_due_no_email"] += 1
-            _append_exclusion(
-                business_name,
-                score,
-                "no email and no contact page/form/facebook",
-            )
-            _append_decision(
-                opp_id,
-                business_name,
-                score,
-                "filtered",
-                "no email and no contact page/form/facebook",
-            )
-            continue
 
         candidates.append(
             {
                 "opp": opp,
                 "case": case,
-                "lead_tier": "actionable_email" if lead_email_candidate else "contact_available",
+                "lead_tier": (
+                    "actionable_email"
+                    if lead_email_candidate
+                    else "contact_available"
+                    if has_contact_available
+                    else "door_to_door_candidate"
+                ),
             }
         )
 
@@ -4320,8 +4313,11 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
             "Low Priority"
         )
         opportunity_reason = str(opp.get("opportunity_reason") or "").strip()
+        has_contact_path = bool(lead_email or lead_contact_page or lead_phone or lead_facebook)
         actionable_email_ready = bool(business_name and workspace_id and lead_email)
-        if not actionable_email_ready:
+        if not has_contact_path:
+            lead_bucket = "Door-to-Door Candidates"
+        elif not actionable_email_ready:
             lead_bucket = "Needs Review"
         issue_list = opp.get("opportunity_signals") if isinstance(opp.get("opportunity_signals"), list) else []
         if not issue_list:
@@ -4344,8 +4340,30 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
             "city": opp.get("city"),
             "place_id": opp.get("place_id"),
             "best_contact_method": best_contact,
+            "has_contact_path": has_contact_path,
             "opportunity_score": score,
             "opportunity_reason": opportunity_reason or issues_summary,
+            "lead_bucket": lead_bucket,
+            "website_status": str(opp.get("website_status") or "").strip() or None,
+            "google_rating": opp.get("google_rating") or opp.get("rating"),
+            "google_review_count": opp.get("review_count"),
+            "recommended_next_action": (
+                "Send First Touch"
+                if lead_email
+                else "Open Contact Path"
+                if (lead_contact_page or lead_facebook)
+                else "Text Outreach"
+                if lead_phone
+                else "Save for Door-to-Door"
+            ),
+            "why_it_matters": (
+                "Customers may have trouble contacting this business online."
+                if not has_contact_path
+                else "Business appears active, but website/contact flow can be improved to capture more customers."
+            ),
+            "best_pitch_angle": (
+                f"I noticed {opportunity_reason or issues_summary.lower()} and can help you get more customer inquiries."
+            ),
             "auto_intake": True,
             "status": "new" if actionable_email_ready else "research_later",
             "sequence_active": bool(actionable_email_ready),
