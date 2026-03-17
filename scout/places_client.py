@@ -44,6 +44,26 @@ def _truthy_env(name: str, default: bool = True) -> bool:
 
 
 GEOCODING_OPTIONAL = _truthy_env("SCOUT_ENABLE_GEOCODING", True)
+PLACES_ENABLED = _truthy_env("SCOUT_ENABLE_PLACES", True)
+PLACES_REDUCED_MODE_MESSAGE = (
+    "Google Places discovery is unavailable because billing is not enabled. "
+    "Scout is running in reduced mode."
+)
+_places_reduced_mode_notice: str | None = None
+
+
+def _set_places_reduced_mode_notice(message: str) -> None:
+    global _places_reduced_mode_notice
+    if not _places_reduced_mode_notice:
+        _places_reduced_mode_notice = str(message or "").strip() or PLACES_REDUCED_MODE_MESSAGE
+
+
+def get_places_reduced_mode_notice(*, clear: bool = False) -> str | None:
+    global _places_reduced_mode_notice
+    notice = _places_reduced_mode_notice
+    if clear:
+        _places_reduced_mode_notice = None
+    return notice
 
 
 def _maps_search_link(name: str | None, address: str | None, city: str | None = None) -> str | None:
@@ -105,8 +125,11 @@ def _places_post(url: str, body: dict, field_mask: str, log: Callable[[str], Non
     """POST request to Places API (New). Uses X-Goog-Api-Key header."""
     key = os.environ.get("GOOGLE_MAPS_API_KEY", "").strip()
     if not key:
+        _set_places_reduced_mode_notice(
+            "Google Places discovery is unavailable because API key is missing. Scout is running in reduced mode."
+        )
         if log:
-            log("GOOGLE_MAPS_API_KEY not set")
+            log("Soft warning: GOOGLE_MAPS_API_KEY not set — running reduced mode without Places discovery")
         return {}
     if log:
         log(f"Calling endpoint: {url}")
@@ -135,6 +158,8 @@ def _places_post(url: str, body: dict, field_mask: str, log: Callable[[str], Non
         except Exception:
             err_msg = body_str
             status = str(e.code)
+        if "PERMISSION_DENIED" in str(status).upper() or "BILLING" in str(err_msg).upper() or "BILLING" in str(status).upper():
+            _set_places_reduced_mode_notice(PLACES_REDUCED_MODE_MESSAGE)
         raise RuntimeError(f"Places API error ({status}): {err_msg}") from e
     except Exception as e:
         if log:
@@ -381,6 +406,14 @@ def search_places(
     Returns place dicts: name, address, phone, website, rating, review_count,
     hours, maps_url, distance_miles, category.
     """
+    if not PLACES_ENABLED:
+        _set_places_reduced_mode_notice(
+            "Google Places discovery disabled by SCOUT_ENABLE_PLACES=false. Scout is running in reduced mode."
+        )
+        if log:
+            log("Soft warning: SCOUT_ENABLE_PLACES=false — skipping Google Places discovery")
+        return []
+
     if current_lat is not None and current_lng is not None:
         lat, lng = float(current_lat), float(current_lng)
         if log:
@@ -427,11 +460,16 @@ def search_places(
                 results = text_search_new(query, lat, lng, radius_m, max_per_category, log=log)
             except RuntimeError as e:
                 err_str = str(e).upper()
-                if "REQUEST_DENIED" in err_str or "LEGACY" in err_str:
-                    raise RuntimeError(
-                        f"Places API REQUEST_DENIED or legacy API. "
-                        f"Enable 'Places API (New)' in your Google Cloud project. Original: {e}"
-                    ) from e
+                if (
+                    "REQUEST_DENIED" in err_str
+                    or "LEGACY" in err_str
+                    or "PERMISSION_DENIED" in err_str
+                    or "BILLING" in err_str
+                    or "FORBIDDEN" in err_str
+                ):
+                    _set_places_reduced_mode_notice(PLACES_REDUCED_MODE_MESSAGE)
+                    _log(f"Soft warning: {PLACES_REDUCED_MODE_MESSAGE}")
+                    return []
                 raise
 
             for r in results:

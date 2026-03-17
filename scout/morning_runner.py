@@ -2076,6 +2076,7 @@ def run(
     progress_callback=None,
     cancel_callback=None,
 ):
+    places_reduced_mode_notice: str | None = None
     def is_cancelled() -> bool:
         if not cancel_callback:
             return False
@@ -2113,6 +2114,16 @@ def run(
         load_dotenv(SCRIPT_DIR / ".env")
         load_dotenv(SCRIPT_DIR.parent / ".env")
     except ImportError:
+        pass
+
+    try:
+        try:
+            from .places_client import get_places_reduced_mode_notice
+        except ImportError:
+            from places_client import get_places_reduced_mode_notice
+        # Clear stale notice from prior runs in the same process.
+        get_places_reduced_mode_notice(clear=True)
+    except Exception:
         pass
 
     config = load_config()
@@ -2397,8 +2408,22 @@ def run(
             f"Scout failed: {str(e)}",
         ) from e
 
+    try:
+        try:
+            from .places_client import get_places_reduced_mode_notice
+        except ImportError:
+            from places_client import get_places_reduced_mode_notice
+        places_reduced_mode_notice = get_places_reduced_mode_notice(clear=False)
+        if places_reduced_mode_notice:
+            print(f"  [Scout] reduced mode: {places_reduced_mode_notice}")
+    except Exception:
+        places_reduced_mode_notice = None
+
     if not places:
-        _write_empty("No businesses from Google Places. Check API key and config.")
+        empty_summary = "No businesses discovered from Places for this run."
+        if places_reduced_mode_notice:
+            empty_summary = f"{places_reduced_mode_notice} {empty_summary}"
+        _write_empty(empty_summary, reduced_mode_notice=places_reduced_mode_notice)
         return
 
     if ignore_chains:
@@ -2777,6 +2802,7 @@ def run(
         "businesses_found": len(places),
         "high_score_opportunities": high_score_opportunities,
         "leads_created": len(case_slugs),
+        "reduced_mode_notice": places_reduced_mode_notice,
     }
     with open(TODAY_PATH, "w", encoding="utf-8") as f:
         json.dump(today, f, indent=2)
@@ -2810,7 +2836,7 @@ def run(
     report_progress("saving_results", 98, "Saving results")
 
 
-def _write_empty(summary: str | None = None):
+def _write_empty(summary: str | None = None, reduced_mode_notice: str | None = None):
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     today = {
         "generated_at": generated_at,
@@ -2824,6 +2850,7 @@ def _write_empty(summary: str | None = None):
         "businesses_found": 0,
         "high_score_opportunities": 0,
         "leads_created": 0,
+        "reduced_mode_notice": reduced_mode_notice or None,
     }
     with open(SCRIPT_DIR / "today.json", "w", encoding="utf-8") as f:
         json.dump(today, f, indent=2)

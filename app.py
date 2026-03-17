@@ -263,6 +263,255 @@ def _load_scout_data():
     return {"today": today, "opportunities": opportunities}
 
 
+def _safe_update_row(sb, table: str, row_id: str, updates: dict) -> bool:
+    clean_updates = {k: v for k, v in (updates or {}).items() if v is not None}
+    if not row_id or not clean_updates:
+        return False
+    try:
+        sb.table(table).update(clean_updates).eq("id", row_id).limit(1).execute()
+        return True
+    except Exception as e:
+        print(f"  [Scout] reduced-mode {table} update skipped ({row_id}): {e}", file=sys.stderr)
+        return False
+
+
+def _run_reduced_mode_enrichment(sb, workspace_id: str, owner_id: str) -> dict:
+    stats = {
+        "google_discovery_used": False,
+        "reduced_mode": True,
+        "stored_records_scanned": 0,
+        "records_enriched": 0,
+        "emails_found": 0,
+        "actionable_email_leads": 0,
+        "contact_available": 0,
+        "door_to_door_candidates": 0,
+        "skipped": 0,
+    }
+    max_records = max(20, min(400, int(os.environ.get("SCOUT_REDUCED_MAX_RECORDS", "120") or "120")))
+    try:
+        from scout.investigator import investigate
+    except Exception:
+        from investigator import investigate  # type: ignore[no-redef]
+    try:
+        from scout.morning_runner import calculateOpportunityScore, generateOpportunitySignals, _derive_lead_assessment
+    except Exception:
+        from morning_runner import calculateOpportunityScore, generateOpportunitySignals, _derive_lead_assessment  # type: ignore[no-redef]
+
+    opp_select = (
+        "id,business_name,category,city,address,website,opportunity_score,opportunity_reason,"
+        "lead_bucket,close_probability,website_status,opportunity_signals,created_at"
+    )
+    try:
+        opp_rows = (
+            sb.table("opportunities")
+            .select(opp_select)
+            .eq("workspace_id", workspace_id)
+            .order("created_at", desc=True)
+            .limit(max_records)
+            .execute()
+            .data
+            or []
+        )
+    except Exception as e:
+        print(f"  [Scout] reduced-mode opportunities load failed: {e}", file=sys.stderr)
+        return {"stats": stats, "opportunities": []}
+
+    opp_ids = [str(r.get("id") or "").strip() for r in opp_rows if str(r.get("id") or "").strip()]
+    case_rows = []
+    if opp_ids:
+        try:
+            case_rows = (
+                sb.table("case_files")
+                .select(
+                    "id,opportunity_id,email,email_source,phone_from_site,contact_page,contact_form_url,facebook,facebook_url,"
+                    "audit_issues,strongest_problems,google_review_count,google_rating,created_at"
+                )
+                .in_("opportunity_id", opp_ids)
+                .order("created_at", desc=True)
+                .limit(max_records * 2)
+                .execute()
+                .data
+                or []
+            )
+        except Exception:
+            try:
+                case_rows = (
+                    sb.table("case_files")
+                    .select(
+                        "id,opportunity_id,email,phone_from_site,contact_page,contact_form_url,facebook,"
+                        "audit_issues,strongest_problems,google_review_count,google_rating,created_at"
+                    )
+                    .in_("opportunity_id", opp_ids)
+                    .order("created_at", desc=True)
+                    .limit(max_records * 2)
+                    .execute()
+                    .data
+                    or []
+                )
+            except Exception as e:
+                print(f"  [Scout] reduced-mode case_files load failed: {e}", file=sys.stderr)
+                case_rows = []
+
+    latest_case_by_opp: dict[str, dict] = {}
+    for row in case_rows:
+        opp_id = str(row.get("opportunity_id") or "").strip()
+        if not opp_id or opp_id in latest_case_by_opp:
+            continue
+        latest_case_by_opp[opp_id] = row
+
+    reduced_opportunities: list[dict] = []
+    for opp in opp_rows:
+        stats["stored_records_scanned"] += 1
+        opp_id = str(opp.get("id") or "").strip()
+        business_name = str(opp.get("business_name") or "").strip()
+        website = str(opp.get("website") or "").strip()
+        category = str(opp.get("category") or "").strip()
+        city = str(opp.get("city") or "").strip()
+        address = str(opp.get("address") or "").strip()
+        case = latest_case_by_opp.get(opp_id) or {}
+
+        email = str(case.get("email") or "").strip().lower()
+        phone = str(case.get("phone_from_site") or "").strip()
+        contact_page = str(case.get("contact_page") or case.get("contact_form_url") or "").strip()
+        facebook_url = str(case.get("facebook_url") or case.get("facebook") or "").strip()
+        email_source = str(case.get("email_source") or "unknown").strip().lower() or "unknown"
+        review_count = int(case.get("google_review_count") or 0)
+        rating = case.get("google_rating")
+        audit_issues = case.get("audit_issues") if isinstance(case.get("audit_issues"), list) else []
+        strongest = case.get("strongest_problems") if isinstance(case.get("strongest_problems"), list) else []
+        website_status = str(opp.get("website_status") or "").strip()
+        opportunity_reason = str(opp.get("opportunity_reason") or "").strip()
+
+        needs_enrichment = bool(
+            website
+            and (not email and not contact_page and not phone and not facebook_url)
+        ) or not website_status or not opportunity_reason
+        if needs_enrichment and website:
+            try:
+                inv = investigate(
+                    website,
+                    crawl_internal=True,
+                    timeout=8,
+                    screenshot_dir=None,
+                    google_profile_url=None,
+                )
+                stats["records_enriched"] += 1
+                inv_email = str(((inv.get("emails") or [None])[0] or "")).strip().lower()
+                inv_phone = str(((inv.get("phones") or [None])[0] or "")).strip()
+                inv_contact = str(inv.get("contact_page") or inv.get("contact_form_url") or "").strip()
+                inv_facebook = str((inv.get("social") or {}).get("facebook") or "").strip()
+                inv_source = str(inv.get("email_source") or "unknown").strip().lower() or "unknown"
+                if inv_email and not email:
+                    email = inv_email
+                    email_source = inv_source
+                if inv_phone and not phone:
+                    phone = inv_phone
+                if inv_contact and not contact_page:
+                    contact_page = inv_contact
+                if inv_facebook and not facebook_url:
+                    facebook_url = inv_facebook
+                inv_audit = inv.get("audit_issues") if isinstance(inv.get("audit_issues"), list) else []
+                inv_strongest = inv.get("strongest_problems") if isinstance(inv.get("strongest_problems"), list) else []
+                if inv_audit:
+                    audit_issues = [str(v or "").strip() for v in inv_audit if str(v or "").strip()][:8]
+                if inv_strongest:
+                    strongest = [str(v or "").strip() for v in inv_strongest if str(v or "").strip()][:8]
+                seed = {
+                    "business_name": business_name,
+                    "category": category,
+                    "city": city,
+                    "address": address,
+                    "website": website,
+                    "email": email or None,
+                    "phone": phone or None,
+                    "contact_page": contact_page or None,
+                    "facebook_url": facebook_url or None,
+                    "review_count": review_count,
+                    "rating": rating,
+                    "audit_issues": audit_issues,
+                    "strongest_problems": strongest,
+                    "website_score": inv.get("website_score"),
+                    "mobile_score": inv.get("mobile_score"),
+                    "design_score": inv.get("design_score"),
+                    "navigation_score": inv.get("navigation_score"),
+                    "conversion_score": inv.get("conversion_score"),
+                }
+                score, score_signals, _tier, website_quality, reasons, close_probability = calculateOpportunityScore(seed)
+                website_status = str(website_quality.get("website_status") or website_status or "").strip()
+                if not opportunity_reason:
+                    reason_list = reasons if isinstance(reasons, list) else []
+                    opportunity_reason = str((reason_list[0] if reason_list else "") or "").strip()
+                lead_assessment = _derive_lead_assessment(
+                    {
+                        **seed,
+                        "website_status": website_status,
+                        "opportunity_score": score,
+                        "opportunity_reason": opportunity_reason,
+                    }
+                )
+                opp_updates = {
+                    "website_status": website_status or None,
+                    "opportunity_reason": opportunity_reason or None,
+                    "opportunity_score": score if score else None,
+                    "close_probability": close_probability or None,
+                    "lead_bucket": lead_assessment.get("lead_bucket"),
+                    "opportunity_signals": list(dict.fromkeys(generateOpportunitySignals({**seed, "opportunity_score": score}) + (score_signals or [])))[:10],
+                }
+                _safe_update_row(sb, "opportunities", opp_id, opp_updates)
+                if str(case.get("id") or "").strip():
+                    _safe_update_row(
+                        sb,
+                        "case_files",
+                        str(case.get("id") or "").strip(),
+                        {
+                            "email": email or None,
+                            "email_source": email_source or "unknown",
+                            "phone_from_site": phone or None,
+                            "contact_page": contact_page or None,
+                            "facebook_url": facebook_url or None,
+                            "facebook": facebook_url or None,
+                            "audit_issues": audit_issues or None,
+                            "strongest_problems": strongest or None,
+                        },
+                    )
+            except Exception as e:
+                stats["skipped"] += 1
+                print(f"  [Scout] reduced-mode enrich skipped for {business_name or opp_id}: {e}", file=sys.stderr)
+
+        has_email = bool(email)
+        has_contact_available = bool(contact_page or facebook_url or phone)
+        if has_email:
+            stats["emails_found"] += 1
+            stats["actionable_email_leads"] += 1
+        elif has_contact_available:
+            stats["contact_available"] += 1
+        else:
+            stats["door_to_door_candidates"] += 1
+
+        reason_label = opportunity_reason or (
+            str((strongest or audit_issues or ["No Website Found"])[0] or "").strip() or "No clear opportunity reason"
+        )
+        reduced_opportunities.append(
+            {
+                "id": opp_id,
+                "business_name": business_name or "Unknown Business",
+                "category": category or "Unknown Category",
+                "city": city or None,
+                "address": address or None,
+                "website": website or None,
+                "opportunity_score": opp.get("opportunity_score"),
+                "lead_bucket": opp.get("lead_bucket"),
+                "opportunity_reason": reason_label,
+                "best_contact_method": "email" if has_email else "contact_page" if contact_page else "phone" if phone else "facebook" if facebook_url else "none",
+                "recommended_next_action": "Send First Touch" if has_email else "Open Contact Path" if (contact_page or facebook_url) else "Review Location",
+                "best_pitch_angle": reason_label,
+            }
+        )
+
+    reduced_opportunities.sort(key=lambda row: float(row.get("opportunity_score") or 0), reverse=True)
+    return {"stats": stats, "opportunities": reduced_opportunities[:max_records]}
+
+
 def _job_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -1670,6 +1919,8 @@ def _execute_scout_job(
         "admin_supabase_url_host": urlparse(CRM_SUPABASE_URL or "").netloc or None,
         "supabase_url_present": bool(_supabase_url),
         "supabase_service_key_present": bool(_supabase_service_key),
+        "reduced_mode_notice": None,
+        "places_reduced_mode": False,
         "errors": [],
     }
 
@@ -1788,6 +2039,7 @@ def _execute_scout_job(
         data = _load_scout_data()
         today = data["today"]
         opportunities = data["opportunities"]
+        reduced_mode_notice = str((today or {}).get("reduced_mode_notice") or "").strip() or None
         _append_history(len(opportunities), today.get("summary", ""))
         _job_progress(
             job_id,
@@ -1935,6 +2187,44 @@ def _execute_scout_job(
                     },
                 )
                 _process_workspace_outreach_sequences(workspace_id or "", user_id)
+                if reduced_mode_notice:
+                    reduced_payload = _run_reduced_mode_enrichment(
+                        sb,
+                        workspace_id=intake_workspace_id or workspace_id or "",
+                        owner_id=user_id,
+                    )
+                    reduced_stats = (reduced_payload or {}).get("stats") or {}
+                    reduced_opps = (reduced_payload or {}).get("opportunities") or []
+                    if reduced_opps:
+                        opportunities = reduced_opps
+                        today = {
+                            **(today or {}),
+                            "summary": reduced_mode_notice,
+                            "top_opportunities": reduced_opps[:10],
+                            "case_slugs": [],
+                            "reduced_mode_notice": reduced_mode_notice,
+                        }
+                        try:
+                            with open(TODAY_PATH, "w", encoding="utf-8") as f:
+                                json.dump(today, f, indent=2)
+                            with open(OPPORTUNITIES_PATH, "w", encoding="utf-8") as f:
+                                json.dump(reduced_opps, f, indent=2)
+                        except Exception as write_err:
+                            print(f"  [Scout] reduced-mode file refresh failed: {write_err}", file=sys.stderr)
+                    persistence_debug["reduced_mode_notice"] = reduced_mode_notice
+                    persistence_debug["places_reduced_mode"] = True
+                    persistence_debug["intake"] = {
+                        **(persistence_debug.get("intake") or {}),
+                        "google_discovery_used": False,
+                        "reduced_mode": True,
+                        "stored_records_scanned": int(reduced_stats.get("stored_records_scanned") or 0),
+                        "records_enriched": int(reduced_stats.get("records_enriched") or 0),
+                        "emails_found": int(reduced_stats.get("emails_found") or 0),
+                        "actionable_email_leads": int(reduced_stats.get("actionable_email_leads") or 0),
+                        "contact_available": int(reduced_stats.get("contact_available") or 0),
+                        "door_to_door_candidates": int(reduced_stats.get("door_to_door_candidates") or 0),
+                        "skipped": int(reduced_stats.get("skipped") or 0),
+                    }
             except Exception as intake_error:
                 print(f"  [Scout] crm intake after run failed: {intake_error}", file=sys.stderr)
                 persistence_debug["errors"].append(
@@ -1959,6 +2249,10 @@ def _execute_scout_job(
         processed = int((today or {}).get("processed_count") or len(opportunities))
         saved = int((today or {}).get("saved_count") or len(opportunities))
         skipped = int((today or {}).get("skipped_count") or max(0, processed - saved))
+        reduced_mode_notice = str((today or {}).get("reduced_mode_notice") or "").strip() or None
+        if reduced_mode_notice:
+            persistence_debug["reduced_mode_notice"] = reduced_mode_notice
+            persistence_debug["places_reduced_mode"] = True
         scout_summary = {
             "cities_scanned": int((today or {}).get("cities_scanned") or 0),
             "industries_scanned": int((today or {}).get("industries_scanned") or 0),
@@ -1976,6 +2270,8 @@ def _execute_scout_job(
             f"updated {int(sync_stats.get('updated') or 0)}, "
             f"skipped duplicates {int(sync_stats.get('duplicate_skipped') or 0)}."
         )
+        if reduced_mode_notice:
+            summary = f"{reduced_mode_notice} {summary}"
         finished = _job_update(
             job_id,
             status="completed",
