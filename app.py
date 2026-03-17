@@ -3884,9 +3884,114 @@ def _process_workspace_outreach_sequences(workspace_id: str, owner_id: str) -> d
             )
     return stats
 
+def _compute_lead_conversion_score(
+    *,
+    email: str,
+    contact_page: str,
+    phone: str,
+    facebook_url: str,
+    website_status: str,
+    review_count: int,
+    category: str,
+    business_name: str,
+    website: str,
+    opportunity_reason: str,
+) -> tuple[int, dict]:
+    score = 0
+    breakdown: dict[str, int | str | list[str]] = {
+        "positive": [],
+        "negative": [],
+        "raw_score": 0,
+    }
+    status = str(website_status or "").strip().lower()
+    cat = str(category or "").strip().lower()
+    name = str(business_name or "").strip().lower()
+    reason = str(opportunity_reason or "").strip().lower()
+    has_email = bool(str(email or "").strip())
+    has_contact_page = bool(str(contact_page or "").strip())
+    has_phone = bool(str(phone or "").strip())
+    has_facebook = bool(str(facebook_url or "").strip())
+    has_contact_path = has_email or has_contact_page or has_phone or has_facebook
+    reviews = int(review_count or 0)
+    website_text = str(website or "").strip().lower()
+    clear_info = bool(name and cat and (website_text or reason))
+    service_fit = any(
+        token in cat
+        for token in ["plumber", "roofer", "hvac", "electrician", "landscaping", "cleaning", "auto repair", "contractor"]
+    )
+    church_fit = "church" in cat
+    shop_fit = any(token in cat for token in ["shop", "store", "retail", "cafe", "restaurant", "salon"])
+    chain_or_franchise = any(token in name for token in ["franchise", "chain", "walmart", "target", "mcdonald", "starbucks"])
+
+    if has_email:
+        score += 40
+        breakdown["positive"].append("email_exists:+40")
+    if has_contact_page:
+        score += 15
+        breakdown["positive"].append("contact_page_exists:+15")
+    if has_phone and not has_email and not has_contact_page:
+        score += 5
+        breakdown["positive"].append("phone_only:+5")
+
+    if status == "no_website":
+        score += 30
+        breakdown["positive"].append("no_website:+30")
+    elif status == "broken_website":
+        score += 25
+        breakdown["positive"].append("broken_website:+25")
+    elif status == "outdated_website":
+        score += 20
+        breakdown["positive"].append("outdated_website:+20")
+    elif status in {"missing_contact_page", "missing_contact_info"}:
+        score += 15
+        breakdown["positive"].append("missing_contact_info:+15")
+
+    if reviews >= 10:
+        score += 15
+        breakdown["positive"].append("reviews_10_plus:+15")
+    elif reviews >= 3:
+        score += 10
+        breakdown["positive"].append("reviews_3_10:+10")
+    elif reviews >= 1:
+        score += 5
+        breakdown["positive"].append("reviews_1_2:+5")
+
+    if service_fit:
+        score += 15
+        breakdown["positive"].append("service_business_fit:+15")
+    elif church_fit:
+        score += 10
+        breakdown["positive"].append("church_fit:+10")
+    elif shop_fit:
+        score += 10
+        breakdown["positive"].append("local_shop_fit:+10")
+
+    if not has_contact_path:
+        score -= 40
+        breakdown["negative"].append("no_contact_path:-40")
+    if reviews <= 0:
+        score -= 20
+        breakdown["negative"].append("no_reviews:-20")
+    if chain_or_franchise:
+        score -= 25
+        breakdown["negative"].append("chain_or_franchise:-25")
+    if status in {"healthy_website", "strong_website", "modern_website"}:
+        score -= 20
+        breakdown["negative"].append("strong_existing_website:-20")
+    if not clear_info:
+        score -= 15
+        breakdown["negative"].append("unclear_business_info:-15")
+
+    bounded = max(0, min(100, int(score)))
+    breakdown["raw_score"] = int(score)
+    breakdown["final_score"] = bounded
+    return bounded, breakdown
+
 
 def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bool = False) -> dict:
     stats = {
+        "scanned_count": 0,
+        "enriched_count": 0,
         "opportunities_found": 0,
         "opportunities_evaluated": 0,
         "eligible_for_lead_creation": 0,
@@ -3919,6 +4024,9 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
         "leads_with_facebook": 0,
         "leads_with_no_contact_path": 0,
         "actionable_email_leads_created": 0,
+        "research_later_leads_created": 0,
+        "door_to_door_candidates_created": 0,
+        "archived_low_priority_created": 0,
         "leads_skipped_due_no_email": 0,
         "leads_created_with_low_score": 0,
         "leads_created_high_score": 0,
@@ -3937,6 +4045,7 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
         "contact_rule_used": "strict",
         "debug_decisions": [],
         "exclusion_samples": [],
+        "leads_skipped_reason": {},
     }
     debug_decision_limit = 40
     exclusion_sample_limit = 25
@@ -3975,6 +4084,11 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
                 "exclusion_reason": exclusion_reason,
             }
         )
+
+    def _count_skip_reason(reason: str) -> None:
+        key = str(reason or "other").strip() or "other"
+        current = int((stats["leads_skipped_reason"] or {}).get(key) or 0)
+        stats["leads_skipped_reason"][key] = current + 1
 
     workspace_id = str(workspace.get("id") or "").strip()
     stats["workspace_id_used"] = workspace_id or None
@@ -4122,6 +4236,7 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
 
     candidates: list[dict] = []
     for opp in opportunities:
+        stats["scanned_count"] += 1
         stats["evaluated"] += 1
         stats["opportunities_evaluated"] += 1
         case = case_by_opp.get(str(opp.get("id"))) or {}
@@ -4136,6 +4251,7 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
         )
         if not opp_workspace_id:
             stats["filtered_missing_workspace"] += 1
+            _count_skip_reason("missing_workspace_id")
             print(f"  [Intake] filtered: missing_workspace_id opp_id={opp_id or '(missing)'}")
             _append_exclusion(
                 business_name,
@@ -4152,6 +4268,7 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
             continue
         if not business_name:
             stats["filtered_missing_business_name"] += 1
+            _count_skip_reason("missing_business_name")
             print(f"  [Intake] filtered: missing_business_name opp_id={opp_id or '(missing)'}")
             _append_exclusion(
                 business_name,
@@ -4176,6 +4293,7 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
         )
         if _is_closed_or_dnc(status_tokens):
             stats["filtered_closed_or_dnc"] += 1
+            _count_skip_reason("closed_or_dnc")
             print(f"  [Intake] filtered: closed_or_dnc opp_id={opp_id or '(missing)'}")
             _append_exclusion(
                 business_name,
@@ -4188,6 +4306,47 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
                 score,
                 "filtered",
                 "opportunity or case is closed/do_not_contact",
+            )
+            continue
+
+        # Enrichment fail-safe: do not create CRM leads until enrichment is present.
+        has_case_enrichment = bool(case)
+        has_website_analysis = bool(str(opp.get("website_status") or "").strip())
+        has_opportunity_reason = bool(str(opp.get("opportunity_reason") or "").strip())
+        if not has_case_enrichment:
+            stats["filtered_other"] += 1
+            _count_skip_reason("missing_case_enrichment")
+            _append_exclusion(business_name, score, "missing enrichment case_file")
+            _append_decision(
+                opp_id,
+                business_name,
+                score,
+                "filtered",
+                "missing enrichment case_file",
+            )
+            continue
+        if not has_website_analysis:
+            stats["filtered_other"] += 1
+            _count_skip_reason("missing_website_analysis")
+            _append_exclusion(business_name, score, "missing website_status after enrichment")
+            _append_decision(
+                opp_id,
+                business_name,
+                score,
+                "filtered",
+                "missing website_status after enrichment",
+            )
+            continue
+        if not has_opportunity_reason:
+            stats["filtered_missing_opportunity_reason"] += 1
+            _count_skip_reason("missing_opportunity_reason")
+            _append_exclusion(business_name, score, "missing opportunity_reason after enrichment")
+            _append_decision(
+                opp_id,
+                business_name,
+                score,
+                "filtered",
+                "missing opportunity_reason after enrichment",
             )
             continue
 
@@ -4213,6 +4372,7 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
                 ),
             }
         )
+        stats["enriched_count"] += 1
 
     candidates.sort(
         key=lambda item: (
@@ -4237,6 +4397,7 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
             stats["filtered_existing_linked_opportunity"] += 1
             stats["duplicate_skipped"] += 1
             stats["duplicates_skipped"] += 1
+            _count_skip_reason("duplicate_by_linked_opportunity_id")
             print(f"  [Intake] duplicate crm lead skipped opp_id={opp_id} reason={duplicate_reason}")
             _append_exclusion(
                 business_name,
@@ -4272,6 +4433,7 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
         if duplicate_reason:
             stats["duplicate_skipped"] += 1
             stats["duplicates_skipped"] += 1
+            _count_skip_reason(f"duplicate_by_{duplicate_reason}")
             print(
                 f"  [Intake] duplicate crm lead skipped opp_id={opp_id or '(missing)'} "
                 f"reason={duplicate_reason}"
@@ -4291,7 +4453,7 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
             continue
 
         lead_email = str(case.get("email") or "").strip()
-        lead_email_source = str(case.get("email_source") or "unknown").strip().lower() or "unknown"
+        lead_email_source = str(case.get("email_source") or "not_found").strip().lower() or "not_found"
         lead_phone = str(opp.get("phone") or case.get("phone_from_site") or "").strip()
         lead_contact_page = str(case.get("contact_page") or case.get("contact_form_url") or "").strip()
         lead_facebook = str(case.get("facebook_url") or case.get("facebook") or "").strip()
@@ -4323,6 +4485,19 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
         if not issue_list:
             issue_list = case.get("strongest_problems") if isinstance(case.get("strongest_problems"), list) else []
         issues_summary = ", ".join([str(i).strip() for i in issue_list if str(i).strip()][:3]) or "Contact info is hard to find"
+        review_count = int(opp.get("review_count") or case.get("google_review_count") or 0)
+        conversion_score, score_breakdown = _compute_lead_conversion_score(
+            email=lead_email,
+            contact_page=lead_contact_page,
+            phone=lead_phone,
+            facebook_url=lead_facebook,
+            website_status=str(opp.get("website_status") or "").strip(),
+            review_count=review_count,
+            category=str(opp.get("category") or "").strip(),
+            business_name=business_name,
+            website=str(opp.get("website") or "").strip(),
+            opportunity_reason=opportunity_reason or issues_summary,
+        )
         row = {
             "owner_id": owner_id,
             "workspace_id": workspace_id,
@@ -4342,11 +4517,13 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
             "best_contact_method": best_contact,
             "has_contact_path": has_contact_path,
             "opportunity_score": score,
+            "conversion_score": conversion_score,
+            "score_breakdown": score_breakdown,
             "opportunity_reason": opportunity_reason or issues_summary,
             "lead_bucket": lead_bucket,
             "website_status": str(opp.get("website_status") or "").strip() or None,
             "google_rating": opp.get("google_rating") or opp.get("rating"),
-            "google_review_count": opp.get("review_count"),
+            "google_review_count": review_count,
             "recommended_next_action": (
                 "Send First Touch"
                 if lead_email
@@ -4398,15 +4575,21 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
                 stats["actionable_email_leads_created"] += 1
             elif has_contact_page or has_facebook:
                 # Tier 2 leads are intentionally kept for contact-page/social workflows.
-                pass
+                stats["research_later_leads_created"] += 1
             if has_phone:
                 stats["leads_with_phone"] += 1
             if has_contact_page:
                 stats["leads_with_contact_page"] += 1
             if has_facebook:
                 stats["leads_with_facebook"] += 1
+            if str(lead_bucket).strip().lower() == "door-to-door candidates":
+                stats["door_to_door_candidates_created"] += 1
+            if str(lead_bucket).strip().lower() in {"low priority", "low_priority"}:
+                stats["archived_low_priority_created"] += 1
             if not (has_email or has_phone or has_contact_page or has_facebook):
                 stats["leads_with_no_contact_path"] += 1
+                _count_skip_reason("created_without_contact_path")
+                stats["research_later_leads_created"] += 1
             if score < intake_min_score:
                 stats["leads_created_with_low_score"] += 1
             else:
@@ -4491,6 +4674,7 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
         else:
             stats["insert_failed"] += 1
             stats["insert_errors"] += 1
+            _count_skip_reason("insert_error")
             insert_error = str(insert_result.get("error") or "unknown insert error")
             print(
                 f"  [Scout] crm intake insert failed opp_id={opp_id or '(missing)'} "
@@ -4525,6 +4709,7 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
 
     print(
         "  crm intake complete "
+        f"(scanned_count={stats['scanned_count']}, enriched_count={stats['enriched_count']}, "
         f"(evaluated={stats['evaluated']}, eligible={stats['eligible']}, created={stats['created']}, "
         f"duplicate_skipped={stats['duplicate_skipped']}, insert_attempted={stats['insert_attempted']}, "
         f"insert_succeeded={stats['insert_succeeded']}, insert_failed={stats['insert_failed']}, "
@@ -4535,9 +4720,11 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
         f"leads_with_email={stats['leads_with_email']}, leads_with_phone={stats['leads_with_phone']}, "
         f"leads_with_contact_page={stats['leads_with_contact_page']}, leads_with_facebook={stats['leads_with_facebook']}, "
         f"leads_with_no_contact_path={stats['leads_with_no_contact_path']}, actionable_email_leads_created={stats['actionable_email_leads_created']}, "
+        f"research_later_leads_created={stats['research_later_leads_created']}, door_to_door_candidates_created={stats['door_to_door_candidates_created']}, "
+        f"archived_low_priority_created={stats['archived_low_priority_created']}, "
         f"leads_skipped_due_no_email={stats['leads_skipped_due_no_email']}, "
         f"leads_created_with_low_score={stats['leads_created_with_low_score']}, leads_created_high_score={stats['leads_created_high_score']}, "
-        f"filtered_closed_or_dnc={stats['filtered_closed_or_dnc']})"
+        f"filtered_closed_or_dnc={stats['filtered_closed_or_dnc']}, leads_skipped_reason={stats['leads_skipped_reason']})"
     )
     _log_write_stage(
         "leads_intake",
@@ -4549,11 +4736,16 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
             "filtered_low_score": stats["filtered_low_score"],
             "insert_failed": stats["insert_failed"],
             "query_error": stats["query_error"],
+            "scanned_count": stats["scanned_count"],
+            "enriched_count": stats["enriched_count"],
+            "leads_skipped_reason": stats["leads_skipped_reason"],
         },
     )
     stats["reason_counts"] = {
         "missing_business_name": int(stats["filtered_missing_business_name"]),
         "missing_workspace_id": int(stats["filtered_missing_workspace"]),
+        "missing_case_enrichment": int((stats["leads_skipped_reason"] or {}).get("missing_case_enrichment") or 0),
+        "missing_website_analysis": int((stats["leads_skipped_reason"] or {}).get("missing_website_analysis") or 0),
         "missing_contact_path": int(stats["filtered_missing_contact_path"]),
         "missing_email": int(stats["filtered_missing_email"]),
         "missing_opportunity_reason": int(stats["filtered_missing_opportunity_reason"]),
