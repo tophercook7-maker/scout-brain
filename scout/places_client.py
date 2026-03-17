@@ -1,7 +1,8 @@
 """
 Google Places client — fetches real businesses for Morning Runner.
 
-Uses Places API (New) and Geocoding API. GOOGLE_MAPS_API_KEY from environment.
+Uses Places API (New). Geocoding is optional and only used to improve
+location bias / distance calculations when available.
 Backend only.
 """
 import json
@@ -35,6 +36,23 @@ DETAILS_FIELDS = (
 )
 
 
+def _truthy_env(name: str, default: bool = True) -> bool:
+    raw = str(os.environ.get(name, "")).strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
+GEOCODING_OPTIONAL = _truthy_env("SCOUT_ENABLE_GEOCODING", True)
+
+
+def _maps_search_link(name: str | None, address: str | None, city: str | None = None) -> str | None:
+    query = ", ".join([str(v or "").strip() for v in [name, address, city] if str(v or "").strip()])
+    if not query:
+        return None
+    return f"https://www.google.com/maps/search/?api=1&query={urllib.parse.quote(query)}"
+
+
 def _haversine_miles(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     """Approximate distance in miles between two points."""
     R = 3959
@@ -64,7 +82,9 @@ def _geocode_get(url: str, params: dict, log: Callable[[str], None] | None = Non
             status = data.get("status", "")
             if status == "REQUEST_DENIED":
                 err = data.get("error_message", status)
-                raise RuntimeError(f"Geocoding API REQUEST_DENIED: {err}")
+                if log:
+                    log(f"Soft warning: Geocoding API REQUEST_DENIED ({err}) — continuing without coordinates")
+                return {}
             if status != "OK" and status != "ZERO_RESULTS":
                 err = data.get("error_message", status)
                 if log:
@@ -72,11 +92,13 @@ def _geocode_get(url: str, params: dict, log: Callable[[str], None] | None = Non
             return data
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="ignore")
-        raise RuntimeError(f"Geocoding HTTP {e.code}: {body}") from e
+        if log:
+            log(f"Soft warning: Geocoding HTTP {e.code} ({body}) — continuing without coordinates")
+        return {}
     except Exception as e:
         if log:
-            log(f"Geocoding request failed: {e}")
-        raise
+            log(f"Soft warning: Geocoding request failed ({e}) — continuing without coordinates")
+        return {}
 
 
 def _places_post(url: str, body: dict, field_mask: str, log: Callable[[str], None] | None = None) -> dict:
@@ -120,7 +142,7 @@ def _places_post(url: str, body: dict, field_mask: str, log: Callable[[str], Non
         raise
 
 
-def _place_from_new_api(p: dict, center_lat: float, center_lng: float) -> dict:
+def _place_from_new_api(p: dict, center_lat: float | None, center_lng: float | None) -> dict:
     """Map Places API (New) Place object to our internal format."""
     name = None
     dn = p.get("displayName") or {}
@@ -156,7 +178,7 @@ def _place_from_new_api(p: dict, center_lat: float, center_lng: float) -> dict:
         "rating": p.get("rating"),
         "review_count": p.get("userRatingCount"),
         "hours": hours,
-        "maps_url": p.get("googleMapsUri"),
+        "maps_url": p.get("googleMapsUri") or _maps_search_link(name, p.get("formattedAddress")),
         "place_id": p.get("id"),
         "distance_miles": distance_miles,
     }
@@ -217,7 +239,12 @@ def _extract_review_intelligence(reviews: list[dict] | None) -> tuple[list[str],
     return snippets[:3], themed, activity
 
 
-def place_details_new(place_id: str, center_lat: float, center_lng: float, log: Callable[[str], None] | None = None) -> dict | None:
+def place_details_new(
+    place_id: str,
+    center_lat: float | None,
+    center_lng: float | None,
+    log: Callable[[str], None] | None = None,
+) -> dict | None:
     """Fetch Place Details (New) for richer dossier fields, including reviews."""
     if not place_id:
         return None
@@ -263,6 +290,10 @@ def place_details_new(place_id: str, center_lat: float, center_lng: float, log: 
 
 def geocode(address: str, log: Callable[[str], None] | None = None) -> tuple[float, float] | None:
     """Geocode address to (lat, lng). Uses Geocoding API."""
+    if not GEOCODING_OPTIONAL:
+        if log:
+            log("Geocoding disabled by SCOUT_ENABLE_GEOCODING flag — continuing without coordinates")
+        return None
     data = _geocode_get(GEOCODE_URL, {"address": address}, log=log)
     results = data.get("results") or []
     if not results:
@@ -277,8 +308,8 @@ def geocode(address: str, log: Callable[[str], None] | None = None) -> tuple[flo
 
 def text_search_new(
     text_query: str,
-    lat: float,
-    lng: float,
+    lat: float | None,
+    lng: float | None,
     radius_meters: float,
     max_results: int,
     log: Callable[[str], None] | None = None,
@@ -299,14 +330,15 @@ def text_search_new(
             break
         body = {
             "textQuery": text_query,
-            "locationBias": {
+            "pageSize": min(20, max(1, requested - len(out))),
+        }
+        if lat is not None and lng is not None:
+            body["locationBias"] = {
                 "circle": {
                     "center": {"latitude": lat, "longitude": lng},
                     "radius": radius,
                 }
-            },
-            "pageSize": min(20, max(1, requested - len(out))),
-        }
+            }
         if next_token:
             body["pageToken"] = next_token
 
@@ -345,7 +377,7 @@ def search_places(
 ) -> list[dict]:
     """
     Search for businesses by category in a city.
-    Uses Geocoding API + Places API (New) Text Search.
+    Uses Places API (New) Text Search; Geocoding is optional.
     Returns place dicts: name, address, phone, website, rating, review_count,
     hours, maps_url, distance_miles, category.
     """
@@ -357,11 +389,15 @@ def search_places(
         coords = geocode(city, log=log)
         if not coords:
             if log:
-                log("Geocode failed for city")
-            raise RuntimeError("Geocode failed for city")
-        lat, lng = coords
+                log("Soft warning: city geocode unavailable — continuing with text search only")
+            lat, lng = None, None
+        else:
+            lat, lng = coords
         if log:
-            log("run scout using saved config location")
+            if lat is not None and lng is not None:
+                log("run scout using saved config location")
+            else:
+                log("run scout without coordinate bias")
 
     def _log(msg: str) -> None:
         if log:
@@ -394,7 +430,7 @@ def search_places(
                 if "REQUEST_DENIED" in err_str or "LEGACY" in err_str:
                     raise RuntimeError(
                         f"Places API REQUEST_DENIED or legacy API. "
-                        f"Enable 'Places API (New)' and 'Geocoding API' in your Google Cloud project. Original: {e}"
+                        f"Enable 'Places API (New)' in your Google Cloud project. Original: {e}"
                     ) from e
                 raise
 

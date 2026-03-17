@@ -15,6 +15,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, TimeoutError
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib import error as urllib_error
+from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 
 try:
@@ -266,6 +267,15 @@ def _is_weak_name(name: str, category: str) -> bool:
     if (category or "") and lower == category.lower():
         return True
     return any(lower.startswith(p) for p in WEAK_NAME_PREFIXES)
+
+
+def _maps_search_link(name: str | None, address: str | None, city: str | None) -> str | None:
+    query = ", ".join(
+        [str(v or "").strip() for v in [name, address, city] if str(v or "").strip()]
+    )
+    if not query:
+        return None
+    return f"https://www.google.com/maps/search/?api=1&query={urllib_parse.quote(query)}"
 
 
 def _validate_case(case: dict) -> tuple[bool, str]:
@@ -1487,7 +1497,7 @@ def _build_no_website_case(place: dict, home_city: str, categories: list, index:
     case["distance_miles"] = place.get("distance_miles")
     case["phone"] = place.get("phone")
     case["website"] = None
-    case["maps_link"] = place.get("maps_url")
+    case["maps_link"] = place.get("maps_url") or _maps_search_link(name, case.get("address"), case.get("city"))
     case["hours"] = place.get("hours")
     case["rating"] = place.get("rating")
     case["review_count"] = place.get("review_count")
@@ -1664,7 +1674,7 @@ def _build_weak_website_case(
     case["distance_miles"] = place.get("distance_miles")
     case["phone"] = place.get("phone")
     case["website"] = website
-    case["maps_link"] = place.get("maps_url")
+    case["maps_link"] = place.get("maps_url") or _maps_search_link(name, case.get("address"), case.get("city"))
     case["hours"] = place.get("hours")
     case["rating"] = place.get("rating")
     case["review_count"] = place.get("review_count")
@@ -2363,7 +2373,8 @@ def run(
                 "request_denied",
                 str(e),
                 "Scout failed: Places API returned REQUEST_DENIED. "
-                "Enable 'Places API (New)' and 'Geocoding API' in your Google Cloud project. "
+                "Enable 'Places API (New)' in your Google Cloud project. "
+                "Geocoding is optional and is no longer required for lead discovery. "
                 "You may be calling a legacy API that is not enabled.",
             ) from e
         err_lower = err_str.lower()
@@ -2377,7 +2388,8 @@ def run(
             raise ScoutRunError(
                 "geocode_failed",
                 str(e),
-                "Scout could not resolve the configured city. Check SSL certificates or API access.",
+                "Scout geocoding failed, but discovery should continue in text-search mode. "
+                "Check logs for soft geocoding warnings.",
             ) from e
         raise ScoutRunError(
             "places_api_failed",

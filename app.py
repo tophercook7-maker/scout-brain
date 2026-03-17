@@ -5746,7 +5746,7 @@ def post_run_scout(request: Request, body: RunScoutBody | None = None):
                 "REQUEST_DENIED",
                 str(e),
                 "Scout failed: API returned REQUEST_DENIED. Enable 'Places API (New)' and "
-                "'Geocoding API' in your Google Cloud project. You may be calling a legacy API that is not enabled.",
+                "verify the key/project. Geocoding is optional and no longer required for discovery.",
             )
         if "api" in err_lower and "key" in err_lower:
             return _scout_error_response(
@@ -5764,7 +5764,7 @@ def post_run_scout(request: Request, body: RunScoutBody | None = None):
             return _scout_error_response(
                 "geocode_failed",
                 str(e),
-                "Scout could not resolve the configured city. Check SSL certificates or API access.",
+                "Scout geocoding failed, but discovery should continue in text-search mode. Check soft warnings.",
             )
         if "supabase" in err_lower or "insert" in err_lower and "fail" in err_lower:
             return _scout_error_response(
