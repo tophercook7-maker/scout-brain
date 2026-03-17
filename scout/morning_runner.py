@@ -1141,19 +1141,13 @@ def _derive_lead_assessment(case: dict) -> dict:
     has_contact_path = bool(has_email or has_contact_page or has_phone or has_facebook)
     if has_email:
         best_contact_method = "email"
-    elif has_contact_page:
-        best_contact_method = "contact_page"
-    elif has_phone:
-        best_contact_method = "phone"
-    elif has_facebook:
-        best_contact_method = "facebook"
     else:
         best_contact_method = "none"
 
     if lead_type == "Low Priority":
         recommended_next_action = "Skip For Now"
-    elif not has_contact_path:
-        recommended_next_action = "Review Website"
+    elif not has_email:
+        recommended_next_action = "Research Later"
     elif str(case.get("status") or "new").strip().lower() in {"new", "new_lead"}:
         recommended_next_action = "Send First Touch"
     else:
@@ -1249,6 +1243,7 @@ def calculateOpportunityScore(lead: dict) -> tuple[int, list[str], str, dict, li
     activity_score = max(0, min(100, activity_score))
 
     contact_info_score = 0
+    email_source = str(lead.get("email_source") or "unknown").strip().lower() or "unknown"
     if bool(str(lead.get("email") or "").strip()):
         contact_info_score = 20
     elif contact_page_present:
@@ -1270,6 +1265,10 @@ def calculateOpportunityScore(lead: dict) -> tuple[int, list[str], str, dict, li
         base_signals.append("+contact page present")
     if phone_or_email_detected:
         base_signals.append("+phone or email detected")
+    if bool(str(lead.get("email") or "").strip()):
+        base_signals.append(f"email_source:{email_source}")
+    else:
+        base_signals.append("email_source:none")
     if recent_review_detected:
         base_signals.append("+recent review detected")
     base_signals.append(f"+business activity score {business_activity_score}")
@@ -1306,6 +1305,10 @@ def calculateOpportunityScore(lead: dict) -> tuple[int, list[str], str, dict, li
         base_signals.append("downranked: non-easy target")
     else:
         total = max(total, 80)
+    if not bool(str(lead.get("email") or "").strip()):
+        total = min(total, 39)
+        close_probability = "low"
+        base_signals.append("downranked: missing email")
     if total >= 80:
         tier = "hot_lead"
     elif total >= 60:
@@ -1463,6 +1466,7 @@ def _build_no_website_case(place: dict, home_city: str, categories: list, index:
     case["review_themes"] = place.get("review_themes") or []
 
     case["email"] = None
+    case["email_source"] = "unknown"
     case["contact_page"] = None
     case["contact_form_url"] = None
     case["phone_from_site"] = None
@@ -1819,6 +1823,7 @@ def _build_weak_website_case(
         emails = inv.get("emails") or []
         social = inv.get("social") or {}
         case["email"] = emails[0] if emails else None
+        case["email_source"] = str(inv.get("email_source") or "unknown").strip().lower() or "unknown"
         case["contact_page"] = inv.get("contact_page")
         case["contact_form_url"] = inv.get("contact_form_url")
         case["phone_from_site"] = (inv.get("phones") or [None])[0]
@@ -1836,6 +1841,7 @@ def _build_weak_website_case(
             log.append(f"    {line}")
     else:
         case["fetch_ok"] = False
+        case["email_source"] = "unknown"
         problems = ["Website could not be fully investigated."]
         pitch_lines = ["Manual review recommended."]
         log.append("    website investigation: failed")
@@ -1877,6 +1883,8 @@ def _build_weak_website_case(
         else "Email" if (case["phone"] or case["phone_from_site"]) and case["email"]
         else None
     )
+    if case.get("email_source"):
+        log.append(f"    email source: {case.get('email_source')}")
 
     # Outreach is generated on demand (case open / explicit regenerate), not during main scout run.
     case["short_email"] = None
@@ -2357,6 +2365,27 @@ def run(
     print(f"  Filtered to easy-close categories: {len(places)} remaining")
     if not places:
         _write_empty("No businesses matched easy-close category focus.")
+        return
+
+    def _is_real_active_place(place: dict) -> bool:
+        status = str(place.get("business_status") or "").strip().lower()
+        if status in {"closed", "permanently_closed", "temporarily_closed"}:
+            return False
+        review_count = _as_int(place.get("review_count"), 0)
+        activity = bool(
+            review_count > 0
+            or bool(place.get("owner_post_detected"))
+            or bool(place.get("new_photos_detected"))
+            or bool(place.get("listing_recently_updated"))
+        )
+        has_website = bool(str(place.get("website") or "").strip())
+        return bool(activity or has_website)
+
+    active_places = [p for p in places if _is_real_active_place(p)]
+    print(f"  Filtered inactive/closed listings: {len(active_places)} remaining")
+    places = active_places
+    if not places:
+        _write_empty("No active businesses matched the focus filters.")
         return
 
     # Prioritize businesses with visible phone/contact and simple service model.

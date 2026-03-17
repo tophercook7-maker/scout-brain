@@ -66,6 +66,57 @@ def _extract_emails(html: str) -> list[str]:
     return out[:10]
 
 
+def _email_quality_rank(email: str) -> tuple[int, int]:
+    value = str(email or "").strip().lower()
+    if not value or "@" not in value:
+        return (99, 99)
+    local = value.split("@", 1)[0]
+    generic_tokens = [
+        "noreply",
+        "no-reply",
+        "donotreply",
+        "do-not-reply",
+        "support",
+        "info",
+        "hello",
+        "admin",
+        "contact",
+    ]
+    generic_penalty = 1 if any(token in local for token in generic_tokens) else 0
+    length_penalty = 1 if len(local) <= 3 else 0
+    return (generic_penalty, length_penalty)
+
+
+def _preferred_email_source_order(source: str) -> int:
+    normalized = str(source or "").strip().lower()
+    if normalized == "contact_page":
+        return 0
+    if normalized == "footer":
+        return 1
+    if normalized == "homepage":
+        return 2
+    if normalized == "listing":
+        return 3
+    if normalized == "facebook":
+        return 4
+    return 5
+
+
+def _select_primary_email(email_hits: list[tuple[str, str]]) -> tuple[str | None, str]:
+    ranked: list[tuple[str, str, tuple[int, int], int]] = []
+    for raw_email, raw_source in email_hits:
+        email = str(raw_email or "").strip().lower()
+        source = str(raw_source or "unknown").strip().lower() or "unknown"
+        if not email or "@" not in email:
+            continue
+        ranked.append((email, source, _email_quality_rank(email), _preferred_email_source_order(source)))
+    if not ranked:
+        return None, "unknown"
+    ranked.sort(key=lambda item: (item[3], item[2][0], item[2][1], len(item[0])))
+    winner = ranked[0]
+    return winner[0], winner[1]
+
+
 def _extract_footer_mailto_links(html: str) -> list[str]:
     footer_emails: list[str] = []
     seen: set[str] = set()
@@ -847,6 +898,7 @@ def investigate(
     debug_log.append("website: fetched")
 
     all_emails: set[str] = set()
+    email_hits: list[tuple[str, str]] = []
     all_phones: set[str] = set()
     all_social: dict[str, str] = {}
     all_internal: dict[str, str] = {}
@@ -886,8 +938,10 @@ def investigate(
 
     for e in home_result["emails"]:
         all_emails.add(e)
+        email_hits.append((str(e), "homepage"))
     for e in home_result.get("footer_emails") or []:
         all_emails.add(e)
+        email_hits.append((str(e), "footer"))
     for p in home_result["phones"]:
         all_phones.add(p)
     all_social.update(home_result["social"])
@@ -930,10 +984,17 @@ def investigate(
                 discovered_pages.append(candidate)
                 combined += "\n" + html
                 pr = _analyze_page(html, candidate)
+                source_hint = (
+                    "contact_page"
+                    if any(token in candidate.lower() for token in ["/contact", "contact-us", "get-a-quote", "request-quote", "/quote", "/estimate"])
+                    else "homepage"
+                )
                 for e in pr["emails"]:
                     all_emails.add(e)
+                    email_hits.append((str(e), source_hint))
                 for e in pr.get("footer_emails") or []:
                     all_emails.add(e)
+                    email_hits.append((str(e), "footer"))
                 for p in pr["phones"]:
                     all_phones.add(p)
                 all_social.update(pr["social"])
@@ -972,6 +1033,7 @@ def investigate(
             gp = _fetch_profile_contact_hints(google_profile_url, timeout=min(timeout, 8))
             for e in gp.get("emails") or []:
                 all_emails.add(str(e))
+                email_hits.append((str(e), "listing"))
             for p in gp.get("phones") or []:
                 all_phones.add(str(p))
             for key, value in (gp.get("social") or {}).items():
@@ -991,6 +1053,7 @@ def investigate(
             fb = _fetch_profile_contact_hints(facebook_url, timeout=min(timeout, 8))
             for e in fb.get("emails") or []:
                 all_emails.add(str(e))
+                email_hits.append((str(e), "facebook"))
             for p in fb.get("phones") or []:
                 all_phones.add(str(p))
             if not contact_form_url and fb.get("contact_form_url"):
@@ -1000,7 +1063,13 @@ def investigate(
             debug_log.append(f"facebook page scan failed: {e}")
 
     debug_log.append(f"contact_page: {'found' if contact_page_url else 'not found'}")
-    debug_log.append(f"emails: {'found (' + str(len(all_emails)) + ')' if all_emails else 'not found'}")
+    primary_email, email_source = _select_primary_email(email_hits)
+    if primary_email:
+        all_emails.add(primary_email)
+    debug_log.append(
+        f"emails: {'found (' + str(len(all_emails)) + ')' if all_emails else 'not found'}"
+    )
+    debug_log.append(f"email_source: {email_source}")
     debug_log.append(f"social_links: {'found' if all_social else 'not found'}")
     debug_log.append(f"owner_names: {'found (' + str(len(all_owner_names)) + ')' if all_owner_names else 'not found'}")
 
@@ -1100,7 +1169,7 @@ def investigate(
 
     best_contact = (
         "email"
-        if all_emails
+        if primary_email
         else "contact_page"
         if (contact_page_url or contact_form_url)
         else "phone"
@@ -1123,12 +1192,21 @@ def investigate(
         else None
     )
 
+    ordered_emails: list[str] = []
+    if primary_email:
+        ordered_emails.append(primary_email)
+    for candidate_email in list(all_emails):
+        lowered = str(candidate_email or "").strip().lower()
+        if lowered and lowered not in ordered_emails:
+            ordered_emails.append(lowered)
+
     contact_matrix = {
         "best_contact": best_contact,
         "best_contact_method": best_contact,
         "backup_contact": backup_contact,
         "backup_contact_method": backup_contact,
-        "email": (list(all_emails)[:1] or [None])[0],
+        "email": primary_email,
+        "email_source": email_source,
         "phone": (list(all_phones)[:1] or [None])[0],
         "contact_page": contact_page_url,
         "contact_form_url": contact_form_url,
@@ -1158,7 +1236,8 @@ def investigate(
         "menu_visibility": menu_vis,
         "hours_visibility": hours_vis,
         "directions_visibility": directions_vis,
-        "emails": list(all_emails)[:10],
+        "emails": ordered_emails[:10],
+        "email_source": email_source,
         "phones": list(all_phones)[:5],
         "social": all_social,
         "contact_page": contact_page_url,
