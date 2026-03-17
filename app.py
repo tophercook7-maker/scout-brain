@@ -1882,19 +1882,33 @@ def _execute_scout_job(
                     sb,
                     {"id": intake_workspace_id},
                     user_id,
+                    debug_mode=True,
                 )
                 persistence_debug["leads_created"] = int((intake_stats or {}).get("created") or 0)
                 persistence_debug["intake"] = {
                     "workspace_id": intake_workspace_id,
+                    "opportunities_found": int((intake_stats or {}).get("opportunities_found") or 0),
                     "opportunities_loaded": int((intake_stats or {}).get("opportunities_loaded") or 0),
+                    "opportunities_evaluated": int((intake_stats or {}).get("opportunities_evaluated") or 0),
                     "evaluated": int((intake_stats or {}).get("evaluated") or 0),
+                    "eligible_for_lead_creation": int((intake_stats or {}).get("eligible_for_lead_creation") or 0),
                     "eligible": int((intake_stats or {}).get("eligible") or 0),
+                    "leads_created": int((intake_stats or {}).get("leads_created") or 0),
                     "created": int((intake_stats or {}).get("created") or 0),
+                    "duplicates_skipped": int((intake_stats or {}).get("duplicates_skipped") or 0),
                     "duplicate_skipped": int((intake_stats or {}).get("duplicate_skipped") or 0),
                     "insert_failed": int((intake_stats or {}).get("insert_failed") or 0),
+                    "filtered_out": int((intake_stats or {}).get("filtered_out") or 0),
                     "filtered_low_score": int((intake_stats or {}).get("filtered_low_score") or 0),
                     "filtered_missing_contact_path": int((intake_stats or {}).get("filtered_missing_contact_path") or 0),
                     "filtered_closed_or_dnc": int((intake_stats or {}).get("filtered_closed_or_dnc") or 0),
+                    "filtered_missing_business_name": int((intake_stats or {}).get("filtered_missing_business_name") or 0),
+                    "filtered_missing_workspace": int((intake_stats or {}).get("filtered_missing_workspace") or 0),
+                    "filtered_existing_linked_opportunity": int((intake_stats or {}).get("filtered_existing_linked_opportunity") or 0),
+                    "duplicate_by_website": int((intake_stats or {}).get("duplicate_by_website") or 0),
+                    "duplicate_by_phone": int((intake_stats or {}).get("duplicate_by_phone") or 0),
+                    "duplicate_by_business_name_city": int((intake_stats or {}).get("duplicate_by_business_name_city") or 0),
+                    "reason_counts": (intake_stats or {}).get("reason_counts") or {},
                     "query_error": (intake_stats or {}).get("query_error"),
                     "intake_threshold_used": (intake_stats or {}).get("intake_threshold_used"),
                 }
@@ -3657,7 +3671,7 @@ def _case_map_for_workspace(sb, workspace_id: str, opp_ids: list[str]) -> dict:
         lambda: (
             sb.table("case_files")
             .select(
-                "opportunity_id,email,contact_page,phone_from_site,facebook,instagram,status,outcome"
+                "opportunity_id,email,contact_page,contact_form_url,phone_from_site,facebook,facebook_url,instagram,status,outcome"
             )
             .eq("workspace_id", workspace_id)
             .in_("opportunity_id", opp_ids)
@@ -3666,7 +3680,7 @@ def _case_map_for_workspace(sb, workspace_id: str, opp_ids: list[str]) -> dict:
         lambda: (
             sb.table("case_files")
             .select(
-                "opportunity_id,email,contact_page,phone_from_site,facebook,instagram,status,outcome"
+                "opportunity_id,email,contact_page,contact_form_url,phone_from_site,facebook,facebook_url,instagram,status,outcome"
             )
             .in_("opportunity_id", opp_ids)
             .execute()
@@ -3692,8 +3706,10 @@ def _opportunity_has_contact_path(opp: dict, case: dict | None) -> bool:
         opp.get("backup_contact_method"),
         case.get("email"),
         case.get("contact_page"),
+        case.get("contact_form_url"),
         case.get("phone_from_site"),
         case.get("facebook"),
+        case.get("facebook_url"),
         case.get("instagram"),
     ]
     return any(str(v or "").strip() for v in checks)
@@ -3852,6 +3868,12 @@ def _process_workspace_outreach_sequences(workspace_id: str, owner_id: str) -> d
 
 def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bool = False) -> dict:
     stats = {
+        "opportunities_found": 0,
+        "opportunities_evaluated": 0,
+        "eligible_for_lead_creation": 0,
+        "leads_created": 0,
+        "duplicates_skipped": 0,
+        "filtered_out": 0,
         "evaluated": 0,
         "eligible": 0,
         "created": 0,
@@ -3965,17 +3987,17 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
     intake_select_variants = [
         (
             "id,workspace_id,business_name,category,city,lane,address,phone,website,place_id,"
-            "recommended_contact_method,backup_contact_method,opportunity_score,internal_score,"
+            "recommended_contact_method,backup_contact_method,opportunity_score,"
             "opportunity_signals,opportunity_reason,lead_bucket,close_probability,status"
         ),
         (
             "id,workspace_id,business_name,category,city,lane,address,phone,website,place_id,"
-            "recommended_contact_method,backup_contact_method,opportunity_score,internal_score,"
+            "recommended_contact_method,backup_contact_method,opportunity_score,"
             "opportunity_reason,lead_bucket,close_probability,status"
         ),
         (
             "id,workspace_id,business_name,category,city,lane,address,phone,website,place_id,"
-            "recommended_contact_method,backup_contact_method,opportunity_score,internal_score,status"
+            "recommended_contact_method,backup_contact_method,opportunity_score,status"
         ),
     ]
     intake_queries = []
@@ -4025,6 +4047,7 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
         return stats
 
     stats["opportunities_loaded"] = len(opportunities)
+    stats["opportunities_found"] = len(opportunities)
     if not opportunities:
         print("  crm intake complete (no qualifying opportunities)")
         return stats
@@ -4056,15 +4079,49 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
     candidates: list[dict] = []
     for opp in opportunities:
         stats["evaluated"] += 1
+        stats["opportunities_evaluated"] += 1
         case = case_by_opp.get(str(opp.get("id"))) or {}
-        score = float(opp.get("opportunity_score") or opp.get("internal_score") or 0)
+        score = float(opp.get("opportunity_score") or 0)
         opp_id = str(opp.get("id") or "").strip()
+        opp_workspace_id = str(opp.get("workspace_id") or "").strip()
         business_name = str(opp.get("business_name") or "").strip()
         display_name = business_name or "(missing)"
         print(
             f"  [Intake] candidate opp_id={opp_id or '(missing)'} "
             f"name={display_name} score={score:.2f} workspace_id={workspace_id}"
         )
+        if not opp_workspace_id:
+            stats["filtered_missing_workspace"] += 1
+            print(f"  [Intake] filtered: missing_workspace_id opp_id={opp_id or '(missing)'}")
+            _append_exclusion(
+                business_name,
+                score,
+                "missing workspace_id",
+            )
+            _append_decision(
+                opp_id,
+                business_name,
+                score,
+                "filtered",
+                "missing workspace_id",
+            )
+            continue
+        if not business_name:
+            stats["filtered_missing_business_name"] += 1
+            print(f"  [Intake] filtered: missing_business_name opp_id={opp_id or '(missing)'}")
+            _append_exclusion(
+                business_name,
+                score,
+                "missing business_name",
+            )
+            _append_decision(
+                opp_id,
+                business_name,
+                score,
+                "filtered",
+                "missing business_name",
+            )
+            continue
 
         if score < intake_min_score:
             stats["filtered_low_score"] += 1
@@ -4114,6 +4171,9 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
                 opp.get("website"),
                 opp.get("phone") or case.get("phone_from_site"),
                 case.get("email"),
+                case.get("contact_page"),
+                case.get("contact_form_url"),
+                case.get("facebook_url") or case.get("facebook"),
             ]
         )
         if not has_strict_contact:
@@ -4159,15 +4219,17 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
         opp = item["opp"]
         case = item["case"] or {}
         opp_id = str(opp.get("id") or "").strip()
-        score = float(opp.get("opportunity_score") or opp.get("internal_score") or 0)
+        score = float(opp.get("opportunity_score") or 0)
         business_name = str(opp.get("business_name") or "").strip() or "(missing)"
         stats["eligible"] += 1
+        stats["eligible_for_lead_creation"] += 1
 
         duplicate_reason = None
         if opp_id and opp_id in existing_linked_opps:
             duplicate_reason = "linked_opportunity_id"
             stats["filtered_existing_linked_opportunity"] += 1
             stats["duplicate_skipped"] += 1
+            stats["duplicates_skipped"] += 1
             print(f"  [Intake] duplicate crm lead skipped opp_id={opp_id} reason={duplicate_reason}")
             _append_exclusion(
                 business_name,
@@ -4202,6 +4264,7 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
             stats["duplicate_by_business_name_city"] += 1
         if duplicate_reason:
             stats["duplicate_skipped"] += 1
+            stats["duplicates_skipped"] += 1
             print(
                 f"  [Intake] duplicate crm lead skipped opp_id={opp_id or '(missing)'} "
                 f"reason={duplicate_reason}"
@@ -4237,23 +4300,6 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
             issue_list = case.get("strongest_problems") if isinstance(case.get("strongest_problems"), list) else []
         issues_summary = ", ".join([str(i).strip() for i in issue_list if str(i).strip()][:3]) or "Contact info is hard to find"
         opportunity_reason = str(opp.get("opportunity_reason") or "").strip()
-        if not business_name:
-            stats["filtered_missing_business_name"] += 1
-            print(f"  [Intake] filtered: missing_business_name opp_id={opp_id or '(missing)'}")
-            _append_exclusion(
-                business_name,
-                score,
-                "missing business_name",
-            )
-            _append_decision(
-                opp_id,
-                business_name,
-                score,
-                "filtered",
-                "missing business_name",
-            )
-            continue
-
         row = {
             "owner_id": owner_id,
             "workspace_id": workspace_id,
@@ -4263,12 +4309,16 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
             "email": case.get("email"),
             "phone": opp.get("phone") or case.get("phone_from_site"),
             "website": opp.get("website"),
+            "contact_page": case.get("contact_page") or case.get("contact_form_url"),
+            "category": opp.get("category"),
             "industry": opp.get("category"),
             "lead_source": "scout-brain",
             "address": opp.get("address"),
+            "city": opp.get("city"),
             "place_id": opp.get("place_id"),
             "best_contact_method": best_contact,
             "opportunity_score": score,
+            "opportunity_reason": opportunity_reason or issues_summary,
             "auto_intake": True,
             "status": "new",
             "sequence_active": True,
@@ -4290,6 +4340,7 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
         if bool(insert_result.get("ok")):
             stats["insert_succeeded"] += 1
             stats["created"] += 1
+            stats["leads_created"] += 1
             print(
                 f"  crm lead created from scout opportunity "
                 f"(opp_id={opp_id or '(missing)'}, mode={insert_result.get('mode')})"
@@ -4391,6 +4442,15 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
                 insert_error,
             )
 
+    stats["filtered_out"] = int(
+        stats["filtered_low_score"]
+        + stats["filtered_missing_workspace"]
+        + stats["filtered_closed_or_dnc"]
+        + stats["filtered_missing_contact_path"]
+        + stats["filtered_missing_business_name"]
+        + stats["filtered_other"]
+    )
+
     print(
         "  crm intake complete "
         f"(evaluated={stats['evaluated']}, eligible={stats['eligible']}, created={stats['created']}, "
@@ -4413,6 +4473,17 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
             "query_error": stats["query_error"],
         },
     )
+    stats["reason_counts"] = {
+        "missing_business_name": int(stats["filtered_missing_business_name"]),
+        "missing_workspace_id": int(stats["filtered_missing_workspace"]),
+        "missing_contact_path": int(stats["filtered_missing_contact_path"]),
+        "score_below_threshold": int(stats["filtered_low_score"]),
+        "duplicate_by_linked_opportunity_id": int(stats["filtered_existing_linked_opportunity"]),
+        "duplicate_by_website": int(stats["duplicate_by_website"]),
+        "duplicate_by_phone": int(stats["duplicate_by_phone"]),
+        "duplicate_by_business_name_city": int(stats["duplicate_by_business_name_city"]),
+        "insert_error": int(stats["insert_failed"]),
+    }
     return stats
 
 
@@ -5175,10 +5246,13 @@ def post_crm_intake_backfill(request: Request, body: IntakeBackfillBody | None =
             "crm_supabase_host": crm_host,
             "scout_supabase_host": scout_host,
             "message": (
-                f"Backfill complete: created {int(stats.get('created') or 0)} "
-                f"from {int(stats.get('evaluated') or 0)} evaluated opportunities "
-                f"(eligible={int(stats.get('eligible') or 0)}, duplicates={int(stats.get('duplicate_skipped') or 0)}, "
-                f"insert_failed={int(stats.get('insert_failed') or 0)})."
+                f"Backfill complete: opportunities_found={int(stats.get('opportunities_found') or 0)}, "
+                f"opportunities_evaluated={int(stats.get('opportunities_evaluated') or 0)}, "
+                f"eligible_for_lead_creation={int(stats.get('eligible_for_lead_creation') or 0)}, "
+                f"leads_created={int(stats.get('leads_created') or 0)}, "
+                f"duplicates_skipped={int(stats.get('duplicates_skipped') or 0)}, "
+                f"insert_failed={int(stats.get('insert_failed') or 0)}, "
+                f"filtered_out={int(stats.get('filtered_out') or 0)}."
             ),
         }
     except HTTPException:
