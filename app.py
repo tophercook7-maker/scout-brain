@@ -1918,6 +1918,8 @@ def _execute_scout_job(
                     "leads_with_no_contact_path": int((intake_stats or {}).get("leads_with_no_contact_path") or 0),
                     "actionable_email_leads_created": int((intake_stats or {}).get("actionable_email_leads_created") or 0),
                     "leads_skipped_due_no_email": int((intake_stats or {}).get("leads_skipped_due_no_email") or 0),
+                    "leads_created_with_low_score": int((intake_stats or {}).get("leads_created_with_low_score") or 0),
+                    "leads_created_high_score": int((intake_stats or {}).get("leads_created_high_score") or 0),
                     "query_error": (intake_stats or {}).get("query_error"),
                     "intake_threshold_used": (intake_stats or {}).get("intake_threshold_used"),
                 }
@@ -3918,6 +3920,8 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
         "leads_with_no_contact_path": 0,
         "actionable_email_leads_created": 0,
         "leads_skipped_due_no_email": 0,
+        "leads_created_with_low_score": 0,
+        "leads_created_high_score": 0,
         "sequence_started": 0,
         "sequence_send_failed": 0,
         "sequence_stopped": 0,
@@ -4008,7 +4012,7 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
     )
     intake_min_score = 60.0 if debug_mode else max(float(CRM_INTAKE_MIN_SCORE), 80.0)
     stats["intake_threshold_used"] = intake_min_score
-    stats["contact_rule_used"] = "email_first_actionable"
+    stats["contact_rule_used"] = "email_required_score_not_blocking"
     opportunities = []
     intake_select_variants = [
         (
@@ -4163,23 +4167,6 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
             )
             continue
 
-        if score < intake_min_score:
-            stats["filtered_low_score"] += 1
-            print(f"  [Intake] filtered: low_score opp_id={opp_id or '(missing)'} score={score:.2f}")
-            _append_exclusion(
-                business_name,
-                score,
-                f"score {score:.2f} below threshold {intake_min_score:.0f}",
-            )
-            _append_decision(
-                opp_id,
-                business_name,
-                score,
-                "filtered",
-                f"score {score:.2f} below threshold {intake_min_score:.0f}",
-            )
-            continue
-
         status_tokens = " ".join(
             [
                 str(opp.get("status") or ""),
@@ -4204,90 +4191,23 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
             )
             continue
 
-        opportunity_reason = str(opp.get("opportunity_reason") or "").strip()
-        if not opportunity_reason:
-            stats["filtered_missing_opportunity_reason"] += 1
+        lead_email_candidate = str(case.get("email") or "").strip()
+        if not lead_email_candidate:
+            stats["filtered_missing_email"] += 1
+            stats["leads_skipped_due_no_email"] += 1
             _append_exclusion(
                 business_name,
                 score,
-                "missing opportunity_reason",
+                "missing email",
             )
             _append_decision(
                 opp_id,
                 business_name,
                 score,
                 "filtered",
-                "missing opportunity_reason",
+                "missing email",
             )
             continue
-
-        website_status = str(opp.get("website_status") or "").strip().lower()
-        allowed_opportunity_types = {
-            "no_website",
-            "facebook_only",
-            "broken_website",
-            "http_only",
-            "missing_contact_page",
-            "outdated_website",
-            "mobile_layout_issue",
-        }
-        if website_status and website_status not in allowed_opportunity_types:
-            stats["filtered_other"] += 1
-            _append_exclusion(
-                business_name,
-                score,
-                f"unsupported opportunity type: {website_status}",
-            )
-            _append_decision(
-                opp_id,
-                business_name,
-                score,
-                "filtered",
-                f"unsupported opportunity type: {website_status}",
-            )
-            continue
-
-        has_strict_contact = _opportunity_has_contact_path(opp, case)
-        has_relaxed_contact = any(
-            str(v or "").strip()
-            for v in [
-                opp.get("website"),
-                opp.get("phone") or case.get("phone_from_site"),
-                case.get("email"),
-                case.get("contact_page"),
-                case.get("contact_form_url"),
-                case.get("facebook_url") or case.get("facebook"),
-            ]
-        )
-        if not has_strict_contact:
-            if debug_mode and has_relaxed_contact:
-                print(
-                    f"  [Intake] debug_mode contact override opp_id={opp_id or '(missing)'} "
-                    "reason=website_or_phone_or_email"
-                )
-                _append_decision(
-                    opp_id,
-                    business_name,
-                    score,
-                    "eligible",
-                    "strict contact path missing; allowed by debug relaxed contact rule",
-                )
-            else:
-                stats["filtered_missing_contact_path"] += 1
-                print(f"  [Intake] filtered: missing_contact_path opp_id={opp_id or '(missing)'}")
-                _append_exclusion(
-                    business_name,
-                    score,
-                    "no usable contact path",
-                )
-                _append_decision(
-                    opp_id,
-                    business_name,
-                    score,
-                    "filtered",
-                    "no usable contact path",
-                )
-                continue
 
         candidates.append({"opp": opp, "case": case})
 
@@ -4389,11 +4309,7 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
             "Low Priority"
         )
         opportunity_reason = str(opp.get("opportunity_reason") or "").strip()
-        actionable_email_ready = bool(business_name and workspace_id and opportunity_reason and lead_email)
-        if not lead_email:
-            stats["filtered_missing_email"] += 1
-            stats["leads_skipped_due_no_email"] += 1
-            lead_bucket = "Needs Review"
+        actionable_email_ready = bool(business_name and workspace_id and lead_email)
         issue_list = opp.get("opportunity_signals") if isinstance(opp.get("opportunity_signals"), list) else []
         if not issue_list:
             issue_list = case.get("strongest_problems") if isinstance(case.get("strongest_problems"), list) else []
@@ -4456,6 +4372,10 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
                 stats["leads_with_facebook"] += 1
             if not (has_email or has_phone or has_contact_page or has_facebook):
                 stats["leads_with_no_contact_path"] += 1
+            if score < intake_min_score:
+                stats["leads_created_with_low_score"] += 1
+            else:
+                stats["leads_created_high_score"] += 1
             print(
                 f"  crm lead created from scout opportunity "
                 f"(opp_id={opp_id or '(missing)'}, mode={insert_result.get('mode')})"
@@ -4581,6 +4501,7 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
         f"leads_with_contact_page={stats['leads_with_contact_page']}, leads_with_facebook={stats['leads_with_facebook']}, "
         f"leads_with_no_contact_path={stats['leads_with_no_contact_path']}, actionable_email_leads_created={stats['actionable_email_leads_created']}, "
         f"leads_skipped_due_no_email={stats['leads_skipped_due_no_email']}, "
+        f"leads_created_with_low_score={stats['leads_created_with_low_score']}, leads_created_high_score={stats['leads_created_high_score']}, "
         f"filtered_closed_or_dnc={stats['filtered_closed_or_dnc']})"
     )
     _log_write_stage(
@@ -5383,7 +5304,9 @@ def post_crm_intake_backfill(request: Request, body: IntakeBackfillBody | None =
                 f"leads_with_facebook={int(stats.get('leads_with_facebook') or 0)}, "
                 f"leads_with_no_contact_path={int(stats.get('leads_with_no_contact_path') or 0)}, "
                 f"actionable_email_leads_created={int(stats.get('actionable_email_leads_created') or 0)}, "
-                f"leads_skipped_due_no_email={int(stats.get('leads_skipped_due_no_email') or 0)}."
+                f"leads_skipped_due_no_email={int(stats.get('leads_skipped_due_no_email') or 0)}, "
+                f"leads_created_with_low_score={int(stats.get('leads_created_with_low_score') or 0)}, "
+                f"leads_created_high_score={int(stats.get('leads_created_high_score') or 0)}."
             ),
         }
     except HTTPException:
