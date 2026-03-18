@@ -1223,6 +1223,28 @@ def _sync_scout_to_supabase(
         def _mirror_opportunity_to_lead(opp_id: str, opp_payload: dict) -> None:
             if not opp_id:
                 return
+            if not str(user_id or "").strip():
+                stats["leads_mirrored_failed"] += 1
+                _log_write_stage(
+                    "leads_mirror",
+                    "failed",
+                    {
+                        "opportunity_id": opp_id,
+                        "error": {"message": "missing_owner_id"},
+                    },
+                )
+                return
+            if not str(effective_workspace_id or "").strip():
+                stats["leads_mirrored_failed"] += 1
+                _log_write_stage(
+                    "leads_mirror",
+                    "failed",
+                    {
+                        "opportunity_id": opp_id,
+                        "error": {"message": "missing_workspace_id"},
+                    },
+                )
+                return
             try:
                 existing_lead_rows = (
                     sb.table("leads")
@@ -1259,10 +1281,43 @@ def _sync_scout_to_supabase(
                     lead_row["created_at"] = opp_payload.get("created_at")
 
                 insert_result = sb.table("leads").insert(lead_row).execute()
-                if getattr(insert_result, "data", None):
+                inserted_data = getattr(insert_result, "data", None) or []
+                inserted_id = str(((inserted_data or [None])[0] or {}).get("id") or "").strip() if inserted_data else ""
+                if not inserted_id:
+                    stats["leads_mirrored_failed"] += 1
+                    _log_write_stage(
+                        "leads_mirror",
+                        "failed",
+                        {
+                            "opportunity_id": opp_id,
+                            "error": {"message": "insert_succeeded_without_id"},
+                        },
+                    )
+                    return
+                verify_rows = (
+                    sb.table("leads")
+                    .select("id,owner_id,workspace_id")
+                    .eq("id", inserted_id)
+                    .eq("owner_id", user_id)
+                    .eq("workspace_id", effective_workspace_id)
+                    .limit(1)
+                    .execute()
+                    .data
+                    or []
+                )
+                if verify_rows:
                     stats["leads_mirrored_created"] += 1
                 else:
                     stats["leads_mirrored_failed"] += 1
+                    _log_write_stage(
+                        "leads_mirror",
+                        "failed",
+                        {
+                            "opportunity_id": opp_id,
+                            "lead_id": inserted_id,
+                            "error": {"message": "post_insert_verification_failed"},
+                        },
+                    )
             except Exception as lead_error:
                 # Lead mirroring should never abort scout persistence.
                 stats["leads_mirrored_failed"] += 1
@@ -4323,10 +4378,50 @@ def _opportunity_has_contact_path(opp: dict, case: dict | None) -> bool:
 
 
 def _insert_crm_lead(crm_sb, row: dict) -> bool:
+    def _verify_visible(insert_data: dict | None, mode: str) -> dict:
+        lead_id = str((insert_data or {}).get("id") or "").strip() if isinstance(insert_data, dict) else ""
+        owner_id = str(row.get("owner_id") or "").strip()
+        workspace_id = str(row.get("workspace_id") or "").strip()
+        linked_opp = str(row.get("linked_opportunity_id") or "").strip()
+        try:
+            if lead_id:
+                verify = (
+                    crm_sb.table(CRM_LEADS_TABLE)
+                    .select("id,owner_id,workspace_id")
+                    .eq("id", lead_id)
+                    .limit(1)
+                    .execute()
+                )
+                verify_row = ((verify.data or [None])[0] or {}) if hasattr(verify, "data") else {}
+                if str(verify_row.get("id") or "").strip() == lead_id:
+                    return {"ok": True, "mode": mode, "error": None, "data": verify_row}
+            if owner_id and linked_opp:
+                verify = (
+                    crm_sb.table(CRM_LEADS_TABLE)
+                    .select("id,owner_id,workspace_id,linked_opportunity_id")
+                    .eq("owner_id", owner_id)
+                    .eq("linked_opportunity_id", linked_opp)
+                    .limit(1)
+                    .execute()
+                )
+                verify_row = ((verify.data or [None])[0] or {}) if hasattr(verify, "data") else {}
+                if str(verify_row.get("id") or "").strip():
+                    if workspace_id and str(verify_row.get("workspace_id") or "").strip() != workspace_id:
+                        return {
+                            "ok": False,
+                            "mode": mode,
+                            "error": "workspace mismatch after insert verification",
+                            "data": None,
+                        }
+                    return {"ok": True, "mode": mode, "error": None, "data": verify_row}
+            return {"ok": False, "mode": mode, "error": "post-insert verification failed", "data": None}
+        except Exception as verify_error:
+            return {"ok": False, "mode": mode, "error": f"post-insert verification failed: {verify_error}", "data": None}
+
     try:
         res = crm_sb.table(CRM_LEADS_TABLE).insert(row).execute()
         data = res.data or []
-        return {"ok": True, "mode": "full", "error": None, "data": (data[0] if data else None)}
+        return _verify_visible((data[0] if data else None), "full")
     except Exception as e:
         # Schema fallback for older CRM deployments that have fewer intake columns.
         if "column" not in str(e).lower():
@@ -4346,7 +4441,7 @@ def _insert_crm_lead(crm_sb, row: dict) -> bool:
         try:
             res = crm_sb.table(CRM_LEADS_TABLE).insert(minimal).execute()
             data = res.data or []
-            return {"ok": True, "mode": "minimal", "error": None, "data": (data[0] if data else None)}
+            return _verify_visible((data[0] if data else None), "minimal")
         except Exception as retry_e:
             return {"ok": False, "mode": "minimal", "error": str(retry_e), "data": None}
 
