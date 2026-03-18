@@ -2042,12 +2042,21 @@ def _matches_issue_filters(case: dict, selected_filters: list[str]) -> bool:
     filters = {str(v or "").strip().lower() for v in selected_filters if str(v or "").strip()}
     website = str(case.get("website") or "").strip().lower()
     facebook_url = str(case.get("facebook") or case.get("facebook_url") or "").strip().lower()
+    email = str(case.get("email") or "").strip().lower()
+    phone = str(case.get("phone") or case.get("phone_from_site") or "").strip()
+    review_count = _as_int(case.get("google_review_count") or case.get("review_count"), 0)
+    rating = _as_float(case.get("google_rating") or case.get("rating"), 0.0)
     facebook_only = bool((website and "facebook.com" in website) or (not website and facebook_url))
     no_website = bool(case.get("no_website")) or not bool(website)
     unreachable = str(case.get("website_status") or "").strip().lower() == "unreachable" or bool(case.get("fetch_ok") is False)
     insecure_http = website.startswith("http://") or bool(case.get("ssl_ok") is False)
     contact_missing = not bool(str(case.get("contact_page") or "").strip()) and not bool(case.get("contact_form_present"))
     mobile_broken = bool(case.get("viewport_ok") is False) or _as_int(case.get("mobile_score"), 100) < 50
+    weak_outdated = bool(case.get("outdated_design_clues")) or _as_int(case.get("design_score"), 100) < 60 or mobile_broken
+    no_contact_info = not bool(email) and not bool(phone)
+    low_reviews = review_count < 10
+    low_rating = rating > 0 and rating < 4.0
+    no_cta = bool((case.get("website_audit") or {}).get("checks", {}).get("cta_missing")) or bool(case.get("tap_to_call_present") is False)
     easy_win = no_website or unreachable or insecure_http or contact_missing or mobile_broken
     missing_online_ordering = bool((case.get("website_audit") or {}).get("checks", {}).get("booking_or_ordering_missing"))
     weak_menu_contact_flow = contact_missing or bool(case.get("menu_found") is False) or bool(case.get("tap_to_call_present") is False)
@@ -2065,8 +2074,40 @@ def _matches_issue_filters(case: dict, selected_filters: list[str]) -> bool:
         "weak menu/contact flow": weak_menu_contact_flow,
         "redesign opportunities": redesign_opportunity,
         "easy wins only": easy_win,
+        "no website": no_website,
+        "weak / outdated website": weak_outdated or unreachable,
+        "no contact info": no_contact_info,
+        "facebook only presence": facebook_only,
+        "low reviews (< 10)": low_reviews,
+        "low rating (< 4.0)": low_rating,
+        "no clear call-to-action": no_cta,
     }
     return any(checks.get(f, False) for f in filters)
+
+
+def _targeted_priority_score(case: dict) -> int:
+    website = str(case.get("website") or "").strip().lower()
+    email = str(case.get("email") or "").strip().lower()
+    phone = str(case.get("phone") or case.get("phone_from_site") or "").strip()
+    review_count = _as_int(case.get("google_review_count") or case.get("review_count"), 0)
+    no_website = bool(case.get("no_website")) or not bool(website)
+    weak_website = (
+        str(case.get("website_status") or "").strip().lower() in {"unreachable", "broken", "outdated"}
+        or bool(case.get("outdated_design_clues"))
+        or _as_int(case.get("design_score"), 100) < 60
+        or _as_int(case.get("mobile_score"), 100) < 50
+    )
+    no_contact_info = not bool(email) and not bool(phone)
+    score = 0
+    if no_website:
+        score += 3
+    if no_contact_info:
+        score += 2
+    if weak_website:
+        score += 2
+    if review_count < 10:
+        score += 1
+    return score
 
 
 def run(
@@ -2129,19 +2170,30 @@ def run(
     config = load_config()
     settings = scan_settings if isinstance(scan_settings, dict) else {}
     scan_scope = str(settings.get("scope") or "").strip().lower()
-    selected_city = str(settings.get("single_city") or "").strip()
+    selected_city = str(settings.get("single_city") or settings.get("city") or "").strip()
     selected_region = str(settings.get("region") or "").strip().lower()
     selected_categories = [
         str(v or "").strip()
         for v in (settings.get("categories") or [])
         if str(v or "").strip()
     ]
+    if not selected_categories and str(settings.get("category") or "").strip():
+        selected_categories = [str(settings.get("category") or "").strip()]
     selected_issue_filters = [
         str(v or "").strip().lower()
         for v in (settings.get("issue_filters") or [])
         if str(v or "").strip()
     ]
     selected_depth = str(settings.get("depth") or "").strip().lower()
+    selected_mode = str(settings.get("mode") or "").strip().lower()
+    selected_discovery_mode = str(settings.get("discovery_mode") or "").strip().lower()
+    if selected_mode == "discovery":
+        selected_discovery_mode = "paid_discovery"
+    elif selected_mode == "reduced":
+        selected_discovery_mode = "reduced_free"
+    if not selected_discovery_mode:
+        selected_discovery_mode = "reduced_free"
+    force_reduced_mode = selected_discovery_mode != "paid_discovery"
     if selected_categories:
         config["categories"] = selected_categories
     if scan_scope == "single_city" and selected_city:
@@ -2183,6 +2235,9 @@ def run(
     max_total_results = max(200, max_total_results)
     max_total_results = min(max_total_results, int(config.get("max_businesses_per_run", 600) or 600))
     max_total_results = _scan_depth_limit(selected_depth, max_total_results)
+    requested_lead_limit = int(settings.get("lead_limit") or 0) if str(settings.get("lead_limit") or "").strip() else 0
+    if requested_lead_limit > 0:
+        max_total_results = max(1, min(200, requested_lead_limit))
     max_results_per_city = max(100, int(config.get("max_results_per_city", 250)))
     max_per = int(config.get("max_results_per_query", config.get("max_results_per_category", 60)))
     max_per = max(1, min(60, max_per))
@@ -2262,7 +2317,8 @@ def run(
         print(
             "  scan settings applied: "
             f"scope={scan_scope or 'default'}, city={selected_city or 'n/a'}, region={selected_region or 'n/a'}, "
-            f"categories={len(selected_categories)}, issue_filters={len(selected_issue_filters)}, depth={selected_depth or 'default'}"
+            f"categories={len(selected_categories)}, issue_filters={len(selected_issue_filters)}, "
+            f"depth={selected_depth or 'default'}, discovery_mode={selected_discovery_mode}"
         )
     print(f"  deep_scan_max_per_run: {deep_scan_max_per_run}")
     print(f"  max_concurrency: {max_concurrency}")
@@ -2281,14 +2337,42 @@ def run(
         print(f"  location mode: current ({current_lat}, {current_lng})")
     else:
         print(f"  location mode: saved config ({home_city})")
-    if not api_key:
-        print()
-        print("  ERROR: GOOGLE_MAPS_API_KEY not set. Add to scout/.env")
-        raise ScoutRunError(
-            "api_key_missing",
-            "GOOGLE_MAPS_API_KEY not set",
-            "Scout failed: Google Maps API key not configured. Add GOOGLE_MAPS_API_KEY to scout/.env",
+    if force_reduced_mode:
+        places_reduced_mode_notice = (
+            "Reduced mode (free) selected. Google Places discovery skipped. "
+            "Scout is running in reduced enrichment mode."
         )
+        try:
+            try:
+                from .places_client import _set_places_reduced_mode_notice
+            except ImportError:
+                from places_client import _set_places_reduced_mode_notice
+            _set_places_reduced_mode_notice(places_reduced_mode_notice)
+        except Exception:
+            pass
+        _write_empty(
+            f"{places_reduced_mode_notice} No paid discovery executed for this run.",
+            reduced_mode_notice=places_reduced_mode_notice,
+        )
+        return
+    if not api_key:
+        places_reduced_mode_notice = (
+            "Google Places discovery is unavailable because API key is missing. "
+            "Scout is running in reduced mode."
+        )
+        try:
+            try:
+                from .places_client import _set_places_reduced_mode_notice
+            except ImportError:
+                from places_client import _set_places_reduced_mode_notice
+            _set_places_reduced_mode_notice(places_reduced_mode_notice)
+        except Exception:
+            pass
+        _write_empty(
+            f"{places_reduced_mode_notice} No paid discovery executed for this run.",
+            reduced_mode_notice=places_reduced_mode_notice,
+        )
+        return
     print()
     report_progress("discovering_businesses", 10, "Discovery started")
 
@@ -2752,6 +2836,7 @@ def run(
     filtered_case_slugs = []
     filtered_no_website_slugs = []
     filtered_weak_website_slugs = []
+    scored_filtered_cases: list[tuple[str, int, float]] = []
     for slug in case_slugs:
         p = CASES_DIR / f"{slug}.json"
         if not p.exists():
@@ -2763,11 +2848,16 @@ def run(
             continue
         if _matches_issue_filters(c, selected_issue_filters):
             filtered_case_slugs.append(slug)
+            scored_filtered_cases.append((slug, _targeted_priority_score(c), float(c.get("opportunity_score") or 0)))
             if slug in no_website_slugs:
                 filtered_no_website_slugs.append(slug)
             if slug in weak_website_slugs:
                 filtered_weak_website_slugs.append(slug)
-    case_slugs = filtered_case_slugs
+    if scored_filtered_cases:
+        scored_filtered_cases.sort(key=lambda item: (item[1], item[2]), reverse=True)
+        case_slugs = [slug for slug, _target_score, _opp_score in scored_filtered_cases]
+    else:
+        case_slugs = filtered_case_slugs
     no_website_slugs = filtered_no_website_slugs
     weak_website_slugs = filtered_weak_website_slugs
 

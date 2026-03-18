@@ -108,17 +108,18 @@ def _env_flag(name: str, default: bool = False) -> bool:
 # Railway backend-only mode should not require npm or frontend assets.
 # Enable only when intentionally serving frontend from this process.
 SERVE_FRONTEND = _env_flag("SERVE_FRONTEND", default=False)
-ENABLE_SCHEDULED_SCOUT = _env_flag("ENABLE_SCHEDULED_SCOUT", default=True)
+MANUAL_ONLY_MODE = _env_flag("MANUAL_ONLY_MODE", default=True)
+ENABLE_SCHEDULED_SCOUT = _env_flag("ENABLE_SCHEDULED_SCOUT", default=not MANUAL_ONLY_MODE) and not MANUAL_ONLY_MODE
 SCHEDULED_SCOUT_HOUR = int(os.environ.get("SCHEDULED_SCOUT_HOUR", "2"))
 SCHEDULED_SCOUT_TIMEZONE = (os.environ.get("SCHEDULED_SCOUT_TIMEZONE", "local") or "local").strip()
 SCHEDULED_SCOUT_JOB_NAME = (os.environ.get("SCHEDULED_SCOUT_JOB_NAME", "nightly_scout_run") or "nightly_scout_run").strip()
 SCHEDULED_SCOUT_SCOPE = (os.environ.get("SCHEDULED_SCOUT_SCOPE", "internal") or "internal").strip().lower()
 SCHEDULED_SCOUT_WORKSPACE_NAME = (os.environ.get("SCHEDULED_SCOUT_WORKSPACE_NAME", "MixedMakerShop") or "MixedMakerShop").strip()
 SCHEDULED_SCOUT_REGIONS = ["northwest", "central", "river_valley", "delta", "south", "ouachita"]
-CRM_AUTO_INTAKE_ENABLED = _env_flag("CRM_AUTO_INTAKE_ENABLED", default=True)
+CRM_AUTO_INTAKE_ENABLED = _env_flag("CRM_AUTO_INTAKE_ENABLED", default=not MANUAL_ONLY_MODE) and not MANUAL_ONLY_MODE
 CRM_INTAKE_MIN_SCORE = float(os.environ.get("CRM_INTAKE_MIN_SCORE", "80"))
 CRM_INTAKE_MAX_CANDIDATES = int(os.environ.get("CRM_INTAKE_MAX_CANDIDATES", "250"))
-AUTO_SEQUENCE_SEND_STEP1 = _env_flag("AUTO_SEQUENCE_SEND_STEP1", default=False)
+AUTO_SEQUENCE_SEND_STEP1 = _env_flag("AUTO_SEQUENCE_SEND_STEP1", default=False) and not MANUAL_ONLY_MODE
 SEQUENCE_STEP_2_DELAY_DAYS = int(os.environ.get("SEQUENCE_STEP_2_DELAY_DAYS", "3"))
 SEQUENCE_STEP_3_DELAY_DAYS = int(os.environ.get("SEQUENCE_STEP_3_DELAY_DAYS", "7"))
 CRM_SUPABASE_URL = (os.environ.get("CRM_SUPABASE_URL", "") or "").strip() or _supabase_url
@@ -178,6 +179,7 @@ def get_healthz():
         "ok": True,
         "service": "scout-brain",
         "scheduler_enabled": bool(ENABLE_SCHEDULED_SCOUT),
+        "manual_only_mode": bool(MANUAL_ONLY_MODE),
         "runtime": {
             # Canonical keys requested by admin diagnostics.
             "has_supabase_url": bool(snapshot.get("supabase_url_present")),
@@ -275,7 +277,67 @@ def _safe_update_row(sb, table: str, row_id: str, updates: dict) -> bool:
         return False
 
 
-def _run_reduced_mode_enrichment(sb, workspace_id: str, owner_id: str) -> dict:
+def _normalize_issue_filters(filters: list[str] | None) -> set[str]:
+    return {str(v or "").strip().lower() for v in (filters or []) if str(v or "").strip()}
+
+
+def _reduced_matches_issue_filters(candidate: dict, selected_filters: set[str]) -> bool:
+    if not selected_filters:
+        return True
+    website = str(candidate.get("website") or "").strip().lower()
+    facebook_url = str(candidate.get("facebook_url") or "").strip().lower()
+    email = str(candidate.get("email") or "").strip().lower()
+    phone = str(candidate.get("phone") or "").strip()
+    contact_page = str(candidate.get("contact_page") or "").strip()
+    website_status = str(candidate.get("website_status") or "").strip().lower()
+    reason = str(candidate.get("opportunity_reason") or "").strip().lower()
+    review_count = int(candidate.get("review_count") or 0)
+    try:
+        rating = float(candidate.get("rating") or 0.0)
+    except Exception:
+        rating = 0.0
+    no_website = not website
+    weak_website = website_status in {"unreachable", "broken", "outdated"} or "outdated" in reason or "weak" in reason or "broken" in reason
+    no_contact = not email and not phone
+    facebook_only = no_website and bool(facebook_url)
+    low_reviews = review_count < 10
+    low_rating = rating > 0 and rating < 4.0
+    no_cta = "call-to-action" in reason or "cta" in reason
+    checks = {
+        "no website": no_website,
+        "weak / outdated website": weak_website,
+        "no contact info": no_contact,
+        "facebook only presence": facebook_only,
+        "low reviews (< 10)": low_reviews,
+        "low rating (< 4.0)": low_rating,
+        "no clear call-to-action": no_cta,
+    }
+    return any(checks.get(f, False) for f in selected_filters)
+
+
+def _reduced_target_priority_score(candidate: dict) -> int:
+    website = str(candidate.get("website") or "").strip()
+    email = str(candidate.get("email") or "").strip()
+    phone = str(candidate.get("phone") or "").strip()
+    website_status = str(candidate.get("website_status") or "").strip().lower()
+    reason = str(candidate.get("opportunity_reason") or "").strip().lower()
+    review_count = int(candidate.get("review_count") or 0)
+    no_website = not website
+    weak_website = website_status in {"unreachable", "broken", "outdated"} or "outdated" in reason or "weak" in reason or "broken" in reason
+    no_contact = not email and not phone
+    score = 0
+    if no_website:
+        score += 3
+    if no_contact:
+        score += 2
+    if weak_website:
+        score += 2
+    if review_count < 10:
+        score += 1
+    return score
+
+
+def _run_reduced_mode_enrichment(sb, workspace_id: str, owner_id: str, scan_settings: dict | None = None) -> dict:
     stats = {
         "google_discovery_used": False,
         "reduced_mode": True,
@@ -287,7 +349,10 @@ def _run_reduced_mode_enrichment(sb, workspace_id: str, owner_id: str) -> dict:
         "door_to_door_candidates": 0,
         "skipped": 0,
     }
-    max_records = max(20, min(400, int(os.environ.get("SCOUT_REDUCED_MAX_RECORDS", "120") or "120")))
+    selected_filters = _normalize_issue_filters((scan_settings or {}).get("issue_filters"))
+    selected_city = str((scan_settings or {}).get("city") or (scan_settings or {}).get("single_city") or "").strip().lower()
+    selected_category = str((scan_settings or {}).get("category") or "").strip().lower()
+    max_records = max(20, min(400, int((scan_settings or {}).get("lead_limit") or os.environ.get("SCOUT_REDUCED_MAX_RECORDS", "120") or "120")))
     try:
         from scout.investigator import investigate
     except Exception:
@@ -368,6 +433,10 @@ def _run_reduced_mode_enrichment(sb, workspace_id: str, owner_id: str) -> dict:
         category = str(opp.get("category") or "").strip()
         city = str(opp.get("city") or "").strip()
         address = str(opp.get("address") or "").strip()
+        if selected_city and selected_city not in city.lower():
+            continue
+        if selected_category and selected_category not in category.lower():
+            continue
         case = latest_case_by_opp.get(opp_id) or {}
 
         email = str(case.get("email") or "").strip().lower()
@@ -491,24 +560,36 @@ def _run_reduced_mode_enrichment(sb, workspace_id: str, owner_id: str) -> dict:
         reason_label = opportunity_reason or (
             str((strongest or audit_issues or ["No Website Found"])[0] or "").strip() or "No clear opportunity reason"
         )
-        reduced_opportunities.append(
-            {
-                "id": opp_id,
-                "business_name": business_name or "Unknown Business",
-                "category": category or "Unknown Category",
-                "city": city or None,
-                "address": address or None,
-                "website": website or None,
-                "opportunity_score": opp.get("opportunity_score"),
-                "lead_bucket": opp.get("lead_bucket"),
-                "opportunity_reason": reason_label,
-                "best_contact_method": "email" if has_email else "contact_page" if contact_page else "phone" if phone else "facebook" if facebook_url else "none",
-                "recommended_next_action": "Send First Touch" if has_email else "Open Contact Path" if (contact_page or facebook_url) else "Review Location",
-                "best_pitch_angle": reason_label,
-            }
-        )
+        candidate = {
+            "id": opp_id,
+            "business_name": business_name or "Unknown Business",
+            "category": category or "Unknown Category",
+            "city": city or None,
+            "address": address or None,
+            "website": website or None,
+            "opportunity_score": opp.get("opportunity_score"),
+            "lead_bucket": opp.get("lead_bucket"),
+            "opportunity_reason": reason_label,
+            "best_contact_method": "email" if has_email else "contact_page" if contact_page else "phone" if phone else "facebook" if facebook_url else "none",
+            "recommended_next_action": "Send First Touch" if has_email else "Open Contact Path" if (contact_page or facebook_url) else "Review Location",
+            "best_pitch_angle": reason_label,
+            "email": email or None,
+            "phone": phone or None,
+            "contact_page": contact_page or None,
+            "facebook_url": facebook_url or None,
+            "review_count": review_count,
+            "rating": rating,
+            "website_status": website_status or None,
+        }
+        if not _reduced_matches_issue_filters(candidate, selected_filters):
+            continue
+        candidate["targeted_priority_score"] = _reduced_target_priority_score(candidate)
+        reduced_opportunities.append(candidate)
 
-    reduced_opportunities.sort(key=lambda row: float(row.get("opportunity_score") or 0), reverse=True)
+    reduced_opportunities.sort(
+        key=lambda row: (int(row.get("targeted_priority_score") or 0), float(row.get("opportunity_score") or 0)),
+        reverse=True,
+    )
     return {"stats": stats, "opportunities": reduced_opportunities[:max_records]}
 
 
@@ -835,6 +916,14 @@ def _workspace_env_fallback_id() -> str | None:
     return candidate or None
 
 
+def _manual_trigger_request(request: Request) -> bool:
+    header = str(request.headers.get("x-manual-trigger") or "").strip().lower()
+    if header in {"1", "true", "yes", "on"}:
+        return True
+    query = str(request.query_params.get("manual_trigger") or "").strip().lower()
+    return query in {"1", "true", "yes", "on"}
+
+
 def _runtime_config_snapshot() -> dict:
     backend_host = urlparse(_supabase_url or "").netloc or None
     crm_host = urlparse(CRM_SUPABASE_URL or "").netloc or None
@@ -847,6 +936,7 @@ def _runtime_config_snapshot() -> dict:
         "crm_supabase_url_host": crm_host,
         "scout_workspace_id_env_set": bool(SCOUT_WORKSPACE_ID),
         "scheduled_scout_workspace_env_set": bool(SCHEDULED_SCOUT_WORKSPACE),
+        "manual_only_mode": bool(MANUAL_ONLY_MODE),
     }
 
 
@@ -861,7 +951,8 @@ def _log_runtime_config(context: str) -> None:
         f"CRM_SUPABASE_URL set={snapshot['crm_supabase_url_present']} host={snapshot['crm_supabase_url_host'] or 'missing'} | "
         f"CRM_SUPABASE_SERVICE_ROLE_KEY set={snapshot['crm_supabase_service_key_present']} | "
         f"SCOUT_WORKSPACE_ID set={snapshot['scout_workspace_id_env_set']} | "
-        f"SCHEDULED_SCOUT_WORKSPACE set={snapshot['scheduled_scout_workspace_env_set']}"
+        f"SCHEDULED_SCOUT_WORKSPACE set={snapshot['scheduled_scout_workspace_env_set']} | "
+        f"MANUAL_ONLY_MODE={snapshot['manual_only_mode']}"
     )
 
 
@@ -1024,6 +1115,9 @@ def _sync_scout_to_supabase(
         "case_files_failed": 0,
         "case_file_errors": [],
         "resolved_workspace_id": None,
+        "leads_mirrored_created": 0,
+        "leads_mirrored_skipped": 0,
+        "leads_mirrored_failed": 0,
     }
     if not _supabase_url or not _supabase_service_key:
         return stats
@@ -1089,6 +1183,52 @@ def _sync_scout_to_supabase(
                 return " | ".join(normalized[:4])
             text = str(value or "").strip()
             return text or None
+
+        def _mirror_opportunity_to_lead(opp_id: str, opp_payload: dict) -> None:
+            if not opp_id:
+                return
+            try:
+                existing_lead_rows = (
+                    sb.table("leads")
+                    .select("id")
+                    .eq("owner_id", user_id)
+                    .or_(f"id.eq.{opp_id},linked_opportunity_id.eq.{opp_id}")
+                    .limit(1)
+                    .execute()
+                    .data
+                    or []
+                )
+                if existing_lead_rows:
+                    stats["leads_mirrored_skipped"] += 1
+                    return
+
+                lead_row = {
+                    "id": opp_id,
+                    "owner_id": user_id,
+                    "workspace_id": effective_workspace_id,
+                    "linked_opportunity_id": opp_id,
+                    "business_name": str(opp_payload.get("business_name") or "").strip() or "Unknown business",
+                    "website": opp_payload.get("website"),
+                    "phone": opp_payload.get("phone"),
+                    "email": opp_payload.get("email"),
+                    "industry": opp_payload.get("category") or opp_payload.get("industry"),
+                    "address": opp_payload.get("address"),
+                    "status": "new" if str(opp_payload.get("email") or "").strip() else "research_later",
+                    "notes": "Auto-created from opportunity discovery sync.",
+                }
+                if opp_payload.get("created_at"):
+                    lead_row["created_at"] = opp_payload.get("created_at")
+
+                insert_result = sb.table("leads").insert(lead_row).execute()
+                if getattr(insert_result, "data", None):
+                    stats["leads_mirrored_created"] += 1
+                else:
+                    stats["leads_mirrored_failed"] += 1
+            except Exception as lead_error:
+                # Lead mirroring should never abort scout persistence.
+                stats["leads_mirrored_failed"] += 1
+                if SCOUT_VERBOSE_LOGS:
+                    print(f"  [Scout] lead mirror failed for opportunity {opp_id}: {lead_error}", file=sys.stderr)
 
         for opp_ui in opportunities_ui:
             slug = opp_ui.get("slug") or opp_ui.get("id")
@@ -1249,6 +1389,7 @@ def _sync_scout_to_supabase(
                 stats["opportunities_updated"] += 1
             else:
                 stats["opportunities_inserted"] += 1
+            _mirror_opportunity_to_lead(str(opp_id), opp_row)
             if place_id_key:
                 existing_by_place_id[place_id_key] = opp_id
             if website_key:
@@ -2192,6 +2333,7 @@ def _execute_scout_job(
                         sb,
                         workspace_id=intake_workspace_id or workspace_id or "",
                         owner_id=user_id,
+                        scan_settings=scan_settings or {},
                     )
                     reduced_stats = (reduced_payload or {}).get("stats") or {}
                     reduced_opps = (reduced_payload or {}).get("opportunities") or []
@@ -5729,6 +5871,14 @@ def get_active_job(request: Request):
 
 @app.post("/scheduled/scout")
 def post_scheduled_scout():
+    if MANUAL_ONLY_MODE:
+        return {
+            "ok": True,
+            "started": False,
+            "manual_only_mode": True,
+            "job_name": SCHEDULED_SCOUT_JOB_NAME,
+            "message": "Manual-only mode enabled. Scheduled scout is disabled.",
+        }
     if _daily_scout_lock.locked():
         return {
             "ok": True,
@@ -5748,6 +5898,16 @@ def post_scheduled_scout():
 
 @app.post("/scheduled/outreach-sequences")
 def post_scheduled_outreach_sequences():
+    if MANUAL_ONLY_MODE:
+        return {
+            "ok": True,
+            "manual_only_mode": True,
+            "checked": 0,
+            "sent": 0,
+            "failed": 0,
+            "stopped": 0,
+            "message": "Manual-only mode enabled. Scheduled outreach sequences are disabled.",
+        }
     if not _supabase_url or not _supabase_service_key:
         raise HTTPException(status_code=500, detail="Supabase backend is not configured")
     try:
@@ -5841,6 +6001,8 @@ def post_crm_intake_backfill(request: Request, body: IntakeBackfillBody | None =
 @app.post("/run-scout")
 def post_run_scout(request: Request, body: RunScoutBody | None = None):
     try:
+        if MANUAL_ONLY_MODE and not _manual_trigger_request(request):
+            raise HTTPException(status_code=403, detail="Manual trigger required in MANUAL_ONLY_MODE")
         user_id = _get_user_id_from_request(request)
         if not user_id:
             _log_write_stage(
@@ -7090,7 +7252,7 @@ if SERVE_FRONTEND:
 
 def _start_scheduler():
     global _scheduler
-    if _scheduler is not None or not ENABLE_SCHEDULED_SCOUT:
+    if _scheduler is not None or not ENABLE_SCHEDULED_SCOUT or MANUAL_ONLY_MODE:
         return
     try:
         from apscheduler.schedulers.background import BackgroundScheduler
@@ -7154,6 +7316,7 @@ def main():
     print("  -------------------------")
     print(f"  App running at:  http://0.0.0.0:{port}")
     print(f"  FRONTEND_SERVING: {'enabled' if SERVE_FRONTEND else 'disabled (api-only)'}")
+    print(f"  MANUAL_ONLY_MODE: {'enabled' if MANUAL_ONLY_MODE else 'disabled'}")
     print(f"  SCHEDULED_SCOUT: {'enabled' if ENABLE_SCHEDULED_SCOUT else 'disabled'}")
     print(f"  SCHEDULED_SCOUT_JOB_NAME: {SCHEDULED_SCOUT_JOB_NAME}")
     print(f"  SCHEDULED_SCOUT_HOUR: {SCHEDULED_SCOUT_HOUR:02d}:00")
