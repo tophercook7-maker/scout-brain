@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 from urllib import request as urllib_request
 from urllib import error as urllib_error
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote_plus
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
@@ -344,9 +344,16 @@ def _run_reduced_mode_enrichment(sb, workspace_id: str, owner_id: str, scan_sett
         "stored_records_scanned": 0,
         "records_enriched": 0,
         "emails_found": 0,
+        "contact_pages_found": 0,
+        "facebook_found": 0,
+        "phone_found": 0,
+        "no_contact_path": 0,
         "actionable_email_leads": 0,
         "contact_available": 0,
+        "research_later": 0,
         "door_to_door_candidates": 0,
+        "facebook_only": 0,
+        "phone_only": 0,
         "skipped": 0,
     }
     selected_filters = _normalize_issue_filters((scan_settings or {}).get("issue_filters"))
@@ -451,10 +458,9 @@ def _run_reduced_mode_enrichment(sb, workspace_id: str, owner_id: str, scan_sett
         website_status = str(opp.get("website_status") or "").strip()
         opportunity_reason = str(opp.get("opportunity_reason") or "").strip()
 
-        needs_enrichment = bool(
-            website
-            and (not email and not contact_page and not phone and not facebook_url)
-        ) or not website_status or not opportunity_reason
+        # Keep trying to discover an email even when another contact path exists.
+        # This improves outreach usefulness for already-stored businesses.
+        needs_enrichment = bool(website and not email) or not website_status or not opportunity_reason
         if needs_enrichment and website:
             try:
                 inv = investigate(
@@ -549,13 +555,25 @@ def _run_reduced_mode_enrichment(sb, workspace_id: str, owner_id: str, scan_sett
 
         has_email = bool(email)
         has_contact_available = bool(contact_page or facebook_url or phone)
+        if contact_page:
+            stats["contact_pages_found"] += 1
+        if facebook_url:
+            stats["facebook_found"] += 1
+        if phone:
+            stats["phone_found"] += 1
         if has_email:
             stats["emails_found"] += 1
             stats["actionable_email_leads"] += 1
         elif has_contact_available:
             stats["contact_available"] += 1
         else:
+            stats["research_later"] += 1
+            stats["no_contact_path"] += 1
             stats["door_to_door_candidates"] += 1
+        if facebook_url and not email and not contact_page and not phone:
+            stats["facebook_only"] += 1
+        if phone and not email and not contact_page and not facebook_url:
+            stats["phone_only"] += 1
 
         reason_label = opportunity_reason or (
             str((strongest or audit_issues or ["No Website Found"])[0] or "").strip() or "No clear opportunity reason"
@@ -571,7 +589,7 @@ def _run_reduced_mode_enrichment(sb, workspace_id: str, owner_id: str, scan_sett
             "lead_bucket": opp.get("lead_bucket"),
             "opportunity_reason": reason_label,
             "best_contact_method": "email" if has_email else "contact_page" if contact_page else "phone" if phone else "facebook" if facebook_url else "none",
-            "recommended_next_action": "Send First Touch" if has_email else "Open Contact Path" if (contact_page or facebook_url) else "Review Location",
+            "recommended_next_action": "Send First Touch" if has_email else "Open Contact Path" if (contact_page or facebook_url or phone) else "Research Later",
             "best_pitch_angle": reason_label,
             "email": email or None,
             "phone": phone or None,
@@ -1184,6 +1202,24 @@ def _sync_scout_to_supabase(
             text = str(value or "").strip()
             return text or None
 
+        def _preferred_website_from_payload(payload: dict, contact: dict) -> str | None:
+            candidates = [
+                payload.get("website"),
+                contact.get("website"),
+                payload.get("url"),
+                payload.get("homepage"),
+            ]
+            for value in candidates:
+                text = str(value or "").strip()
+                if not text:
+                    continue
+                lower = text.lower()
+                if "facebook.com" in lower or "instagram.com" in lower or "maps.google" in lower:
+                    continue
+                if lower.startswith(("http://", "https://")):
+                    return text
+            return None
+
         def _mirror_opportunity_to_lead(opp_id: str, opp_payload: dict) -> None:
             if not opp_id:
                 return
@@ -1211,6 +1247,9 @@ def _sync_scout_to_supabase(
                     "website": opp_payload.get("website"),
                     "phone": opp_payload.get("phone"),
                     "email": opp_payload.get("email"),
+                    "contact_page": opp_payload.get("contact_page"),
+                    "facebook_url": opp_payload.get("facebook_url"),
+                    "enrichment_status": opp_payload.get("enrichment_status"),
                     "industry": opp_payload.get("category") or opp_payload.get("industry"),
                     "address": opp_payload.get("address"),
                     "status": "new" if str(opp_payload.get("email") or "").strip() else "research_later",
@@ -1236,6 +1275,8 @@ def _sync_scout_to_supabase(
             if not name:
                 continue
             stats["opportunities_attempted"] += 1
+            contact_blob = opp_ui.get("contact") if isinstance(opp_ui.get("contact"), dict) else {}
+            website_candidate = _preferred_website_from_payload(opp_ui, contact_blob)
             opp_row = {
                 "user_id": user_id,
                 "workspace_id": effective_workspace_id,
@@ -1249,7 +1290,12 @@ def _sync_scout_to_supabase(
                 "distance_miles": opp_ui.get("distance_miles"),
                 "address": opp_ui.get("address"),
                 "phone": opp_ui.get("phone"),
-                "website": opp_ui.get("website"),
+                "website": website_candidate,
+                "email": opp_ui.get("email") or contact_blob.get("email"),
+                "contact_page": opp_ui.get("contact_page") or contact_blob.get("contact_page") or contact_blob.get("contact_form_url"),
+                "facebook_url": opp_ui.get("facebook_url") or opp_ui.get("facebook") or contact_blob.get("facebook"),
+                "discovery_status": opp_ui.get("discovery_status") or ("website_found" if website_candidate else "no_website_found"),
+                "enrichment_status": opp_ui.get("enrichment_status"),
                 "maps_link": opp_ui.get("maps_url") or opp_ui.get("maps_link"),
                 "rating": opp_ui.get("rating"),
                 "google_rating": opp_ui.get("rating"),
@@ -1318,6 +1364,11 @@ def _sync_scout_to_supabase(
                         "best_contact_method",
                         "best_pitch_angle",
                         "recommended_next_action",
+                        "email",
+                        "contact_page",
+                        "facebook_url",
+                        "discovery_status",
+                        "enrichment_status",
                         "place_id",
                         "city",
                         "state",
@@ -1343,6 +1394,11 @@ def _sync_scout_to_supabase(
                     legacy_opp.pop("best_contact_method", None)
                     legacy_opp.pop("best_pitch_angle", None)
                     legacy_opp.pop("recommended_next_action", None)
+                    legacy_opp.pop("email", None)
+                    legacy_opp.pop("contact_page", None)
+                    legacy_opp.pop("facebook_url", None)
+                    legacy_opp.pop("discovery_status", None)
+                    legacy_opp.pop("enrichment_status", None)
                     legacy_opp.pop("place_id", None)
                     legacy_opp.pop("city", None)
                     legacy_opp.pop("state", None)
@@ -2282,6 +2338,7 @@ def _execute_scout_job(
                     "workspace_id": intake_workspace_id,
                     "opportunities_found": int((intake_stats or {}).get("opportunities_found") or 0),
                     "opportunities_loaded": int((intake_stats or {}).get("opportunities_loaded") or 0),
+                    "total_records": int((intake_stats or {}).get("total_records") or (intake_stats or {}).get("scanned_count") or 0),
                     "opportunities_evaluated": int((intake_stats or {}).get("opportunities_evaluated") or 0),
                     "evaluated": int((intake_stats or {}).get("evaluated") or 0),
                     "eligible_for_lead_creation": int((intake_stats or {}).get("eligible_for_lead_creation") or 0),
@@ -2309,6 +2366,21 @@ def _execute_scout_job(
                     "leads_with_contact_page": int((intake_stats or {}).get("leads_with_contact_page") or 0),
                     "leads_with_facebook": int((intake_stats or {}).get("leads_with_facebook") or 0),
                     "leads_with_no_contact_path": int((intake_stats or {}).get("leads_with_no_contact_path") or 0),
+                    "websites_found": int((intake_stats or {}).get("websites_found") or 0),
+                    "emails_found": int((intake_stats or {}).get("emails_found") or (intake_stats or {}).get("leads_with_email") or 0),
+                    "businesses_found": int((intake_stats or {}).get("opportunities_found") or (intake_stats or {}).get("opportunities_loaded") or 0),
+                    "phones_found": int((intake_stats or {}).get("phones_found") or (intake_stats or {}).get("leads_with_phone") or 0),
+                    "contact_pages_found": int((intake_stats or {}).get("contact_pages_found") or (intake_stats or {}).get("leads_with_contact_page") or 0),
+                    "facebook_links_found": int((intake_stats or {}).get("facebook_links_found") or (intake_stats or {}).get("leads_with_facebook") or 0),
+                    "records_with_no_contact": int((intake_stats or {}).get("records_with_no_contact") or (intake_stats or {}).get("leads_with_no_contact_path") or 0),
+                    "no_website_found": int((intake_stats or {}).get("no_website_found") or 0),
+                    "facebook_found": int((intake_stats or {}).get("leads_with_facebook") or 0),
+                    "phone_found": int((intake_stats or {}).get("leads_with_phone") or 0),
+                    "no_contact_path": int((intake_stats or {}).get("leads_with_no_contact_path") or 0),
+                    "facebook_only": int((intake_stats or {}).get("leads_facebook_only") or 0),
+                    "phone_only": int((intake_stats or {}).get("leads_phone_only") or 0),
+                    "leads_created_with_website": int((intake_stats or {}).get("leads_created_with_website") or 0),
+                    "leads_created_without_website": int((intake_stats or {}).get("leads_created_without_website") or 0),
                     "actionable_email_leads_created": int((intake_stats or {}).get("actionable_email_leads_created") or 0),
                     "leads_skipped_due_no_email": int((intake_stats or {}).get("leads_skipped_due_no_email") or 0),
                     "leads_created_with_low_score": int((intake_stats or {}).get("leads_created_with_low_score") or 0),
@@ -2360,10 +2432,22 @@ def _execute_scout_job(
                         "google_discovery_used": False,
                         "reduced_mode": True,
                         "stored_records_scanned": int(reduced_stats.get("stored_records_scanned") or 0),
+                        "total_records": int(reduced_stats.get("stored_records_scanned") or 0),
+                        "websites_found": int(reduced_stats.get("stored_records_scanned") or 0),
                         "records_enriched": int(reduced_stats.get("records_enriched") or 0),
                         "emails_found": int(reduced_stats.get("emails_found") or 0),
+                        "phones_found": int(reduced_stats.get("phone_found") or reduced_stats.get("phone_founds") or 0),
+                        "contact_pages_found": int(reduced_stats.get("contact_pages_found") or 0),
+                        "facebook_links_found": int(reduced_stats.get("facebook_found") or 0),
+                        "records_with_no_contact": int(reduced_stats.get("no_contact_path") or 0),
+                        "facebook_found": int(reduced_stats.get("facebook_found") or 0),
+                        "phone_found": int(reduced_stats.get("phone_found") or 0),
+                        "no_contact_path": int(reduced_stats.get("no_contact_path") or 0),
+                        "facebook_only": int(reduced_stats.get("facebook_only") or 0),
+                        "phone_only": int(reduced_stats.get("phone_only") or 0),
                         "actionable_email_leads": int(reduced_stats.get("actionable_email_leads") or 0),
                         "contact_available": int(reduced_stats.get("contact_available") or 0),
+                        "research_later": int(reduced_stats.get("research_later") or 0),
                         "door_to_door_candidates": int(reduced_stats.get("door_to_door_candidates") or 0),
                         "skipped": int(reduced_stats.get("skipped") or 0),
                     }
@@ -3967,6 +4051,72 @@ def _normalize_phone(value) -> str:
     return "".join(digits)
 
 
+def _website_candidate_hosts(business_name: str, city: str | None = None) -> list[str]:
+    base = "".join(ch for ch in _normalize_text(business_name) if ch.isalnum())
+    city_slug = "".join(ch for ch in _normalize_text(city) if ch.isalnum())
+    if not base:
+        return []
+    hosts: list[str] = []
+    for tld in ["com", "net", "org", "biz", "us"]:
+        hosts.append(f"{base}.{tld}")
+    if city_slug:
+        for tld in ["com", "net", "org"]:
+            hosts.append(f"{base}{city_slug}.{tld}")
+            hosts.append(f"{base}-{city_slug}.{tld}")
+    seen: set[str] = set()
+    out: list[str] = []
+    for host in hosts:
+        h = host.strip().lower()
+        if h and h not in seen:
+            seen.add(h)
+            out.append(h)
+    return out[:12]
+
+
+def _is_reachable_website(url: str, timeout: int = 5) -> bool:
+    if not url:
+        return False
+    target = url if url.startswith("http") else f"https://{url}"
+    try:
+        req = urllib_request.Request(target, headers={"User-Agent": "MassiveBrainWebsiteProbe/1.0"}, method="HEAD")
+        with urllib_request.urlopen(req, timeout=timeout) as resp:
+            return int(getattr(resp, "status", 0) or 0) < 500
+    except Exception:
+        try:
+            req = urllib_request.Request(target, headers={"User-Agent": "MassiveBrainWebsiteProbe/1.0"}, method="GET")
+            with urllib_request.urlopen(req, timeout=timeout) as resp:
+                return int(getattr(resp, "status", 0) or 0) < 500
+        except Exception:
+            return False
+
+
+def _discover_website_for_business(
+    business_name: str,
+    city: str | None = None,
+    hints: list[str] | None = None,
+) -> tuple[str | None, bool]:
+    candidates: list[str] = []
+    for hint in hints or []:
+        norm = _normalize_website(hint)
+        if norm:
+            candidates.append(norm)
+    candidates.extend(_website_candidate_hosts(business_name, city))
+    query = quote_plus(", ".join([v for v in [business_name, city or ""] if v]))
+    if query:
+        candidates.append(f"www.google.com/maps/search/?api=1&query={query}")
+    seen: set[str] = set()
+    for raw in candidates:
+        host = _normalize_website(raw)
+        if not host or host in seen:
+            continue
+        seen.add(host)
+        if host.startswith("www.google.com/maps"):
+            continue
+        if _is_reachable_website(host):
+            return f"https://{host}", True
+    return None, False
+
+
 def _is_closed_or_dnc(status_text: str) -> bool:
     s = _normalize_text(status_text)
     if not s:
@@ -4429,6 +4579,7 @@ def _compute_lead_conversion_score(
 def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bool = False) -> dict:
     stats = {
         "scanned_count": 0,
+        "total_records": 0,
         "enriched_count": 0,
         "opportunities_found": 0,
         "opportunities_evaluated": 0,
@@ -4461,6 +4612,17 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
         "leads_with_contact_page": 0,
         "leads_with_facebook": 0,
         "leads_with_no_contact_path": 0,
+        "websites_found": 0,
+        "no_website_found": 0,
+        "emails_found": 0,
+        "phones_found": 0,
+        "contact_pages_found": 0,
+        "facebook_links_found": 0,
+        "records_with_no_contact": 0,
+        "leads_created_with_website": 0,
+        "leads_created_without_website": 0,
+        "leads_facebook_only": 0,
+        "leads_phone_only": 0,
         "actionable_email_leads_created": 0,
         "research_later_leads_created": 0,
         "door_to_door_candidates_created": 0,
@@ -4671,6 +4833,10 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
         for row in existing
         if str(row.get("linked_opportunity_id") or "").strip()
     }
+    try:
+        from scout.investigator import investigate as _investigate_website
+    except Exception:
+        from investigator import investigate as _investigate_website  # type: ignore[no-redef]
 
     candidates: list[dict] = []
     for opp in opportunities:
@@ -4747,22 +4913,116 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
             )
             continue
 
-        # Enrichment fail-safe: do not create CRM leads until enrichment is present.
-        has_case_enrichment = bool(case)
+        website_value = str(opp.get("website") or case.get("website") or "").strip()
+        website_found = bool(website_value)
+        discovery_status = "website_found" if website_found else "attempted"
+        if not website_found:
+            try:
+                guessed_site, guessed_found = _discover_website_for_business(
+                    business_name=business_name,
+                    city=str(opp.get("city") or "").strip(),
+                    hints=[
+                        str(opp.get("maps_link") or "").strip(),
+                        str(case.get("maps_link") or "").strip(),
+                        str(case.get("website") or "").strip(),
+                    ],
+                )
+                if guessed_found and guessed_site:
+                    website_value = guessed_site
+                    website_found = True
+                    opp["website"] = guessed_site
+                    discovery_status = "website_found"
+                else:
+                    discovery_status = "no_website_found"
+            except Exception:
+                discovery_status = "failed"
+        print(
+            f"  [Intake] website_found={str(bool(website_found)).lower()} "
+            f"opp_id={opp_id or '(missing)'} name={display_name}"
+        )
+        if website_found:
+            stats["websites_found"] += 1
+        elif discovery_status == "no_website_found":
+            stats["no_website_found"] += 1
+
+        lead_email_candidate = str(case.get("email") or "").strip()
+        lead_phone_candidate = str(opp.get("phone") or case.get("phone_from_site") or "").strip()
+        lead_contact_page_candidate = str(case.get("contact_page") or case.get("contact_form_url") or "").strip()
+        lead_facebook_candidate = str(case.get("facebook_url") or case.get("facebook") or "").strip()
+        enrichment_attempted = False
+        enrichment_status = "not_attempted"
+
+        should_attempt_enrichment = bool(
+            (website_value and not lead_email_candidate)
+            or (not lead_email_candidate and not lead_phone_candidate and not lead_contact_page_candidate and not lead_facebook_candidate)
+        )
+        if should_attempt_enrichment:
+            enrichment_attempted = True
+            enrichment_status = "attempted"
+            target_url = website_value or lead_facebook_candidate
+            if target_url:
+                try:
+                    inv = _investigate_website(
+                        target_url,
+                        crawl_internal=True if website_value else False,
+                        timeout=8,
+                        screenshot_dir=None,
+                        google_profile_url=None,
+                    ) or {}
+                    emails = inv.get("emails") or []
+                    phones = inv.get("phones") or []
+                    social = inv.get("social") or {}
+                    inv_email = str((emails[0] if emails else "") or "").strip()
+                    inv_phone = str((phones[0] if phones else "") or "").strip()
+                    inv_contact_page = str(inv.get("contact_page") or inv.get("contact_form_url") or "").strip()
+                    inv_facebook = str((social.get("facebook") if isinstance(social, dict) else "") or "").strip()
+                    inv_website = str(inv.get("url") or "").strip()
+                    if inv_email and not lead_email_candidate:
+                        lead_email_candidate = inv_email
+                    if inv_phone and not lead_phone_candidate:
+                        lead_phone_candidate = inv_phone
+                    if inv_contact_page and not lead_contact_page_candidate:
+                        lead_contact_page_candidate = inv_contact_page
+                    if inv_facebook and not lead_facebook_candidate:
+                        lead_facebook_candidate = inv_facebook
+                    if inv_website and not website_value:
+                        website_value = inv_website
+                        opp["website"] = inv_website
+                except Exception as enrich_error:
+                    print(
+                        f"  [Intake] enrichment attempt failed opp_id={opp_id or '(missing)'} "
+                        f"name={display_name} error={enrich_error}",
+                        file=sys.stderr,
+                    )
+
+        has_contact_available = bool(
+            lead_email_candidate
+            or lead_phone_candidate
+            or lead_contact_page_candidate
+            or lead_facebook_candidate
+        )
+        if lead_email_candidate:
+            stats["emails_found"] += 1
+        if lead_phone_candidate:
+            stats["phones_found"] += 1
+        if lead_contact_page_candidate:
+            stats["contact_pages_found"] += 1
+        if lead_facebook_candidate:
+            stats["facebook_links_found"] += 1
+        if not has_contact_available:
+            stats["records_with_no_contact"] += 1
+        if enrichment_attempted:
+            if lead_email_candidate:
+                enrichment_status = "success"
+            elif has_contact_available:
+                enrichment_status = "partial"
+            else:
+                enrichment_status = "failed"
+        else:
+            enrichment_status = "success" if has_contact_available else "not_attempted"
+
         has_website_analysis = bool(str(opp.get("website_status") or "").strip())
         has_opportunity_reason = bool(str(opp.get("opportunity_reason") or "").strip())
-        if not has_case_enrichment:
-            stats["filtered_other"] += 1
-            _count_skip_reason("missing_case_enrichment")
-            _append_exclusion(business_name, score, "missing enrichment case_file")
-            _append_decision(
-                opp_id,
-                business_name,
-                score,
-                "filtered",
-                "missing enrichment case_file",
-            )
-            continue
         if not has_website_analysis:
             stats["filtered_other"] += 1
             _count_skip_reason("missing_website_analysis")
@@ -4773,6 +5033,20 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
                 score,
                 "filtered",
                 "missing website_status after enrichment",
+            )
+            _safe_update_row(
+                sb,
+                "opportunities",
+                opp_id,
+                {
+                    "website": website_value or None,
+                    "email": lead_email_candidate or None,
+                    "phone": lead_phone_candidate or None,
+                    "contact_page": lead_contact_page_candidate or None,
+                    "facebook_url": lead_facebook_candidate or None,
+                    "discovery_status": discovery_status,
+                    "enrichment_status": enrichment_status,
+                },
             )
             continue
         if not has_opportunity_reason:
@@ -4786,21 +5060,47 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
                 "filtered",
                 "missing opportunity_reason after enrichment",
             )
+            _safe_update_row(
+                sb,
+                "opportunities",
+                opp_id,
+                {
+                    "website": website_value or None,
+                    "email": lead_email_candidate or None,
+                    "phone": lead_phone_candidate or None,
+                    "contact_page": lead_contact_page_candidate or None,
+                    "facebook_url": lead_facebook_candidate or None,
+                    "discovery_status": discovery_status,
+                    "enrichment_status": enrichment_status,
+                },
+            )
             continue
-
-        lead_email_candidate = str(case.get("email") or "").strip()
-        lead_phone_candidate = str(opp.get("phone") or case.get("phone_from_site") or "").strip()
-        has_contact_available = bool(
-            lead_email_candidate
-            or lead_phone_candidate
-            or str(case.get("contact_page") or case.get("contact_form_url") or "").strip()
-            or str(case.get("facebook_url") or case.get("facebook") or "").strip()
+        _safe_update_row(
+            sb,
+            "opportunities",
+            opp_id,
+            {
+                "website": website_value or None,
+                "email": lead_email_candidate or None,
+                "phone": lead_phone_candidate or None,
+                "contact_page": lead_contact_page_candidate or None,
+                "facebook_url": lead_facebook_candidate or None,
+                "discovery_status": discovery_status,
+                "enrichment_status": enrichment_status,
+            },
         )
 
         candidates.append(
             {
                 "opp": opp,
                 "case": case,
+                "website": website_value or None,
+                "lead_email_candidate": lead_email_candidate or None,
+                "lead_phone_candidate": lead_phone_candidate or None,
+                "lead_contact_page_candidate": lead_contact_page_candidate or None,
+                "lead_facebook_candidate": lead_facebook_candidate or None,
+                "discovery_status": discovery_status,
+                "enrichment_status": enrichment_status,
                 "lead_tier": (
                     "actionable_email"
                     if lead_email_candidate
@@ -4890,11 +5190,30 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
             )
             continue
 
-        lead_email = str(case.get("email") or "").strip()
+        lead_email = str(item.get("lead_email_candidate") or case.get("email") or "").strip()
         lead_email_source = str(case.get("email_source") or "not_found").strip().lower() or "not_found"
-        lead_phone = str(opp.get("phone") or case.get("phone_from_site") or "").strip()
-        lead_contact_page = str(case.get("contact_page") or case.get("contact_form_url") or "").strip()
-        lead_facebook = str(case.get("facebook_url") or case.get("facebook") or "").strip()
+        lead_phone = str(item.get("lead_phone_candidate") or opp.get("phone") or case.get("phone_from_site") or "").strip()
+        lead_contact_page = str(item.get("lead_contact_page_candidate") or case.get("contact_page") or case.get("contact_form_url") or "").strip()
+        lead_facebook = str(item.get("lead_facebook_candidate") or case.get("facebook_url") or case.get("facebook") or "").strip()
+        discovery_status = str(item.get("discovery_status") or "not_attempted").strip() or "not_attempted"
+        enrichment_status = str(item.get("enrichment_status") or "not_attempted").strip() or "not_attempted"
+        website_for_row = str(item.get("website") or opp.get("website") or "").strip() or None
+        if discovery_status in {"not_attempted", "failed"}:
+            stats["filtered_other"] += 1
+            _count_skip_reason("website_discovery_not_attempted")
+            _append_exclusion(
+                business_name,
+                score,
+                f"website discovery status={discovery_status}",
+            )
+            _append_decision(
+                opp_id,
+                business_name,
+                score,
+                "filtered",
+                f"website discovery status={discovery_status}",
+            )
+            continue
         if lead_email:
             best_contact = "email"
         elif lead_contact_page:
@@ -4944,8 +5263,10 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
             "contact_name": None,
             "email": lead_email or None,
             "phone": lead_phone or None,
-            "website": opp.get("website"),
+            "website": website_for_row,
             "contact_page": lead_contact_page or None,
+            "facebook_url": lead_facebook or None,
+            "enrichment_status": enrichment_status,
             "category": opp.get("category"),
             "industry": opp.get("category"),
             "lead_source": "scout-brain",
@@ -4993,6 +5314,32 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
                 f"actionable_email_ready: {'yes' if actionable_email_ready else 'no'}."
             ),
         }
+        # Keep linked leads updated with latest enrichment contact fields.
+        if opp_id:
+            lead_updates = {
+                "website": website_for_row,
+                "email": lead_email or None,
+                "phone": lead_phone or None,
+                "contact_page": lead_contact_page or None,
+                "facebook_url": lead_facebook or None,
+                "discovery_status": discovery_status,
+                "best_contact_method": best_contact,
+                "has_contact_path": has_contact_path,
+                "enrichment_status": enrichment_status,
+            }
+            try:
+                crm_sb.table("leads").update(lead_updates).eq("owner_id", owner_id).eq("linked_opportunity_id", opp_id).execute()
+            except Exception:
+                try:
+                    basic_updates = {
+                        "website": website_for_row,
+                        "email": lead_email or None,
+                        "phone": lead_phone or None,
+                        "best_contact_method": best_contact,
+                    }
+                    crm_sb.table("leads").update(basic_updates).eq("owner_id", owner_id).eq("linked_opportunity_id", opp_id).execute()
+                except Exception:
+                    pass
         stats["insert_attempted"] += 1
         print(
             f"  [Intake] insert_attempted opp_id={opp_id or '(missing)'} "
@@ -5020,6 +5367,10 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
                 stats["leads_with_contact_page"] += 1
             if has_facebook:
                 stats["leads_with_facebook"] += 1
+            if has_facebook and not has_email and not has_contact_page and not has_phone:
+                stats["leads_facebook_only"] += 1
+            if has_phone and not has_email and not has_contact_page and not has_facebook:
+                stats["leads_phone_only"] += 1
             if str(lead_bucket).strip().lower() == "door-to-door candidates":
                 stats["door_to_door_candidates_created"] += 1
             if str(lead_bucket).strip().lower() in {"low priority", "low_priority"}:
@@ -5028,6 +5379,10 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
                 stats["leads_with_no_contact_path"] += 1
                 _count_skip_reason("created_without_contact_path")
                 stats["research_later_leads_created"] += 1
+            if website_for_row:
+                stats["leads_created_with_website"] += 1
+            else:
+                stats["leads_created_without_website"] += 1
             if score < intake_min_score:
                 stats["leads_created_with_low_score"] += 1
             else:
@@ -5144,6 +5499,7 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
         + stats["filtered_missing_business_name"]
         + stats["filtered_other"]
     )
+    stats["total_records"] = int(stats["scanned_count"] or 0)
 
     print(
         "  crm intake complete "
@@ -5155,9 +5511,15 @@ def _run_workspace_crm_intake(sb, workspace: dict, owner_id: str, debug_mode: bo
         f"sequence_stopped={stats['sequence_stopped']}, "
         f"filtered_low_score={stats['filtered_low_score']}, filtered_missing_contact_path={stats['filtered_missing_contact_path']}, "
         f"filtered_missing_email={stats['filtered_missing_email']}, filtered_missing_opportunity_reason={stats['filtered_missing_opportunity_reason']}, "
+        f"websites_found={stats['websites_found']}, emails_found={stats['emails_found']}, phones_found={stats['phones_found']}, "
+        f"contact_pages_found={stats['contact_pages_found']}, facebook_links_found={stats['facebook_links_found']}, "
+        f"records_with_no_contact={stats['records_with_no_contact']}, "
+        f"leads_created_with_website={stats['leads_created_with_website']}, "
+        f"leads_created_without_website={stats['leads_created_without_website']}, "
         f"leads_with_email={stats['leads_with_email']}, leads_with_phone={stats['leads_with_phone']}, "
         f"leads_with_contact_page={stats['leads_with_contact_page']}, leads_with_facebook={stats['leads_with_facebook']}, "
-        f"leads_with_no_contact_path={stats['leads_with_no_contact_path']}, actionable_email_leads_created={stats['actionable_email_leads_created']}, "
+        f"leads_with_no_contact_path={stats['leads_with_no_contact_path']}, leads_facebook_only={stats['leads_facebook_only']}, "
+        f"leads_phone_only={stats['leads_phone_only']}, actionable_email_leads_created={stats['actionable_email_leads_created']}, "
         f"research_later_leads_created={stats['research_later_leads_created']}, door_to_door_candidates_created={stats['door_to_door_candidates_created']}, "
         f"archived_low_priority_created={stats['archived_low_priority_created']}, "
         f"leads_skipped_due_no_email={stats['leads_skipped_due_no_email']}, "

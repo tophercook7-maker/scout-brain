@@ -1486,6 +1486,7 @@ def _build_no_website_case(place: dict, home_city: str, categories: list, index:
     case = empty_case(slug)
     case["lane"] = "no_website"
     case["no_website"] = True
+    case["discovery_status"] = "no_website_found"
 
     case["business_name"] = name
     case["category"] = place.get("category") or (categories[0] if categories else None)
@@ -1663,6 +1664,7 @@ def _build_weak_website_case(
     case = empty_case(slug)
     case["lane"] = "weak_website"
     case["no_website"] = False
+    case["discovery_status"] = "website_found"
 
     case["business_name"] = name
     case["category"] = place.get("category") or (categories[0] if categories else None)
@@ -2553,6 +2555,22 @@ def run(
         return (-has_phone, -has_contact_hint, -simple_service)
 
     places = sorted(places, key=_place_priority)
+
+    sample_size = min(5, len(places))
+    if sample_size:
+        print("  source payload sample (first 5)")
+        for idx, raw in enumerate(places[:sample_size], start=1):
+            sample_name = str(raw.get("name") or "").strip() or "(missing)"
+            sample = {
+                "name": sample_name,
+                "website": raw.get("website"),
+                "formatted_address": raw.get("address") or raw.get("vicinity"),
+                "phone": raw.get("phone"),
+                "place_url": raw.get("maps_url"),
+                "place_id": raw.get("place_id"),
+                "facebook_url": raw.get("facebook_url") or raw.get("facebook"),
+            }
+            print(f"    [{idx}] {json.dumps(sample, ensure_ascii=False)}")
 
     no_website = [p for p in places if not (p.get("website") or "").strip()]
     weak_website = [p for p in places if (p.get("website") or "").strip()]
