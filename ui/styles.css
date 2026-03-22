@@ -37,6 +37,20 @@ body {
   align-items: center;
 }
 
+.public-brand-lockup {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.public-brand-logo {
+  border-radius: 14px;
+  border: 1px solid rgba(217, 119, 6, 0.4);
+  box-shadow: var(--shadow);
+  object-fit: cover;
+  flex-shrink: 0;
+}
+
 .public-nav {
   display: flex;
   flex-wrap: wrap;
