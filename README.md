@@ -24,6 +24,11 @@ Current work should prioritize polishing the live Railway-hosted Scout-Brain app
 - cleaner route naming and admin feel
 - improved scoring and prioritization
 
+## Lead enrichment API (CRM-oriented)
+
+- **`POST /api/enrich-lead`** — partial lead in, normalized **web-design-scored** lead out (Places + site investigation). See [`docs/ENRICH_LEAD_API.md`](docs/ENRICH_LEAD_API.md).
+- Architecture / flow audit: [`docs/SCOUT_BRAIN_FLOW_AUDIT.md`](docs/SCOUT_BRAIN_FLOW_AUDIT.md).
+
 ## Core product architecture (single codebase)
 
 Scout-Brain is one core product that supports two presentations:

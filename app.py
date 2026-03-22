@@ -2,7 +2,7 @@
 """
 Massive Brain backend (FastAPI).
 
-- API routes: /scout-data, /run-scout, /audit, /case/*
+- API routes: /scout-data, /run-scout, /audit, /api/enrich-lead, /case/*
 - Reads/writes scout/config.json, scout/history.json, scout/opportunities.json, scout/today.json
 - Loads GOOGLE_MAPS_API_KEY and Supabase secrets from env
 - Optional frontend serving can be enabled with SERVE_FRONTEND=1
@@ -46,6 +46,8 @@ try:
     from scout.errors import ScoutRunError
 except ImportError:
     ScoutRunError = None  # will not match in except
+
+from scout.enriched_lead_schema import EnrichLeadRequest
 
 # Load .env
 _env_loaded = False
@@ -7511,6 +7513,16 @@ class AuditBody(BaseModel):
     url: str
 
 
+def _require_enrich_api_key(request: Request) -> None:
+    """Optional shared secret for POST /api/enrich-lead. If SCOUT_ENRICH_API_KEY is unset, no auth."""
+    key = (os.environ.get("SCOUT_ENRICH_API_KEY") or "").strip()
+    if not key:
+        return
+    got = (request.headers.get("X-Scout-Enrich-Key") or "").strip()
+    if got != key:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Scout-Enrich-Key")
+
+
 class CaseUpdateBody(BaseModel):
     status: str | None = None
     first_contacted_at: str | None = None
@@ -7669,6 +7681,25 @@ def post_case_regenerate_outreach(request: Request, slug: str):
     return {"ok": True, "case": case_to_ui(case)}
 
 
+@app.post("/api/enrich-lead")
+def post_api_enrich_lead(request: Request, body: EnrichLeadRequest):
+    """
+    Normalize + enrich a partial lead using Google Places (when configured) and site investigation.
+    Output shape is stable for future next-app CRM integration.
+    """
+    _require_enrich_api_key(request)
+    try:
+        from scout.lead_enrichment_pipeline import run_lead_enrichment
+
+        enriched = run_lead_enrichment(body, scout_dir=SCOUT_DIR, log=None)
+        return {"ok": True, "enriched_lead": enriched.model_dump()}
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"ok": False, "error": str(e), "enriched_lead": None},
+        )
+
+
 @app.post("/audit")
 def post_audit(body: AuditBody):
     url = (body.url or "").strip()
@@ -7700,7 +7731,7 @@ if SERVE_FRONTEND:
         SPA fallback for frontend routes.
         Keep API/static prefixes protected so backend routes are not shadowed.
         """
-        protected_prefixes = ("run-scout", "scout-data", "audit", "case", "scout", "assets", "ui")
+        protected_prefixes = ("run-scout", "scout-data", "audit", "case", "scout", "assets", "ui", "api")
         for prefix in protected_prefixes:
             if full_path == prefix or full_path.startswith(f"{prefix}/"):
                 raise HTTPException(status_code=404, detail="Not found")
